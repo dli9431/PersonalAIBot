@@ -259,6 +259,8 @@ HEARTBEAT_INTERVAL = 30  # seconds between "still working..." messages
 
 async def _run_with_heartbeat(cmd: list[str], ch: discord.TextChannel, label: str) -> str:
     """Run a subprocess, sending periodic heartbeats to Discord while it works."""
+    await ch.send(f"⚙️ {label} started...")
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=REPO_PATH,
@@ -268,21 +270,15 @@ async def _run_with_heartbeat(cmd: list[str], ch: discord.TextChannel, label: st
 
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
+    done = asyncio.Event()
     start = time.time()
-    last_heartbeat = start
 
     async def read_stdout():
-        nonlocal last_heartbeat
         while True:
             chunk = await proc.stdout.read(4096)
             if not chunk:
                 break
             stdout_chunks.append(chunk)
-            now = time.time()
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                elapsed = int(now - start)
-                last_heartbeat = now
-                await ch.send(f"⏳ {label} still working... ({elapsed}s)")
 
     async def read_stderr():
         while True:
@@ -291,14 +287,23 @@ async def _run_with_heartbeat(cmd: list[str], ch: discord.TextChannel, label: st
                 break
             stderr_chunks.append(chunk)
 
+    async def heartbeat():
+        while not done.is_set():
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            if not done.is_set():
+                elapsed = int(time.time() - start)
+                await ch.send(f"⏳ {label} still working... ({elapsed}s)")
+
     try:
-        await asyncio.wait_for(
-            asyncio.gather(read_stdout(), read_stderr(), proc.wait()),
-            timeout=ENGINE_TIMEOUT,
-        )
+        io_task = asyncio.gather(read_stdout(), read_stderr(), proc.wait())
+        hb_task = asyncio.create_task(heartbeat())
+        await asyncio.wait_for(io_task, timeout=ENGINE_TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
         raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT)
+    finally:
+        done.set()
+        hb_task.cancel()
 
     stdout = b"".join(stdout_chunks).decode(errors="replace")
     stderr = b"".join(stderr_chunks).decode(errors="replace")
