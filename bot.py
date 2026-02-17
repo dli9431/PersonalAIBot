@@ -60,6 +60,7 @@ _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -457,14 +458,24 @@ Just type your follow-up — the engine keeps context
 `login both` — authenticate both""".format(default=DEFAULT_ENGINE)
 
 
+@tree.command(name="help", description="Show all available bot commands")
+async def slash_help(interaction: discord.Interaction):
+    if interaction.user.id != ALLOWED_USER_ID:
+        await interaction.response.send_message("Not authorised.", ephemeral=True)
+        return
+    await interaction.response.send_message(HELP_TEXT)
+
+
 @client.event
 async def on_ready():
+    await tree.sync()
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user : {ALLOWED_USER_ID}")
     print(f"   Repo         : {REPO_PATH}")
     print(f"   Default engine: {DEFAULT_ENGINE}")
     print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
     print(f"   gh CLI       : {'yes' if has_gh_cli() else 'no'}")
+    print(f"   Slash commands synced")
 
 
 @client.event
