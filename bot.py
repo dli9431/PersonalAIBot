@@ -254,12 +254,12 @@ async def login_claude(ch: discord.TextChannel) -> None:
 
 # ── Engine runners ────────────────────────────────────────────────────────────
 
-HEARTBEAT_INTERVAL = 30  # seconds between "still working..." messages
+STATUS_REFRESH = 5  # seconds between live status updates
 
 
-async def _run_with_heartbeat(cmd: list[str], ch: discord.TextChannel, label: str) -> str:
-    """Run a subprocess, sending periodic heartbeats to Discord while it works."""
-    await ch.send(f"⚙️ {label} started...")
+async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: str) -> str:
+    """Run a subprocess, live-updating a single Discord message with output."""
+    status_msg = await ch.send(f"⚙️ {label} started...")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -287,23 +287,48 @@ async def _run_with_heartbeat(cmd: list[str], ch: discord.TextChannel, label: st
                 break
             stderr_chunks.append(chunk)
 
-    async def heartbeat():
+    async def live_update():
+        last_text = ""
         while not done.is_set():
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            if not done.is_set():
-                elapsed = int(time.time() - start)
-                await ch.send(f"⏳ {label} still working... ({elapsed}s)")
+            await asyncio.sleep(STATUS_REFRESH)
+            if done.is_set():
+                break
+            elapsed = int(time.time() - start)
+            raw = b"".join(stdout_chunks).decode(errors="replace")
+            # Show the tail of the output that fits in a Discord message
+            tail = strip_ansi(raw).strip()
+            # Truncate to fit in Discord (2000 char limit minus formatting)
+            if len(tail) > 1400:
+                tail = tail[-1400:]
+            if tail == last_text:
+                # No new output, just update the timer
+                try:
+                    await status_msg.edit(content=f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(waiting for output...)'}\n```")
+                except discord.HTTPException:
+                    pass
+                continue
+            last_text = tail
+            try:
+                await status_msg.edit(content=f"⏳ {label} working... ({elapsed}s)\n```\n{tail}\n```")
+            except discord.HTTPException:
+                pass
 
     try:
         io_task = asyncio.gather(read_stdout(), read_stderr(), proc.wait())
-        hb_task = asyncio.create_task(heartbeat())
+        update_task = asyncio.create_task(live_update())
         await asyncio.wait_for(io_task, timeout=ENGINE_TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
         raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT)
     finally:
         done.set()
-        hb_task.cancel()
+        update_task.cancel()
+        # Final update to show completion
+        elapsed = int(time.time() - start)
+        try:
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)")
+        except discord.HTTPException:
+            pass
 
     stdout = b"".join(stdout_chunks).decode(errors="replace")
     stderr = b"".join(stderr_chunks).decode(errors="replace")
@@ -338,7 +363,7 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
         cmd.append("--disallowedTools")
         cmd.extend(CLAUDE_DENIED_TOOLS)
 
-    return await _run_with_heartbeat(cmd, ch, "Claude Code")
+    return await _run_with_live_output(cmd, ch, "Claude Code")
 
 
 async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None) -> str:
@@ -360,7 +385,7 @@ async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, im
     if images:
         cmd.extend(["--image", ",".join(images)])
 
-    return await _run_with_heartbeat(cmd, ch, "Codex CLI")
+    return await _run_with_live_output(cmd, ch, "Codex CLI")
 
 
 async def run_engine(engine: str, task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None) -> str:
