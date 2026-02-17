@@ -548,6 +548,7 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
+    global CLAUDE_MODEL, CODEX_MODEL
     if message.author.bot or not is_authorised(message):
         return
 
@@ -719,7 +720,6 @@ async def on_message(message: discord.Message):
 
     # ── Model change ─────────────────────────────────────────────────────
     if lower.startswith("model "):
-        global CLAUDE_MODEL, CODEX_MODEL
         parts = lower[6:].strip().split(None, 1)
         if len(parts) != 2:
             await ch.send(
