@@ -412,7 +412,19 @@ async def merge_branch(source: str, target: str) -> str:
     push = run_git(["git", "push", "origin", target])
     if push.returncode != 0:
         return f"❌ Merged locally but push failed:\n```\n{push.stderr[-500:]}\n```"
-    return f"✅ Merged `{source}` → `{target}` and pushed."
+
+    result = f"✅ Merged `{source}` → `{target}` and pushed."
+
+    # Clean up: delete the feature branch locally and remotely after merging
+    if source.startswith(f"{BRANCH_PREFIX}/"):
+        run_git(["git", "branch", "-D", source])
+        run_git(["git", "push", "origin", "--delete", source])
+        result += f"\n🗑️ Deleted branch `{source}`."
+
+    # Pull the target branch so the local repo stays up to date
+    run_git(["git", "pull", "--ff-only"])
+
+    return result
 
 
 async def create_pr(source: str, target: str, title: str) -> str:
