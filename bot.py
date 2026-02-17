@@ -15,6 +15,7 @@ Requirements:
 
 import asyncio
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -114,6 +115,24 @@ def parse_engine_and_task(content: str) -> tuple[str, str]:
         if lower.startswith(prefix):
             return "codex", content[len(prefix):].strip()
     return DEFAULT_ENGINE, content
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+IMAGE_DIR = pathlib.Path("/tmp/botimages")
+
+
+async def download_attachments(message: discord.Message) -> list[str]:
+    """Download image attachments from a Discord message and return local paths."""
+    paths: list[str] = []
+    for att in message.attachments:
+        ext = pathlib.Path(att.filename).suffix.lower()
+        if ext not in IMAGE_EXTENSIONS:
+            continue
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        dest = IMAGE_DIR / f"{att.id}_{att.filename}"
+        await att.save(dest)
+        paths.append(str(dest))
+    return paths
 
 
 def get_diff() -> str:
@@ -236,8 +255,11 @@ async def login_claude(ch: discord.TextChannel) -> None:
 
 # ── Engine runners ────────────────────────────────────────────────────────────
 
-async def run_claude_code(task: str, resume: bool = False) -> str:
+async def run_claude_code(task: str, resume: bool = False, images: list[str] | None = None) -> str:
     """Run Claude Code. If resume=True, uses --resume to continue last session."""
+    if images:
+        img_lines = "\n".join(f"- {p}" for p in images)
+        task = f"Examine the image(s) at the following path(s) using the Read tool:\n{img_lines}\n\n{task}"
     cmd = ["claude"]
     if resume:
         cmd.extend(["--resume", "-p", task])
@@ -267,7 +289,7 @@ async def run_claude_code(task: str, resume: bool = False) -> str:
     return output
 
 
-async def run_codex(task: str, resume: bool = False) -> str:
+async def run_codex(task: str, resume: bool = False, images: list[str] | None = None) -> str:
     """Run Codex CLI. If resume=True, uses exec resume --last for context."""
     if resume:
         cmd = [
@@ -283,6 +305,8 @@ async def run_codex(task: str, resume: bool = False) -> str:
             "--model", CODEX_MODEL,
             task,
         ]
+    if images:
+        cmd.extend(["--image", ",".join(images)])
 
     proc = await asyncio.to_thread(
         subprocess.run, cmd,
@@ -296,10 +320,10 @@ async def run_codex(task: str, resume: bool = False) -> str:
     return output
 
 
-async def run_engine(engine: str, task: str, resume: bool = False) -> str:
+async def run_engine(engine: str, task: str, resume: bool = False, images: list[str] | None = None) -> str:
     if engine == "codex":
-        return await run_codex(task, resume)
-    return await run_claude_code(task, resume)
+        return await run_codex(task, resume, images)
+    return await run_claude_code(task, resume, images)
 
 
 # ── Git workflow ──────────────────────────────────────────────────────────────
@@ -412,7 +436,11 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
-    if not content:
+    has_images = any(
+        pathlib.Path(att.filename).suffix.lower() in IMAGE_EXTENSIONS
+        for att in message.attachments
+    )
+    if not content and not has_images:
         return
 
     ch = message.channel
@@ -573,10 +601,14 @@ async def on_message(message: discord.Message):
         label = "Claude Code" if engine == "claude" else "Codex CLI"
         session["turns"] += 1
 
+        images = await download_attachments(message)
+        follow_up_task = content or "Describe and analyze these images"
+
         await ch.send(f"🔄 **{label}** follow-up (turn {session['turns']})...\n"
-                       f"> {truncate(content, 200)}")
+                       f"> {truncate(follow_up_task, 200)}"
+                       + (f"\n📎 {len(images)} image(s) attached" if images else ""))
         try:
-            output = await run_engine(engine, content, resume=True)
+            output = await run_engine(engine, follow_up_task, resume=True, images=images)
         except subprocess.TimeoutExpired:
             await ch.send(f"⏰ Timed out ({ENGINE_TIMEOUT}s).")
             return
@@ -592,7 +624,10 @@ async def on_message(message: discord.Message):
         return
 
     # ── New task → start a session ────────────────────────────────────────
-    engine, task = parse_engine_and_task(content)
+    images = await download_attachments(message)
+    engine, task = parse_engine_and_task(content) if content else (DEFAULT_ENGINE, "")
+    if not task and images:
+        task = "Describe and analyze these images"
     if not task:
         await ch.send("Give me a task to work on.")
         return
@@ -603,7 +638,8 @@ async def on_message(message: discord.Message):
         await ch.send("⚠️ Previous session discarded.\n")
 
     label = "Claude Code" if engine == "claude" else "Codex CLI"
-    await ch.send(f"🧠 **{label}** starting session...\n> {truncate(task, 200)}")
+    await ch.send(f"🧠 **{label}** starting session...\n> {truncate(task, 200)}"
+                   + (f"\n📎 {len(images)} image(s) attached" if images else ""))
 
     try:
         branch = create_branch(task, engine)
@@ -612,7 +648,7 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        output = await run_engine(engine, task, resume=False)
+        output = await run_engine(engine, task, resume=False, images=images)
     except subprocess.TimeoutExpired:
         await ch.send(f"⏰ {label} timed out ({ENGINE_TIMEOUT}s).")
         await discard_changes(branch)
