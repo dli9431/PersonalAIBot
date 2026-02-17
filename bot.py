@@ -16,6 +16,7 @@ Requirements:
 import asyncio
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -84,6 +85,13 @@ def run_git(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd, cwd=REPO_PATH, capture_output=True, text=True, timeout=60,
     )
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def truncate(text: str, limit: int = MAX_DIFF_CHARS) -> str:
@@ -179,7 +187,7 @@ async def login_codex(ch: discord.TextChannel) -> None:
             line = await stream.readline()
             if not line:
                 break
-            text = line.decode().strip()
+            text = strip_ansi(line.decode()).strip()
             if not text:
                 continue
             output_lines.append(text)
@@ -226,7 +234,7 @@ async def login_claude(ch: discord.TextChannel) -> None:
             line = await stream.readline()
             if not line:
                 break
-            text = line.decode().strip()
+            text = strip_ansi(line.decode()).strip()
             if not text:
                 continue
             output_lines.append(text)
