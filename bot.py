@@ -388,10 +388,30 @@ async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, im
     return await _run_with_live_output(cmd, ch, "Codex CLI")
 
 
+MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
+
+
 async def run_engine(engine: str, task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None) -> str:
     if engine == "codex":
-        return await run_codex(task, ch, resume, images)
-    return await run_claude_code(task, ch, resume, images)
+        runner = run_codex
+    else:
+        runner = run_claude_code
+
+    try:
+        return await runner(task, ch, resume, images)
+    except subprocess.TimeoutExpired:
+        # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
+        for attempt in range(1, MAX_AUTO_CONTINUES + 1):
+            auto_commit(task, 0)  # save any partial work
+            await ch.send(f"⏳ Timed out — auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
+            try:
+                return await runner("continue where you left off", ch, resume=True)
+            except subprocess.TimeoutExpired:
+                continue
+        auto_commit(task, 0)
+        await ch.send(f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
+                       f"Send a follow-up to continue manually, or `done` to review what's there.")
+        return "(timed out — partial work auto-committed)"
 
 
 # ── Git workflow ──────────────────────────────────────────────────────────────
@@ -805,9 +825,6 @@ async def on_message(message: discord.Message):
                        + (f"\n📎 {len(images)} image(s) attached" if images else ""))
         try:
             output = await run_engine(engine, follow_up_task, ch, resume=True, images=images)
-        except subprocess.TimeoutExpired:
-            await ch.send(f"⏰ Timed out ({ENGINE_TIMEOUT}s).")
-            return
         except Exception as e:
             await ch.send(f"❌ Error: `{e}`")
             return
@@ -846,10 +863,6 @@ async def on_message(message: discord.Message):
 
     try:
         output = await run_engine(engine, task, ch, resume=False, images=images)
-    except subprocess.TimeoutExpired:
-        await ch.send(f"⏰ {label} timed out ({ENGINE_TIMEOUT}s).")
-        await discard_changes(branch)
-        return
     except Exception as e:
         await ch.send(f"❌ {label} error: `{e}`")
         await discard_changes(branch)
