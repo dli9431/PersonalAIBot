@@ -2,20 +2,15 @@
 """
 Discord → Claude Code / Codex CLI → Git bridge bot.
 
-Receives messages from your private Discord server, routes them to either
-Claude Code or OpenAI Codex CLI in non-interactive mode, and optionally
-commits + pushes the changes after your approval. Supports merging to
-dev/main branches and creating GitHub PRs via the gh CLI.
+Supports iterative sessions: send a task, review changes, send follow-ups,
+and only commit when you're satisfied. Uses --resume (Claude Code) and
+exec resume --last (Codex) for multi-turn context.
 
 Designed to run inside WSL2 on Windows.
 
 Requirements:
     pip install discord.py python-dotenv
     Optional: gh CLI (for PR creation)
-
-Usage:
-    1. Copy .env.example → .env and fill in your values.
-    2. python bot.py
 """
 
 import asyncio
@@ -38,8 +33,6 @@ MAIN_BRANCH = os.getenv("MAIN_BRANCH", "main")
 DEV_BRANCH = os.getenv("DEV_BRANCH", "dev")
 MAX_DIFF_CHARS = 1800
 
-# ── Engine defaults ──────────────────────────────────────────────────────────
-
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
 # Claude Code
@@ -53,8 +46,6 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 
 # Codex CLI
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.2-codex")
-CODEX_SANDBOX = os.getenv("CODEX_SANDBOX", "workspace-write")
-CODEX_APPROVAL = os.getenv("CODEX_APPROVAL", "on-request")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 
@@ -64,56 +55,53 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# channel_id → {branch, description, diff, engine}
-pending_approvals: dict[int, dict] = {}
+
+# ── Session state ─────────────────────────────────────────────────────────────
+# An active session means we're on a feature branch, iterating with an engine.
+# channel_id → session dict
+active_sessions: dict[int, dict] = {}
+# channel_id → last pushed branch name (for merge/PR commands)
+last_pushed: dict[int, str] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def is_authorised(message: discord.Message) -> bool:
-    return message.author.id == ALLOWED_USER_ID
+def is_authorised(msg: discord.Message) -> bool:
+    return msg.author.id == ALLOWED_USER_ID
 
 
 def slugify(text: str, max_len: int = 40) -> str:
     slug = "".join(c if c.isalnum() else "-" for c in text.lower())
-    slug = slug.strip("-")[:max_len].rstrip("-")
-    return slug or "task"
+    return (slug.strip("-")[:max_len].rstrip("-")) or "task"
 
 
-def run_git(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
+def run_git(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
-        cmd, cwd=cwd or REPO_PATH,
-        capture_output=True, text=True, timeout=60,
+        cmd, cwd=REPO_PATH, capture_output=True, text=True, timeout=60,
     )
 
 
 def truncate(text: str, limit: int = MAX_DIFF_CHARS) -> str:
     if len(text) <= limit:
         return text
-    half = limit // 2 - 20
-    return text[:half] + "\n\n... (truncated) ...\n\n" + text[-half:]
+    h = limit // 2 - 20
+    return text[:h] + "\n\n... (truncated) ...\n\n" + text[-h:]
 
 
 def current_branch() -> str:
-    result = run_git(["git", "branch", "--show-current"])
-    return result.stdout.strip()
+    return run_git(["git", "branch", "--show-current"]).stdout.strip()
 
 
 def has_gh_cli() -> bool:
     try:
-        r = subprocess.run(["gh", "--version"], capture_output=True, timeout=5)
-        return r.returncode == 0
+        return subprocess.run(
+            ["gh", "--version"], capture_output=True, timeout=5
+        ).returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
 
 def parse_engine_and_task(content: str) -> tuple[str, str]:
-    """
-    Parse engine prefix from message.
-    'claude: fix the bug'  → ("claude", "fix the bug")
-    'codex: fix the bug'   → ("codex",  "fix the bug")
-    'fix the bug'          → (DEFAULT_ENGINE, "fix the bug")
-    """
     lower = content.lower()
     for prefix in ("claude:", "cc:", "claude code:"):
         if lower.startswith(prefix):
@@ -124,15 +112,44 @@ def parse_engine_and_task(content: str) -> tuple[str, str]:
     return DEFAULT_ENGINE, content
 
 
+def get_diff() -> str:
+    diff = run_git(["git", "diff"]).stdout or ""
+    staged = run_git(["git", "diff", "--cached"]).stdout or ""
+    untracked = run_git(["git", "ls-files", "--others", "--exclude-standard"]).stdout.strip()
+    combined = diff + staged
+    if untracked:
+        combined += f"\n\nNew files:\n{untracked}"
+    return combined.strip() or "(no changes detected)"
+
+
+def get_diff_stat() -> str:
+    """Short summary: 3 files changed, 12 insertions, 2 deletions."""
+    stat = run_git(["git", "diff", "--stat"]).stdout.strip()
+    untracked = run_git(["git", "ls-files", "--others", "--exclude-standard"]).stdout.strip()
+    lines = []
+    if stat:
+        lines.append(stat.split("\n")[-1].strip())  # summary line
+    if untracked:
+        n = len(untracked.split("\n"))
+        lines.append(f"{n} new file(s)")
+    return ", ".join(lines) or "no changes"
+
+
 # ── Engine runners ────────────────────────────────────────────────────────────
 
-async def run_claude_code(task: str) -> str:
-    cmd = [
-        "claude", "-p", task,
+async def run_claude_code(task: str, resume: bool = False) -> str:
+    """Run Claude Code. If resume=True, uses --resume to continue last session."""
+    cmd = ["claude"]
+    if resume:
+        cmd.extend(["--resume", "-p", task])
+    else:
+        cmd.extend(["-p", task])
+
+    cmd.extend([
         "--model", CLAUDE_MODEL,
         "--output-format", "text",
         "--max-turns", "10",
-    ]
+    ])
     if CLAUDE_ALLOWED_TOOLS:
         cmd.append("--allowedTools")
         cmd.extend(CLAUDE_ALLOWED_TOOLS)
@@ -151,15 +168,23 @@ async def run_claude_code(task: str) -> str:
     return output
 
 
-async def run_codex(task: str) -> str:
-    cmd = [
-        "codex", "exec",
-        "--model", CODEX_MODEL,
-        "--sandbox", CODEX_SANDBOX,
-        "--ask-for-approval", CODEX_APPROVAL,
-        "--ephemeral",
-        task,
-    ]
+async def run_codex(task: str, resume: bool = False) -> str:
+    """Run Codex CLI. If resume=True, uses exec resume --last for context."""
+    if resume:
+        cmd = [
+            "codex", "exec", "resume", "--last",
+            "--full-auto",
+            "--model", CODEX_MODEL,
+            task,
+        ]
+    else:
+        cmd = [
+            "codex", "exec",
+            "--full-auto",
+            "--model", CODEX_MODEL,
+            task,
+        ]
+
     proc = await asyncio.to_thread(
         subprocess.run, cmd,
         cwd=REPO_PATH, capture_output=True, text=True,
@@ -167,15 +192,15 @@ async def run_codex(task: str) -> str:
     )
     output = proc.stdout or "(no output)"
     if proc.returncode != 0 and proc.stderr:
-        stderr_tail = proc.stderr.strip().split("\n")[-5:]
-        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(stderr_tail)
+        tail = proc.stderr.strip().split("\n")[-5:]
+        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail)
     return output
 
 
-async def run_engine(engine: str, task: str) -> str:
+async def run_engine(engine: str, task: str, resume: bool = False) -> str:
     if engine == "codex":
-        return await run_codex(task)
-    return await run_claude_code(task)
+        return await run_codex(task, resume)
+    return await run_claude_code(task, resume)
 
 
 # ── Git workflow ──────────────────────────────────────────────────────────────
@@ -186,18 +211,6 @@ def create_branch(task: str, engine: str) -> str:
     run_git(["git", "pull", "--ff-only"])
     run_git(["git", "checkout", "-b", branch])
     return branch
-
-
-def get_diff() -> str:
-    diff = run_git(["git", "diff"])
-    diff_staged = run_git(["git", "diff", "--cached"])
-    combined = (diff.stdout or "") + (diff_staged.stdout or "")
-
-    untracked = run_git(["git", "ls-files", "--others", "--exclude-standard"])
-    if untracked.stdout.strip():
-        combined += f"\n\nNew files:\n{untracked.stdout.strip()}"
-
-    return combined.strip() or "(no changes detected)"
 
 
 async def commit_and_push(branch: str, description: str) -> str:
@@ -216,76 +229,67 @@ async def discard_changes(branch: str) -> None:
     run_git(["git", "branch", "-D", branch])
 
 
-# ── Merge / PR operations ────────────────────────────────────────────────────
+# ── Merge / PR ────────────────────────────────────────────────────────────────
 
 async def merge_branch(source: str, target: str) -> str:
-    """Merge source branch into target locally, then push target."""
-    # Make sure target is up to date
     run_git(["git", "checkout", target])
-    pull = run_git(["git", "pull", "--ff-only"])
-    if pull.returncode != 0:
-        # Target might not exist on remote yet (e.g. first time dev branch)
-        pass
+    run_git(["git", "pull", "--ff-only"])
 
     merge = run_git(["git", "merge", source, "--no-ff",
                       "-m", f"merge {source} into {target}"])
-
     if merge.returncode != 0:
-        conflict_msg = merge.stdout or merge.stderr or "unknown error"
-        # Abort the failed merge
+        msg = merge.stdout or merge.stderr or "unknown error"
         run_git(["git", "merge", "--abort"])
-        return f"❌ Merge conflict merging `{source}` → `{target}`:\n```\n{truncate(conflict_msg, 500)}\n```\nMerge aborted. Resolve manually at your desktop."
+        return (f"❌ Merge conflict `{source}` → `{target}`:\n"
+                f"```\n{truncate(msg, 500)}\n```\nAborted. Resolve at desktop.")
 
     push = run_git(["git", "push", "origin", target])
     if push.returncode != 0:
         return f"❌ Merged locally but push failed:\n```\n{push.stderr[-500:]}\n```"
-
     return f"✅ Merged `{source}` → `{target}` and pushed."
 
 
 async def create_pr(source: str, target: str, title: str) -> str:
-    """Create a GitHub PR using the gh CLI."""
     if not has_gh_cli():
-        return "❌ `gh` CLI not installed. Install it with `sudo apt install gh` and run `gh auth login`."
+        return "❌ `gh` not installed. Run `sudo apt install gh && gh auth login`."
 
     result = run_git([
         "gh", "pr", "create",
-        "--base", target,
-        "--head", source,
+        "--base", target, "--head", source,
         "--title", title,
-        "--body", f"Auto-generated PR from Discord bot.\n\nTask: {title}",
+        "--body", f"Auto-generated from Discord bot.\n\nTask: {title}",
     ])
-
     if result.returncode == 0:
-        pr_url = result.stdout.strip()
-        return f"✅ PR created: {pr_url}"
-
-    return f"❌ PR creation failed:\n```\n{result.stderr[-500:]}\n```"
+        return f"✅ PR created: {result.stdout.strip()}"
+    return f"❌ PR failed:\n```\n{result.stderr[-500:]}\n```"
 
 
-# ── Discord event handlers ───────────────────────────────────────────────────
+# ── Discord handlers ─────────────────────────────────────────────────────────
 
-HELP_TEXT = """**Task commands:**
-`<task>` — run with default engine ({default})
-`claude: <task>` / `cc: <task>` — force Claude Code
-`codex: <task>` / `cx: <task>` — force Codex CLI
+HELP_TEXT = """**Starting a session:**
+`<task>` — start with default engine ({default})
+`claude: <task>` / `cc: <task>` — start with Claude Code
+`codex: <task>` / `cx: <task>` — start with Codex CLI
 
-**After review:**
-`yes` / `push` — commit & push to feature branch
-`no` / `discard` — discard changes
+**During a session** (iterative back-and-forth):
+Just type your follow-up — the engine keeps context
+`diff` — see current changes so far
+`undo` — revert last engine run (git checkout)
 
-**Merge commands** (use after pushing):
-`merge dev` — merge last pushed branch → dev
-`merge main` — merge last pushed branch → main
+**Ending a session:**
+`done` — see full diff + push prompt
+`yes` / `push` — commit & push
+`no` / `discard` — discard all changes
+`abort` — discard and end session immediately
+
+**After pushing:**
+`merge dev` — merge feature branch → dev
+`merge main` — merge feature branch → main
 `merge dev>main` — merge dev → main
-`pr dev` — create PR targeting dev
-`pr main` — create PR targeting main
+`pr dev` / `pr main` — create a PR
 
 **Info:**
-`status` — repo branch & working tree
-`branches` — list recent branches
-`engine` — show engine config
-`help` — this message""".format(default=DEFAULT_ENGINE)
+`status` · `branches` · `engine` · `help`""".format(default=DEFAULT_ENGINE)
 
 
 @client.event
@@ -294,13 +298,8 @@ async def on_ready():
     print(f"   Allowed user : {ALLOWED_USER_ID}")
     print(f"   Repo         : {REPO_PATH}")
     print(f"   Default engine: {DEFAULT_ENGINE}")
-    print(f"   Claude model : {CLAUDE_MODEL}")
-    print(f"   Codex model  : {CODEX_MODEL}")
-    print(f"   gh CLI       : {'available' if has_gh_cli() else 'not found'}")
-
-
-# Track last pushed branch per channel for merge commands
-last_pushed: dict[int, str] = {}
+    print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
+    print(f"   gh CLI       : {'yes' if has_gh_cli() else 'no'}")
 
 
 @client.event
@@ -314,77 +313,101 @@ async def on_message(message: discord.Message):
 
     ch = message.channel
     lower = content.lower()
+    session = active_sessions.get(ch.id)
 
-    # ── Approval / rejection ──────────────────────────────────────────────
-    if lower in ("yes", "approve", "push", "lgtm", "ship it"):
-        pending = pending_approvals.pop(ch.id, None)
-        if pending:
-            await ch.send("⏳ Committing and pushing...")
-            result = await commit_and_push(pending["branch"], pending["description"])
-            await ch.send(result)
-            if "✅" in result:
-                last_pushed[ch.id] = pending["branch"]
-                await ch.send(
-                    f"You can now:\n"
-                    f"• `merge dev` — merge → {DEV_BRANCH}\n"
-                    f"• `merge main` — merge → {MAIN_BRANCH}\n"
-                    f"• `pr dev` / `pr main` — create a PR instead"
-                )
-            run_git(["git", "checkout", MAIN_BRANCH])
+    # ── Session: done → show full diff and prompt ─────────────────────────
+    if lower == "done" and session:
+        diff = get_diff()
+        await ch.send(f"**Full diff on `{session['branch']}`:**\n"
+                       f"```diff\n{truncate(diff, 1800)}\n```")
+        if "(no changes detected)" in diff:
+            await ch.send("No changes to commit.")
             return
-        await ch.send("Nothing pending to approve.")
+        session["phase"] = "review"
+        await ch.send("Reply **yes** to commit & push, or **no** to discard.")
         return
 
-    if lower in ("no", "reject", "discard", "nah"):
-        pending = pending_approvals.pop(ch.id, None)
-        if pending:
-            await discard_changes(pending["branch"])
-            await ch.send(f"🗑️ Changes discarded, back on `{MAIN_BRANCH}`.")
+    # ── Session: push approval ────────────────────────────────────────────
+    if lower in ("yes", "approve", "push", "lgtm", "ship it"):
+        if session and session.get("phase") == "review":
+            await ch.send("⏳ Committing and pushing...")
+            result = await commit_and_push(session["branch"], session["description"])
+            await ch.send(result)
+            if "✅" in result:
+                last_pushed[ch.id] = session["branch"]
+                await ch.send(
+                    f"`merge dev` · `merge main` · `pr dev` · `pr main`"
+                )
+            run_git(["git", "checkout", MAIN_BRANCH])
+            del active_sessions[ch.id]
             return
-        await ch.send("Nothing pending to discard.")
+        # If no session but maybe old-style pending
+        await ch.send("No session awaiting approval. Send `done` first to review changes.")
+        return
+
+    # ── Session: discard ──────────────────────────────────────────────────
+    if lower in ("no", "reject", "discard", "nah"):
+        if session and session.get("phase") == "review":
+            await discard_changes(session["branch"])
+            del active_sessions[ch.id]
+            await ch.send(f"🗑️ Discarded, back on `{MAIN_BRANCH}`.")
+            return
+        await ch.send("No session awaiting approval. Use `abort` to end an active session.")
+        return
+
+    # ── Session: abort (discard immediately) ──────────────────────────────
+    if lower == "abort":
+        if session:
+            await discard_changes(session["branch"])
+            del active_sessions[ch.id]
+            await ch.send(f"🗑️ Session aborted, back on `{MAIN_BRANCH}`.")
+        else:
+            await ch.send("No active session.")
+        return
+
+    # ── Session: diff (peek at current changes) ──────────────────────────
+    if lower == "diff" and session:
+        diff = get_diff()
+        stat = get_diff_stat()
+        await ch.send(f"**Changes so far** ({stat}):\n"
+                       f"```diff\n{truncate(diff, 1800)}\n```")
+        return
+
+    # ── Session: undo (revert uncommitted changes from last run) ──────────
+    if lower == "undo" and session:
+        run_git(["git", "checkout", "."])
+        run_git(["git", "clean", "-fd"])
+        session["turns"] = max(0, session["turns"] - 1)
+        await ch.send("↩️ Reverted last changes. Send another instruction or `diff` to check.")
         return
 
     # ── Merge commands ────────────────────────────────────────────────────
     if lower.startswith("merge "):
         target_str = lower[6:].strip()
-
-        # "merge dev>main" means merge dev into main
         if ">" in target_str:
             parts = target_str.split(">", 1)
-            source = parts[0].strip()
-            target = parts[1].strip()
-            # Resolve aliases
-            source = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(source, source)
-            target = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(target, target)
-            await ch.send(f"⏳ Merging `{source}` → `{target}`...")
-            result = await merge_branch(source, target)
-            await ch.send(result)
+            src = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(parts[0].strip(), parts[0].strip())
+            tgt = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(parts[1].strip(), parts[1].strip())
+        else:
+            src = last_pushed.get(ch.id)
+            tgt = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(target_str, target_str)
+        if not src:
+            await ch.send("No recently pushed branch. Push first.")
             return
-
-        # "merge dev" or "merge main" — merge last pushed branch into target
-        target = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(target_str, target_str)
-        source = last_pushed.get(ch.id)
-        if not source:
-            await ch.send("No recently pushed branch to merge. Push a feature branch first.")
-            return
-
-        await ch.send(f"⏳ Merging `{source}` → `{target}`...")
-        result = await merge_branch(source, target)
-        await ch.send(result)
+        await ch.send(f"⏳ Merging `{src}` → `{tgt}`...")
+        await ch.send(await merge_branch(src, tgt))
         return
 
     # ── PR commands ───────────────────────────────────────────────────────
     if lower.startswith("pr "):
         target_str = lower[3:].strip()
-        target = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(target_str, target_str)
-        source = last_pushed.get(ch.id)
-        if not source:
-            await ch.send("No recently pushed branch. Push a feature branch first.")
+        tgt = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(target_str, target_str)
+        src = last_pushed.get(ch.id)
+        if not src:
+            await ch.send("No recently pushed branch. Push first.")
             return
-
-        await ch.send(f"⏳ Creating PR: `{source}` → `{target}`...")
-        result = await create_pr(source, target, f"auto: {source}")
-        await ch.send(result)
+        await ch.send(f"⏳ Creating PR `{src}` → `{tgt}`...")
+        await ch.send(await create_pr(src, tgt, f"auto: {src}"))
         return
 
     # ── Info commands ─────────────────────────────────────────────────────
@@ -393,44 +416,68 @@ async def on_message(message: discord.Message):
         return
 
     if lower == "status":
-        st = run_git(["git", "status", "--short"])
+        st = run_git(["git", "status", "--short"]).stdout.strip()
         br = current_branch()
-        await ch.send(
-            f"📍 `{REPO_PATH}`\n"
-            f"🌿 `{br}`\n"
-            f"```\n{st.stdout.strip() or '(clean)'}\n```"
-        )
+        sess_info = ""
+        if session:
+            sess_info = (f"\n📝 Active session: **{session['engine']}** · "
+                         f"{session['turns']} turn(s)")
+        await ch.send(f"📍 `{REPO_PATH}`\n🌿 `{br}`{sess_info}\n"
+                       f"```\n{st or '(clean)'}\n```")
         return
 
     if lower == "branches":
-        result = run_git(["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"])
-        branches = result.stdout.strip().split("\n")[:10]
-        listing = "\n".join(f"• `{b}`" for b in branches if b)
+        result = run_git(["git", "branch", "--sort=-committerdate",
+                          "--format=%(refname:short)"])
+        branches = [b for b in result.stdout.strip().split("\n") if b][:10]
+        listing = "\n".join(f"• `{b}`" for b in branches)
         await ch.send(f"**Recent branches:**\n{listing}")
         return
 
     if lower == "engine":
         await ch.send(
-            f"Default engine: **{DEFAULT_ENGINE}**\n"
-            f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`\n"
-            f"Codex sandbox: `{CODEX_SANDBOX}` · approval: `{CODEX_APPROVAL}`"
+            f"Default: **{DEFAULT_ENGINE}**\n"
+            f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`"
         )
         return
 
-    # ── Main task ─────────────────────────────────────────────────────────
+    # ── Follow-up in active session ───────────────────────────────────────
+    if session and session.get("phase") != "review":
+        engine = session["engine"]
+        label = "Claude Code" if engine == "claude" else "Codex CLI"
+        session["turns"] += 1
+
+        await ch.send(f"🔄 **{label}** follow-up (turn {session['turns']})...\n"
+                       f"> {truncate(content, 200)}")
+        try:
+            output = await run_engine(engine, content, resume=True)
+        except subprocess.TimeoutExpired:
+            await ch.send(f"⏰ Timed out ({ENGINE_TIMEOUT}s).")
+            return
+        except Exception as e:
+            await ch.send(f"❌ Error: `{e}`")
+            return
+
+        await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+        stat = get_diff_stat()
+        await ch.send(f"📊 {stat}\n"
+                       f"Send another follow-up, `diff` to inspect, `undo` to revert, "
+                       f"or `done` when finished.")
+        return
+
+    # ── New task → start a session ────────────────────────────────────────
     engine, task = parse_engine_and_task(content)
     if not task:
         await ch.send("Give me a task to work on.")
         return
 
-    # Discard any stale pending approval
-    stale = pending_approvals.pop(ch.id, None)
-    if stale:
-        await discard_changes(stale["branch"])
-        await ch.send("⚠️ Previous pending changes discarded.\n")
+    # Clean up any leftover session
+    if session:
+        await discard_changes(session["branch"])
+        await ch.send("⚠️ Previous session discarded.\n")
 
     label = "Claude Code" if engine == "claude" else "Codex CLI"
-    await ch.send(f"🧠 **{label}** working on it...\n> {truncate(task, 200)}")
+    await ch.send(f"🧠 **{label}** starting session...\n> {truncate(task, 200)}")
 
     try:
         branch = create_branch(task, engine)
@@ -439,7 +486,7 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        output = await run_engine(engine, task)
+        output = await run_engine(engine, task, resume=False)
     except subprocess.TimeoutExpired:
         await ch.send(f"⏰ {label} timed out ({ENGINE_TIMEOUT}s).")
         await discard_changes(branch)
@@ -449,26 +496,20 @@ async def on_message(message: discord.Message):
         await discard_changes(branch)
         return
 
-    await ch.send(f"**{label} says:**\n```\n{truncate(output, 1800)}\n```")
-
-    diff = get_diff()
-    await ch.send(f"**Changes on `{branch}`:**\n```diff\n{truncate(diff, 1800)}\n```")
-
-    if "(no changes detected)" in diff:
-        await ch.send("No file changes. Branch cleaned up.")
-        await discard_changes(branch)
-        return
-
-    pending_approvals[ch.id] = {
+    # Create session
+    active_sessions[ch.id] = {
         "branch": branch,
-        "description": task,
-        "diff": diff,
         "engine": engine,
+        "description": task,
+        "turns": 1,
+        "phase": "working",
     }
-    await ch.send(
-        "👆 Review the diff.\n"
-        "Reply **yes** to commit & push, or **no** to discard."
-    )
+
+    await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+    stat = get_diff_stat()
+    await ch.send(f"📊 {stat}\n"
+                   f"Send a follow-up to keep iterating, `diff` to inspect, "
+                   f"or `done` when finished.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
