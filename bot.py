@@ -38,7 +38,7 @@ MAX_DIFF_CHARS = 1800
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
-# Claude Code
+# Claude Code (mutable at runtime via Discord `model` command)
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "sonnet")
 CLAUDE_ALLOWED_TOOLS = os.getenv("CLAUDE_ALLOWED_TOOLS",
     "Read Edit Write Grep Glob LS Bash(git\\ diff) Bash(git\\ status)"
@@ -512,8 +512,13 @@ Just type your follow-up — the engine keeps context
 `recover <branch>` — resume a previous session
 `recover drop <branch>` — delete an orphaned branch
 
+**Config:**
+`model claude <name>` — change Claude model (e.g. opus, sonnet, haiku)
+`model codex <name>` — change Codex model
+`engine` — show current models
+
 **Info:**
-`status` · `branches` · `engine` · `help`
+`status` · `branches` · `help`
 
 **Login:**
 `login claude` — authenticate Claude Code (browser OAuth)
@@ -705,8 +710,32 @@ async def on_message(message: discord.Message):
     if lower == "engine":
         await ch.send(
             f"Default: **{DEFAULT_ENGINE}**\n"
-            f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`"
+            f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`\n\n"
+            f"**Available models:**\n"
+            f"Claude: `opus` · `sonnet` · `haiku`\n"
+            f"Codex: `gpt-5.3-codex` · `gpt-5.2-codex` · `gpt-5.1-codex-max` · `gpt-5.2` · `gpt-5.1-codex-mini`"
         )
+        return
+
+    # ── Model change ─────────────────────────────────────────────────────
+    if lower.startswith("model "):
+        global CLAUDE_MODEL, CODEX_MODEL
+        parts = lower[6:].strip().split(None, 1)
+        if len(parts) != 2:
+            await ch.send(
+                f"Usage: `model claude <name>` or `model codex <name>`\n"
+                f"Current — Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`"
+            )
+            return
+        target, new_model = parts[0], parts[1]
+        if target in ("claude", "cc"):
+            CLAUDE_MODEL = new_model
+            await ch.send(f"✅ Claude model set to `{CLAUDE_MODEL}`")
+        elif target in ("codex", "cx"):
+            CODEX_MODEL = new_model
+            await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
+        else:
+            await ch.send("Use `model claude <name>` or `model codex <name>`")
         return
 
     # ── Recover orphaned branches ────────────────────────────────────────
