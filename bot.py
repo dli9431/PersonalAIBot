@@ -385,9 +385,20 @@ def create_branch(task: str, engine: str) -> str:
     return branch
 
 
-async def commit_and_push(branch: str, description: str) -> str:
+def auto_commit(description: str, turn: int) -> None:
+    """Commit any pending changes as a WIP save after each engine turn."""
     run_git(["git", "add", "."])
-    run_git(["git", "commit", "-m", f"auto: {description}"])
+    status = run_git(["git", "status", "--porcelain"]).stdout.strip()
+    if status:
+        run_git(["git", "commit", "-m", f"WIP (turn {turn}): {description}"])
+
+
+async def commit_and_push(branch: str, description: str) -> str:
+    # Commit any remaining uncommitted changes
+    run_git(["git", "add", "."])
+    status = run_git(["git", "status", "--porcelain"]).stdout.strip()
+    if status:
+        run_git(["git", "commit", "-m", f"auto: {description}"])
     push = run_git(["git", "push", "-u", "origin", branch])
     if push.returncode == 0:
         return f"✅ Pushed to `{branch}`"
@@ -469,6 +480,11 @@ Just type your follow-up — the engine keeps context
 **After pushing:**
 `merge dev>main` — merge dev → main
 `pr main` — create a PR to main
+
+**Recovery:**
+`recover` — list orphaned feature branches
+`recover <branch>` — resume a previous session
+`recover drop <branch>` — delete an orphaned branch
 
 **Info:**
 `status` · `branches` · `engine` · `help`
@@ -667,6 +683,59 @@ async def on_message(message: discord.Message):
         )
         return
 
+    # ── Recover orphaned branches ────────────────────────────────────────
+    if lower == "recover":
+        result = run_git(["git", "branch", "--sort=-committerdate",
+                          "--format=%(refname:short)"])
+        orphans = [b for b in result.stdout.strip().split("\n")
+                   if b.startswith(f"{BRANCH_PREFIX}/")]
+        if not orphans:
+            await ch.send("No orphaned feature branches found.")
+            return
+        listing = "\n".join(f"• `{b}`" for b in orphans[:10])
+        await ch.send(f"**Orphaned feature branches:**\n{listing}\n\n"
+                       f"Reply `recover <branch>` to resume or `recover drop <branch>` to delete.")
+        return
+
+    if lower.startswith("recover drop "):
+        branch = content[13:].strip()
+        if not branch.startswith(f"{BRANCH_PREFIX}/"):
+            await ch.send("Can only drop feature branches.")
+            return
+        run_git(["git", "branch", "-D", branch])
+        run_git(["git", "push", "origin", "--delete", branch])
+        await ch.send(f"🗑️ Deleted `{branch}` locally and remotely.")
+        return
+
+    if lower.startswith("recover "):
+        branch = content[8:].strip()
+        if not branch.startswith(f"{BRANCH_PREFIX}/"):
+            await ch.send("Can only recover feature branches.")
+            return
+        # Check branch exists
+        check = run_git(["git", "rev-parse", "--verify", branch])
+        if check.returncode != 0:
+            await ch.send(f"Branch `{branch}` not found.")
+            return
+        if session:
+            await discard_changes(session["branch"])
+            await ch.send("⚠️ Previous session discarded.\n")
+        run_git(["git", "checkout", branch])
+        # Parse engine from branch name (auto/engine/slug-timestamp)
+        parts = branch.split("/")
+        engine = parts[1] if len(parts) >= 3 else DEFAULT_ENGINE
+        active_sessions[ch.id] = {
+            "branch": branch,
+            "engine": engine,
+            "description": "recovered session",
+            "turns": 0,
+            "phase": "working",
+        }
+        diff_stat = get_diff_stat()
+        await ch.send(f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n"
+                       f"Send a follow-up, `diff` to inspect, or `done` when finished.")
+        return
+
     # ── Follow-up in active session ───────────────────────────────────────
     if session and session.get("phase") != "review":
         engine = session["engine"]
@@ -688,6 +757,7 @@ async def on_message(message: discord.Message):
             await ch.send(f"❌ Error: `{e}`")
             return
 
+        auto_commit(session["description"], session["turns"])
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
         stat = get_diff_stat()
         await ch.send(f"📊 {stat}\n"
@@ -739,6 +809,7 @@ async def on_message(message: discord.Message):
         "phase": "working",
     }
 
+    auto_commit(task, 1)
     await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
     stat = get_diff_stat()
     await ch.send(f"📊 {stat}\n"
