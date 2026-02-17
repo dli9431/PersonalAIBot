@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-cd "$(dirname "$0")"
+cd ~/PersonalAIBot
 source venv/bin/activate
-python bot.py
+python3 bot.py
