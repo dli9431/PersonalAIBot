@@ -603,6 +603,11 @@ async def on_ready():
 
 
 @client.event
+async def on_resumed():
+    print(f"🤖 Bot reconnected (session resumed) as {client.user}")
+
+
+@client.event
 async def on_message(message: discord.Message):
     global CLAUDE_MODEL, CODEX_MODEL
     if message.author.bot or not is_authorised(message):
