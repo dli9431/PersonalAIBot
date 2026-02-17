@@ -529,8 +529,8 @@ Just type your follow-up — the engine keeps context
 
 **Recovery:**
 `recover` — list orphaned feature branches
-`recover <branch>` — resume a previous session
-`recover drop <branch>` — delete an orphaned branch
+`recover <id>` — resume by short ID (last digits) or full name
+`recover drop <id>` — delete by short ID or full name
 
 **Config:**
 `model claude <name>` — change Claude model (e.g. opus, sonnet, haiku)
@@ -767,26 +767,41 @@ async def on_message(message: discord.Message):
         if not orphans:
             await ch.send("No orphaned feature branches found.")
             return
-        listing = "\n".join(f"• `{b}`" for b in orphans[:10])
+        listing = "\n".join(
+            f"• `{b}` — recover with `recover {b.rsplit('-', 1)[-1]}`"
+            for b in orphans[:10]
+        )
         await ch.send(f"**Orphaned feature branches:**\n{listing}\n\n"
-                       f"Reply `recover <branch>` to resume or `recover drop <branch>` to delete.")
+                       f"Use the short ID or full branch name.")
         return
 
-    if lower.startswith("recover drop "):
-        branch = content[13:].strip()
-        if not branch.startswith(f"{BRANCH_PREFIX}/"):
-            await ch.send("Can only drop feature branches.")
-            return
-        run_git(["git", "branch", "-D", branch])
-        run_git(["git", "push", "origin", "--delete", branch])
-        await ch.send(f"🗑️ Deleted `{branch}` locally and remotely.")
-        return
+    if lower.startswith("recover drop ") or lower.startswith("recover "):
+        is_drop = lower.startswith("recover drop ")
+        arg = content[13:].strip() if is_drop else content[8:].strip()
 
-    if lower.startswith("recover "):
-        branch = content[8:].strip()
-        if not branch.startswith(f"{BRANCH_PREFIX}/"):
-            await ch.send("Can only recover feature branches.")
+        # Resolve short ID (trailing digits) to full branch name
+        if not arg.startswith(f"{BRANCH_PREFIX}/"):
+            result = run_git(["git", "branch", "--sort=-committerdate",
+                              "--format=%(refname:short)"])
+            candidates = [b for b in result.stdout.strip().split("\n")
+                          if b.startswith(f"{BRANCH_PREFIX}/") and b.endswith(f"-{arg}")]
+            if len(candidates) == 1:
+                arg = candidates[0]
+            elif len(candidates) > 1:
+                listing = "\n".join(f"• `{b}`" for b in candidates)
+                await ch.send(f"Multiple matches for `{arg}`:\n{listing}\nUse the full name.")
+                return
+            else:
+                await ch.send(f"No feature branch ending in `{arg}` found.")
+                return
+
+        if is_drop:
+            run_git(["git", "branch", "-D", arg])
+            run_git(["git", "push", "origin", "--delete", arg])
+            await ch.send(f"🗑️ Deleted `{arg}` locally and remotely.")
             return
+
+        branch = arg
         # Check branch exists
         check = run_git(["git", "rev-parse", "--verify", branch])
         if check.returncode != 0:
