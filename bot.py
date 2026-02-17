@@ -373,7 +373,13 @@ async def run_engine(engine: str, task: str, ch: discord.TextChannel, resume: bo
 
 def create_branch(task: str, engine: str) -> str:
     branch = f"{BRANCH_PREFIX}/{engine}/{slugify(task)}-{int(time.time()) % 100000}"
-    run_git(["git", "checkout", MAIN_BRANCH])
+    # Branch from dev if it exists, otherwise main — keeps new branches
+    # up to date with previously merged work and avoids conflicts.
+    base = DEV_BRANCH
+    check = run_git(["git", "rev-parse", "--verify", base])
+    if check.returncode != 0:
+        base = MAIN_BRANCH
+    run_git(["git", "checkout", base])
     run_git(["git", "pull", "--ff-only"])
     run_git(["git", "checkout", "-b", branch])
     return branch
@@ -391,7 +397,7 @@ async def commit_and_push(branch: str, description: str) -> str:
 async def discard_changes(branch: str) -> None:
     run_git(["git", "checkout", "."])
     run_git(["git", "clean", "-fd"])
-    run_git(["git", "checkout", MAIN_BRANCH])
+    run_git(["git", "checkout", DEV_BRANCH])
     run_git(["git", "branch", "-D", branch])
 
 
@@ -456,15 +462,13 @@ Just type your follow-up — the engine keeps context
 
 **Ending a session:**
 `done` — see full diff + push prompt
-`yes` / `push` — commit & push
+`yes` / `push` — commit, push & auto-merge to dev
 `no` / `discard` — discard all changes
 `abort` — discard and end session immediately
 
 **After pushing:**
-`merge dev` — merge feature branch → dev
-`merge main` — merge feature branch → main
 `merge dev>main` — merge dev → main
-`pr dev` / `pr main` — create a PR
+`pr main` — create a PR to main
 
 **Info:**
 `status` · `branches` · `engine` · `help`
@@ -521,7 +525,7 @@ async def on_message(message: discord.Message):
             await ch.send("No changes to commit.")
             return
         session["phase"] = "review"
-        await ch.send("Reply **yes** to commit & push, or **no** to discard.")
+        await ch.send("Reply **yes** to commit, push & merge to dev, or **no** to discard.")
         return
 
     # ── Session: push approval ────────────────────────────────────────────
@@ -532,10 +536,13 @@ async def on_message(message: discord.Message):
             await ch.send(result)
             if "✅" in result:
                 last_pushed[ch.id] = session["branch"]
-                await ch.send(
-                    f"`merge dev` · `merge main` · `pr dev` · `pr main`"
-                )
-            run_git(["git", "checkout", MAIN_BRANCH])
+                # Auto-merge into dev
+                await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
+                merge_result = await merge_branch(session["branch"], DEV_BRANCH)
+                await ch.send(merge_result)
+                await ch.send(f"`pr main` to create a PR to main")
+            else:
+                run_git(["git", "checkout", DEV_BRANCH])
             del active_sessions[ch.id]
             return
         # If no session but maybe old-style pending
@@ -547,7 +554,7 @@ async def on_message(message: discord.Message):
         if session and session.get("phase") == "review":
             await discard_changes(session["branch"])
             del active_sessions[ch.id]
-            await ch.send(f"🗑️ Discarded, back on `{MAIN_BRANCH}`.")
+            await ch.send(f"🗑️ Discarded, back on `{DEV_BRANCH}`.")
             return
         await ch.send("No session awaiting approval. Use `abort` to end an active session.")
         return
@@ -557,7 +564,7 @@ async def on_message(message: discord.Message):
         if session:
             await discard_changes(session["branch"])
             del active_sessions[ch.id]
-            await ch.send(f"🗑️ Session aborted, back on `{MAIN_BRANCH}`.")
+            await ch.send(f"🗑️ Session aborted, back on `{DEV_BRANCH}`.")
         else:
             await ch.send("No active session.")
         return
