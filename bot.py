@@ -253,7 +253,63 @@ async def login_claude(ch: discord.TextChannel) -> None:
 
 # ── Engine runners ────────────────────────────────────────────────────────────
 
-async def run_claude_code(task: str, resume: bool = False, images: list[str] | None = None) -> str:
+HEARTBEAT_INTERVAL = 30  # seconds between "still working..." messages
+
+
+async def _run_with_heartbeat(cmd: list[str], ch: discord.TextChannel, label: str) -> str:
+    """Run a subprocess, sending periodic heartbeats to Discord while it works."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=REPO_PATH,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    start = time.time()
+    last_heartbeat = start
+
+    async def read_stdout():
+        nonlocal last_heartbeat
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            stdout_chunks.append(chunk)
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                elapsed = int(now - start)
+                last_heartbeat = now
+                await ch.send(f"⏳ {label} still working... ({elapsed}s)")
+
+    async def read_stderr():
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(read_stdout(), read_stderr(), proc.wait()),
+            timeout=ENGINE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT)
+
+    stdout = b"".join(stdout_chunks).decode(errors="replace")
+    stderr = b"".join(stderr_chunks).decode(errors="replace")
+
+    output = stdout or "(no output)"
+    if proc.returncode != 0 and stderr:
+        tail = stderr.strip().split("\n")[-5:]
+        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail)
+    return output
+
+
+async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None) -> str:
     """Run Claude Code. If resume=True, uses --resume to continue last session."""
     if images:
         img_lines = "\n".join(f"- {p}" for p in images)
@@ -276,18 +332,10 @@ async def run_claude_code(task: str, resume: bool = False, images: list[str] | N
         cmd.append("--disallowedTools")
         cmd.extend(CLAUDE_DENIED_TOOLS)
 
-    proc = await asyncio.to_thread(
-        subprocess.run, cmd,
-        cwd=REPO_PATH, capture_output=True, text=True,
-        timeout=ENGINE_TIMEOUT,
-    )
-    output = proc.stdout or "(no output)"
-    if proc.returncode != 0 and proc.stderr:
-        output += f"\n\n⚠️ stderr:\n{proc.stderr[-500:]}"
-    return output
+    return await _run_with_heartbeat(cmd, ch, "Claude Code")
 
 
-async def run_codex(task: str, resume: bool = False, images: list[str] | None = None) -> str:
+async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None) -> str:
     """Run Codex CLI. If resume=True, uses exec resume --last for context."""
     if resume:
         cmd = [
@@ -306,22 +354,13 @@ async def run_codex(task: str, resume: bool = False, images: list[str] | None = 
     if images:
         cmd.extend(["--image", ",".join(images)])
 
-    proc = await asyncio.to_thread(
-        subprocess.run, cmd,
-        cwd=REPO_PATH, capture_output=True, text=True,
-        timeout=ENGINE_TIMEOUT,
-    )
-    output = proc.stdout or "(no output)"
-    if proc.returncode != 0 and proc.stderr:
-        tail = proc.stderr.strip().split("\n")[-5:]
-        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail)
-    return output
+    return await _run_with_heartbeat(cmd, ch, "Codex CLI")
 
 
-async def run_engine(engine: str, task: str, resume: bool = False, images: list[str] | None = None) -> str:
+async def run_engine(engine: str, task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None) -> str:
     if engine == "codex":
-        return await run_codex(task, resume, images)
-    return await run_claude_code(task, resume, images)
+        return await run_codex(task, ch, resume, images)
+    return await run_claude_code(task, ch, resume, images)
 
 
 # ── Git workflow ──────────────────────────────────────────────────────────────
@@ -606,7 +645,7 @@ async def on_message(message: discord.Message):
                        f"> {truncate(follow_up_task, 200)}"
                        + (f"\n📎 {len(images)} image(s) attached" if images else ""))
         try:
-            output = await run_engine(engine, follow_up_task, resume=True, images=images)
+            output = await run_engine(engine, follow_up_task, ch, resume=True, images=images)
         except subprocess.TimeoutExpired:
             await ch.send(f"⏰ Timed out ({ENGINE_TIMEOUT}s).")
             return
@@ -646,7 +685,7 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        output = await run_engine(engine, task, resume=False, images=images)
+        output = await run_engine(engine, task, ch, resume=False, images=images)
     except subprocess.TimeoutExpired:
         await ch.send(f"⏰ {label} timed out ({ENGINE_TIMEOUT}s).")
         await discard_changes(branch)
