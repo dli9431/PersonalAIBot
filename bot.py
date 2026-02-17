@@ -115,6 +115,19 @@ def has_gh_cli() -> bool:
         return False
 
 
+def check_github_ssh() -> bool:
+    """Test SSH connection to GitHub. Returns True if auth succeeds."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-T", "git@github.com"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # ssh -T returns exit code 1 on success with "Hi <user>!" in stderr
+        return "successfully authenticated" in result.stderr.lower()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 def parse_engine_and_task(content: str) -> tuple[str, str]:
     lower = content.lower()
     for prefix in ("claude:", "cc:", "claude code:"):
@@ -557,12 +570,18 @@ async def slash_help(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     await tree.sync()
+    ssh_ok = check_github_ssh()
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user : {ALLOWED_USER_ID}")
     print(f"   Repo         : {REPO_PATH}")
     print(f"   Default engine: {DEFAULT_ENGINE}")
     print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
     print(f"   gh CLI       : {'yes' if has_gh_cli() else 'no'}")
+    print(f"   GitHub SSH   : {'yes' if ssh_ok else '⚠️  FAILED'}")
+    if not ssh_ok:
+        print(f"\n⚠️  Cannot connect to GitHub via SSH.")
+        print(f"   Fix:   eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519")
+        print(f"   Test:  ssh -T git@github.com")
     print(f"   Slash commands synced")
 
 
