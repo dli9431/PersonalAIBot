@@ -157,11 +157,21 @@ async def download_attachments(message: discord.Message) -> list[str]:
     return paths
 
 
+def _base_branch() -> str:
+    """Return the base branch to diff against (dev if it exists, else main)."""
+    check = run_git(["git", "rev-parse", "--verify", DEV_BRANCH])
+    return DEV_BRANCH if check.returncode == 0 else MAIN_BRANCH
+
+
 def get_diff() -> str:
-    diff = run_git(["git", "diff"]).stdout or ""
+    base = _base_branch()
+    # Committed changes on this branch vs base
+    committed = run_git(["git", "diff", f"{base}...HEAD"]).stdout or ""
+    # Plus any uncommitted changes not yet auto-committed
+    uncommitted = run_git(["git", "diff"]).stdout or ""
     staged = run_git(["git", "diff", "--cached"]).stdout or ""
     untracked = run_git(["git", "ls-files", "--others", "--exclude-standard"]).stdout.strip()
-    combined = diff + staged
+    combined = committed + uncommitted + staged
     if untracked:
         combined += f"\n\nNew files:\n{untracked}"
     return combined.strip() or "(no changes detected)"
@@ -169,11 +179,16 @@ def get_diff() -> str:
 
 def get_diff_stat() -> str:
     """Short summary: 3 files changed, 12 insertions, 2 deletions."""
-    stat = run_git(["git", "diff", "--stat"]).stdout.strip()
+    base = _base_branch()
+    stat = run_git(["git", "diff", "--stat", f"{base}...HEAD"]).stdout.strip()
+    # Also include any uncommitted changes
+    uncommitted_stat = run_git(["git", "diff", "--stat"]).stdout.strip()
     untracked = run_git(["git", "ls-files", "--others", "--exclude-standard"]).stdout.strip()
     lines = []
     if stat:
-        lines.append(stat.split("\n")[-1].strip())  # summary line
+        lines.append(stat.split("\n")[-1].strip())
+    elif uncommitted_stat:
+        lines.append(uncommitted_stat.split("\n")[-1].strip())
     if untracked:
         n = len(untracked.split("\n"))
         lines.append(f"{n} new file(s)")
