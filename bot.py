@@ -16,6 +16,7 @@ Requirements:
 import asyncio
 import os
 import subprocess
+import sys
 import time
 
 import discord
@@ -48,6 +49,9 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.2-codex")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
+
+# Track login processes so we don't run two at once
+_login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
 
 # ── Discord client setup ─────────────────────────────────────────────────────
 
@@ -133,6 +137,101 @@ def get_diff_stat() -> str:
         n = len(untracked.split("\n"))
         lines.append(f"{n} new file(s)")
     return ", ".join(lines) or "no changes"
+
+
+# ── Login helpers ─────────────────────────────────────────────────────────────
+
+async def login_codex(ch: discord.TextChannel) -> None:
+    """Run `codex login --device-auth`, relay URL+code to Discord, wait for completion."""
+    await ch.send("🔑 Starting Codex device login...")
+
+    proc = await asyncio.create_subprocess_exec(
+        "codex", "login", "--device-auth",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    output_lines = []
+    sent_link = False
+
+    async def read_stream(stream):
+        nonlocal sent_link
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode().strip()
+            if not text:
+                continue
+            output_lines.append(text)
+            # Look for URL or code patterns and relay to Discord
+            if not sent_link and ("http" in text.lower() or "code" in text.lower()
+                                  or "open" in text.lower() or "visit" in text.lower()):
+                await ch.send(f"```\n{text}\n```")
+            # Send any line that looks like it contains actionable info
+            elif any(kw in text.lower() for kw in ("success", "logged in", "authenticated", "error", "failed")):
+                await ch.send(f"```\n{text}\n```")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(read_stream(proc.stdout), read_stream(proc.stderr)),
+            timeout=120,
+        )
+        await proc.wait()
+    except asyncio.TimeoutError:
+        proc.kill()
+        await ch.send("⏰ Login timed out (120s). Try again.")
+        return
+
+    if proc.returncode == 0:
+        await ch.send("✅ Codex login successful!")
+    else:
+        combined = "\n".join(output_lines[-5:]) if output_lines else "(no output)"
+        await ch.send(f"❌ Codex login failed (exit {proc.returncode}):\n```\n{combined}\n```")
+
+
+async def login_claude(ch: discord.TextChannel) -> None:
+    """Run `claude login`, relay the OAuth URL to Discord, wait for completion."""
+    await ch.send("🔑 Starting Claude Code login...")
+
+    proc = await asyncio.create_subprocess_exec(
+        "claude", "login",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    output_lines = []
+
+    async def read_stream(stream):
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode().strip()
+            if not text:
+                continue
+            output_lines.append(text)
+            if any(kw in text.lower() for kw in ("http", "url", "open", "visit", "code",
+                                                   "success", "logged in", "authenticated",
+                                                   "error", "failed")):
+                await ch.send(f"```\n{text}\n```")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(read_stream(proc.stdout), read_stream(proc.stderr)),
+            timeout=120,
+        )
+        await proc.wait()
+    except asyncio.TimeoutError:
+        proc.kill()
+        await ch.send("⏰ Login timed out (120s). Try again.")
+        return
+
+    if proc.returncode == 0:
+        await ch.send("✅ Claude Code login successful!")
+    else:
+        combined = "\n".join(output_lines[-5:]) if output_lines else "(no output)"
+        await ch.send(f"❌ Claude login failed (exit {proc.returncode}):\n```\n{combined}\n```")
 
 
 # ── Engine runners ────────────────────────────────────────────────────────────
@@ -289,7 +388,12 @@ Just type your follow-up — the engine keeps context
 `pr dev` / `pr main` — create a PR
 
 **Info:**
-`status` · `branches` · `engine` · `help`""".format(default=DEFAULT_ENGINE)
+`status` · `branches` · `engine` · `help`
+
+**Login:**
+`login claude` — authenticate Claude Code (browser OAuth)
+`login codex` — authenticate Codex CLI (device code)
+`login both` — authenticate both""".format(default=DEFAULT_ENGINE)
 
 
 @client.event
@@ -410,6 +514,28 @@ async def on_message(message: discord.Message):
         await ch.send(await create_pr(src, tgt, f"auto: {src}"))
         return
 
+    # ── Login commands ────────────────────────────────────────────────────
+    if lower.startswith("login"):
+        if _login_lock.get(ch.id):
+            await ch.send("⏳ A login is already in progress in this channel.")
+            return
+
+        arg = lower[5:].strip()
+        _login_lock[ch.id] = True
+        try:
+            if arg in ("codex", "cx", "openai"):
+                await login_codex(ch)
+            elif arg in ("claude", "cc", ""):
+                await login_claude(ch)
+            elif arg == "both":
+                await login_claude(ch)
+                await login_codex(ch)
+            else:
+                await ch.send("Usage: `login claude`, `login codex`, or `login both`")
+        finally:
+            _login_lock.pop(ch.id, None)
+        return
+
     # ── Info commands ─────────────────────────────────────────────────────
     if lower == "help":
         await ch.send(HELP_TEXT)
@@ -514,5 +640,25 @@ async def on_message(message: discord.Message):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+async def stdin_listener():
+    """Read stdin in a thread, close the bot when user types 'exit' or 'quit'."""
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:  # EOF (e.g. piped input ended)
+            break
+        cmd = line.strip().lower()
+        if cmd in ("exit", "quit", "shutdown"):
+            print("🛑 Shutting down...")
+            await client.close()
+            break
+
+
+async def main():
+    async with client:
+        client.loop.create_task(stdin_listener())
+        await client.start(DISCORD_TOKEN)
+
+
 if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)
+    asyncio.run(main())
