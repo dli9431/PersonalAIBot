@@ -440,6 +440,7 @@ async def discard_changes(branch: str) -> None:
 # ── Merge / PR ────────────────────────────────────────────────────────────────
 
 async def merge_branch(source: str, target: str) -> str:
+    run_git(["git", "fetch", "--all"])
     run_git(["git", "checkout", target])
     run_git(["git", "pull", "--ff-only"])
 
