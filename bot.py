@@ -182,7 +182,6 @@ async def login_codex(ch: discord.TextChannel) -> None:
     sent_link = False
 
     async def read_stream(stream):
-        nonlocal sent_link
         while True:
             line = await stream.readline()
             if not line:
@@ -191,13 +190,7 @@ async def login_codex(ch: discord.TextChannel) -> None:
             if not text:
                 continue
             output_lines.append(text)
-            # Look for URL or code patterns and relay to Discord
-            if not sent_link and ("http" in text.lower() or "code" in text.lower()
-                                  or "open" in text.lower() or "visit" in text.lower()):
-                await ch.send(f"```\n{text}\n```")
-            # Send any line that looks like it contains actionable info
-            elif any(kw in text.lower() for kw in ("success", "logged in", "authenticated", "error", "failed")):
-                await ch.send(f"```\n{text}\n```")
+            await ch.send(f"```\n{text}\n```")
 
     try:
         await asyncio.wait_for(
@@ -238,10 +231,7 @@ async def login_claude(ch: discord.TextChannel) -> None:
             if not text:
                 continue
             output_lines.append(text)
-            if any(kw in text.lower() for kw in ("http", "url", "open", "visit", "code",
-                                                   "success", "logged in", "authenticated",
-                                                   "error", "failed")):
-                await ch.send(f"```\n{text}\n```")
+            await ch.send(f"```\n{text}\n```")
 
     try:
         await asyncio.wait_for(
@@ -705,4 +695,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Suppress "Event loop is closed" noise from subprocess transport __del__
+        sys.stderr = open(os.devnull, "w")
