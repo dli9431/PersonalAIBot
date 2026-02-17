@@ -552,6 +552,8 @@ Just type your follow-up — the engine keeps context
 
 **Info:**
 `status` · `branches` · `help`
+`pull` — pull latest dev from remote
+`pull main` — pull latest main from remote
 
 **Login:**
 `login claude` — authenticate Claude Code (browser OAuth)
@@ -745,6 +747,21 @@ async def on_message(message: discord.Message):
         branches = [b for b in result.stdout.strip().split("\n") if b][:10]
         listing = "\n".join(f"• `{b}`" for b in branches)
         await ch.send(f"**Recent branches:**\n{listing}")
+        return
+
+    if lower.startswith("pull"):
+        arg = lower[4:].strip()
+        branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg, arg) if arg else DEV_BRANCH
+        await ch.send(f"⏳ Pulling `{branch}` from remote...")
+        fetch = run_git(["git", "fetch", "origin", branch])
+        if fetch.returncode != 0:
+            await ch.send(f"❌ Fetch failed:\n```\n{fetch.stderr.strip()}\n```")
+            return
+        pull = run_git(["git", "pull", "origin", branch])
+        if pull.returncode != 0:
+            await ch.send(f"❌ Pull failed:\n```\n{pull.stderr.strip()}\n```")
+            return
+        await ch.send(f"✅ `{branch}` is up to date.\n```\n{pull.stdout.strip() or pull.stderr.strip()}\n```")
         return
 
     if lower == "engine":
