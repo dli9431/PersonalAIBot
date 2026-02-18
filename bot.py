@@ -612,6 +612,7 @@ Just type your follow-up — the engine keeps context
 `repo <n> diff` — diff for project n
 `repo <n> commit [msg]` — stage all & commit in project n
 `repo <n> push` — push project n
+`repo <n> branches` — list branches for project n
 
 **Info:**
 `status` · `branches` · `help` · `restart`
@@ -917,8 +918,16 @@ async def on_message(message: discord.Message):
             else:
                 await ch.send(f"❌ **{label}** push failed:\n```\n{result.stderr.strip()}\n```")
 
+        elif subcmd_lower == "branches":
+            result = run_git_in(["git", "branch", "--sort=-committerdate",
+                                  "--format=%(refname:short)"], path)
+            branches = [b for b in result.stdout.strip().split("\n") if b][:15]
+            current = run_git_in(["git", "branch", "--show-current"], path).stdout.strip()
+            listing = "\n".join(f"{'→' if b == current else '•'} `{b}`" for b in branches)
+            await ch.send(f"**{label} branches:**\n{listing or '(none)'}")
+
         else:
-            await ch.send("Usage: `repo <n> status|diff|commit [msg]|push`")
+            await ch.send("Usage: `repo <n> status|diff|commit [msg]|push|branches`")
         return
 
     # ── Switch active working directory ───────────────────────────────────
