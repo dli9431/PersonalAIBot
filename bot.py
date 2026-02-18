@@ -92,6 +92,8 @@ active_sessions: dict[int, dict] = {}
 last_pushed: dict[int, str] = {}
 # channel_id → active working directory (defaults to REPO_PATH)
 channel_cwd: dict[int, str] = {}
+# channel_id → numbered branch list from last `branches` command
+branch_listing: dict[int, list[str]] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -126,6 +128,31 @@ def resolve_project(arg: str) -> tuple[str, str] | None:
         if arg.lower() in label.lower():
             return label, path
     return None
+
+
+def resolve_branch(ref: str, ch_id: int, cwd: str | None = None) -> str | None:
+    """Resolve a branch reference: #N (from branch_listing), plain number, or name.
+
+    Returns the branch name, or None if not found.
+    """
+    # Strip leading # if present
+    clean = ref.lstrip("#")
+    # Try as a number index into the cached branch listing
+    if clean.isdigit():
+        idx = int(clean) - 1
+        listing = branch_listing.get(ch_id, [])
+        if 0 <= idx < len(listing):
+            return listing[idx]
+        return None
+    # Otherwise treat as a literal branch name
+    return ref
+
+
+def get_branch_list(cwd: str | None = None) -> list[str]:
+    """Return recent branches sorted by committer date."""
+    result = run_git(["git", "branch", "--sort=-committerdate",
+                      "--format=%(refname:short)"], cwd)
+    return [b for b in result.stdout.strip().split("\n") if b]
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -888,21 +915,32 @@ async def on_message(message: discord.Message):
     # ── Merge commands ────────────────────────────────────────────────────
     if lower.startswith("merge "):
         aliases = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}
-        target_str = lower[6:].strip()
+        target_str = content[6:].strip()  # preserve original case
+        target_lower = target_str.lower()
+
+        def _resolve_merge_ref(ref: str) -> str:
+            ref = ref.strip()
+            low = ref.lower()
+            if low in aliases:
+                return aliases[low]
+            if ref.startswith("#") or ref.lstrip("#").isdigit():
+                resolved = resolve_branch(ref, ch.id, cwd)
+                return resolved or ref
+            return ref
 
         if ">" in target_str:
             # merge src>tgt
             parts = target_str.split(">", 1)
-            src = aliases.get(parts[0].strip(), parts[0].strip())
-            tgt = aliases.get(parts[1].strip(), parts[1].strip())
-        elif " into " in target_str:
+            src = _resolve_merge_ref(parts[0])
+            tgt = _resolve_merge_ref(parts[1])
+        elif " into " in target_lower:
             # merge src into tgt
-            parts = target_str.split(" into ", 1)
-            src = aliases.get(parts[0].strip(), parts[0].strip())
-            tgt = aliases.get(parts[1].strip(), parts[1].strip())
+            idx = target_lower.index(" into ")
+            src = _resolve_merge_ref(target_str[:idx])
+            tgt = _resolve_merge_ref(target_str[idx + 6:])
         else:
             # merge <tgt> — use last pushed, session branch, or current branch as src
-            tgt = aliases.get(target_str, target_str)
+            tgt = _resolve_merge_ref(target_str)
             src = (last_pushed.get(ch.id)
                    or (session["branch"] if session else None)
                    or current_branch(cwd))
@@ -981,11 +1019,15 @@ async def on_message(message: discord.Message):
         return
 
     if lower == "branches":
-        result = run_git(["git", "branch", "--sort=-committerdate",
-                          "--format=%(refname:short)"], cwd)
-        branches = [b for b in result.stdout.strip().split("\n") if b][:10]
-        listing = "\n".join(f"• `{b}`" for b in branches)
-        await ch.send(f"**Recent branches ({cwd}):**\n{listing}")
+        branches = get_branch_list(cwd)[:15]
+        branch_listing[ch.id] = branches  # cache for #N references
+        cur = current_branch(cwd)
+        listing = "\n".join(
+            f"{'→' if b == cur else '•'} **{i}.** `{b}`"
+            for i, b in enumerate(branches, 1)
+        )
+        await ch.send(f"**Recent branches ({cwd}):**\n{listing}\n\n"
+                       f"_Use `#N` in commands (e.g. `merge #1`, `switch #3`)_")
         return
 
     if lower.startswith("pull"):
@@ -1096,10 +1138,12 @@ async def on_message(message: discord.Message):
 
     # ── Switch branch mid-session ─────────────────────────────────────────
     if lower.startswith("switch "):
-        branch_name = content[7:].strip()  # preserve case for branch name
+        branch_ref = content[7:].strip()  # preserve case for branch name
         if not session:
             await ch.send("No active session. Start a task first.")
             return
+        # Resolve #N references
+        branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
         # Auto-commit current work before switching
         auto_commit(session["description"], session["turns"], cwd)
         check = run_git(["git", "rev-parse", "--verify", branch_name], cwd)
@@ -1119,9 +1163,10 @@ async def on_message(message: discord.Message):
         prefix_len = len("branch delete ") if lower.startswith("branch delete ") else len("branch del ")
         parts = content[prefix_len:].strip().split()
         if not parts:
-            await ch.send("Usage: `branch delete <name> [local|remote|both] [force]`")
+            await ch.send("Usage: `branch delete <name|#N> [local|remote|both] [force]`")
             return
-        branch_name = parts[0]
+        branch_ref = parts[0]
+        branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
         flags = {p.lower() for p in parts[1:]}
         scope = "both"
         if "local" in flags:
