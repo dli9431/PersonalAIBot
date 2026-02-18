@@ -35,6 +35,7 @@ REPO_PATH = os.environ["REPO_PATH"]
 BRANCH_PREFIX = os.getenv("BRANCH_PREFIX", "auto")
 MAIN_BRANCH = os.getenv("MAIN_BRANCH", "main")
 DEV_BRANCH = os.getenv("DEV_BRANCH", "dev")
+PROTECTED_BRANCHES_ENV = os.getenv("PROTECTED_BRANCHES", "")
 MAX_DIFF_CHARS = 1800
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
@@ -180,6 +181,19 @@ def resolve_branch_case_insensitive(name: str, cwd: str | None = None) -> str | 
     return None
 
 
+def expand_branch_args(tokens: list[str], ch_id: int, cwd: str) -> list[str]:
+    """Expand branch tokens, resolving N/#N references and splitting commas."""
+    names: list[str] = []
+    for token in tokens:
+        for chunk in token.split(","):
+            name = chunk.strip()
+            if not name:
+                continue
+            resolved = resolve_branch(name, ch_id, cwd) if name.lstrip("#").isdigit() else None
+            names.append(resolved or name)
+    return names
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -198,6 +212,12 @@ def current_branch(path: str | None = None) -> str:
     return run_git(["git", "branch", "--show-current"], path).stdout.strip()
 
 
+def _parse_branch_list(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return [b.strip() for b in re.split(r"[,\s]+", raw) if b.strip()]
+
+
 def _load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text())
@@ -212,6 +232,47 @@ def _save_state(state: dict) -> None:
         STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
     except OSError:
         pass
+
+
+PROTECTED_BRANCHES: list[str] = []
+_PROTECTED_BRANCH_KEYS: set[str] = set()
+
+
+def _default_protected_branches() -> list[str]:
+    defaults = [b for b in (MAIN_BRANCH, DEV_BRANCH) if b]
+    defaults.extend(_parse_branch_list(PROTECTED_BRANCHES_ENV))
+    return defaults
+
+
+def _set_protected_branches(branches: list[str], save: bool = True) -> None:
+    global PROTECTED_BRANCHES, _PROTECTED_BRANCH_KEYS
+    uniq = []
+    seen = set()
+    for b in (b.strip() for b in branches if b and b.strip()):
+        key = b.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(b)
+    PROTECTED_BRANCHES = uniq
+    _PROTECTED_BRANCH_KEYS = {b.lower() for b in PROTECTED_BRANCHES}
+    if save:
+        state = _load_state()
+        state["protected_branches"] = PROTECTED_BRANCHES
+        _save_state(state)
+
+
+def _init_protected_branches() -> None:
+    state = _load_state()
+    branches = state.get("protected_branches") or _default_protected_branches()
+    _set_protected_branches(branches, save=not bool(state.get("protected_branches")))
+
+
+def is_protected_branch(branch: str) -> bool:
+    return branch.strip().lower() in _PROTECTED_BRANCH_KEYS
+
+
+_init_protected_branches()
 
 
 def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
@@ -672,6 +733,8 @@ async def discard_changes(branch: str, path: str | None = None) -> None:
     run_git(["git", "checkout", "."], path)
     run_git(["git", "clean", "-fd"], path)
     run_git(["git", "checkout", DEV_BRANCH], path)
+    if is_protected_branch(branch):
+        return
     run_git(["git", "branch", "-D", branch], path)
 
 
@@ -698,9 +761,12 @@ async def merge_branch(source: str, target: str, path: str | None = None) -> str
 
     # Clean up: delete the feature branch locally and remotely after merging
     if source.startswith(f"{BRANCH_PREFIX}/"):
-        run_git(["git", "branch", "-D", source], path)
-        run_git(["git", "push", "origin", "--delete", source], path)
-        result += f"\n🗑️ Deleted branch `{source}`."
+        if is_protected_branch(source):
+            result += f"\n🛡️ Protected branch; skipping delete for `{source}`."
+        else:
+            run_git(["git", "branch", "-D", source], path)
+            run_git(["git", "push", "origin", "--delete", source], path)
+            result += f"\n🗑️ Deleted branch `{source}`."
 
     # Pull the target branch so the local repo stays up to date
     run_git(["git", "pull", "--ff-only"], path)
@@ -748,6 +814,7 @@ Type follow-ups freely — engine keeps context
 HELP_TEXT_2 = """**Branches:**
 `branches` — list branches (use `N` in commands)
 `branch delete <name|N> [local|remote] [force]`
+`branch protect [list|add|remove|clear|reset]`
 `branch switch <branch|N>` — switch branch (in active session)
 
 **Recovery:**
@@ -1317,6 +1384,56 @@ async def on_message(message: discord.Message):
         return
 
     # ── Branch delete ─────────────────────────────────────────────────────
+    if lower.startswith("branch protect"):
+        args = content[len("branch protect"):].strip().split()
+        if not args or args[0].lower() == "list":
+            listing = "\n".join(f"• `{b}`" for b in PROTECTED_BRANCHES) or "(none)"
+            await ch.send(
+                f"**Protected branches:**\n{listing}\n\n"
+                "Use `branch protect add <branch>` or `branch protect remove <branch>`."
+            )
+            return
+
+        action = args[0].lower()
+        rest = args[1:]
+        if action == "add":
+            names = expand_branch_args(rest, ch.id, cwd)
+            if not names:
+                await ch.send("Usage: `branch protect add <branch...>`")
+                return
+            combined = PROTECTED_BRANCHES + names
+            _set_protected_branches(combined)
+            added = [b for b in names if is_protected_branch(b)]
+            listing = "\n".join(f"• `{b}`" for b in added) or "(none)"
+            await ch.send(f"✅ Added protected branches:\n{listing}")
+            return
+
+        if action in ("remove", "rm", "del", "delete"):
+            names = expand_branch_args(rest, ch.id, cwd)
+            if not names:
+                await ch.send("Usage: `branch protect remove <branch...>`")
+                return
+            remove_keys = {b.lower() for b in names}
+            remaining = [b for b in PROTECTED_BRANCHES if b.lower() not in remove_keys]
+            _set_protected_branches(remaining)
+            listing = "\n".join(f"• `{b}`" for b in names) or "(none)"
+            await ch.send(f"✅ Removed protected branches:\n{listing}")
+            return
+
+        if action in ("clear",):
+            _set_protected_branches([])
+            await ch.send("✅ Cleared protected branches list.")
+            return
+
+        if action in ("reset", "default"):
+            _set_protected_branches(_default_protected_branches())
+            listing = "\n".join(f"• `{b}`" for b in PROTECTED_BRANCHES) or "(none)"
+            await ch.send(f"✅ Reset protected branches:\n{listing}")
+            return
+
+        await ch.send("Usage: `branch protect [list|add|remove|clear|reset]`")
+        return
+
     if lower.startswith("branch delete ") or lower.startswith("branch del "):
         prefix_len = len("branch delete ") if lower.startswith("branch delete ") else len("branch del ")
         parts = content[prefix_len:].strip().split()
@@ -1327,6 +1444,12 @@ async def on_message(message: discord.Message):
         branch_name = resolve_branch(branch_ref, ch.id, cwd)
         if branch_name is None:
             await ch.send(f"❌ `{branch_ref}` didn't match any branch. Run `branches` first to use `N` refs.")
+            return
+        if is_protected_branch(branch_name):
+            await ch.send(
+                f"🛡️ `{branch_name}` is protected and cannot be deleted.\n"
+                f"Use `branch protect remove {branch_name}` if you really need to delete it."
+            )
             return
         flags = {p.lower() for p in parts[1:]}
         scope = "both"
@@ -1457,6 +1580,12 @@ async def on_message(message: discord.Message):
                 return
 
         if is_drop:
+            if is_protected_branch(arg):
+                await ch.send(
+                    f"🛡️ `{arg}` is protected and cannot be deleted.\n"
+                    f"Use `branch protect remove {arg}` if you really need to delete it."
+                )
+                return
             run_git(["git", "branch", "-D", arg], cwd)
             run_git(["git", "push", "origin", "--delete", arg], cwd)
             await ch.send(f"🗑️ Deleted `{arg}` locally and remotely.")

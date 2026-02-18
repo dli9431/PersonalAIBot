@@ -72,6 +72,7 @@ REPO_PATH=/home/you/code/my-app     # absolute path to your main project
 BRANCH_PREFIX=auto
 MAIN_BRANCH=main
 DEV_BRANCH=dev
+PROTECTED_BRANCHES=main,dev
 
 # Engine defaults
 DEFAULT_ENGINE=claude    # or codex
@@ -193,6 +194,7 @@ pr main               → open a GitHub PR targeting main
 | `branches` | List recent branches (assigns `N` references) |
 | `branch switch <branch\|N>` | Switch branch in active session |
 | `branch delete <name\|N> [local\|remote] [force]` | Delete a branch (checks if merged first) |
+| `branch protect [list\|add\|remove\|clear\|reset]` | Manage protected branches (blocks deletion) |
 
 ### Multi-repo
 
