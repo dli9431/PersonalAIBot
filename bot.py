@@ -791,6 +791,8 @@ async def on_ready():
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user : {ALLOWED_USER_ID}")
     print(f"   Repo         : {REPO_PATH}")
+    active_label = next((l for l, p in GIT_PROJECTS if p == REPO_PATH), pathlib.Path(REPO_PATH).name)
+    print(f"   Active repo  : {active_label} ({REPO_PATH})")
     print(f"   Default engine: {DEFAULT_ENGINE}")
     print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
     print(f"   gh CLI       : {'yes' if has_gh_cli() else 'no'}")
@@ -1118,7 +1120,8 @@ async def on_message(message: discord.Message):
             branch = run_git_in(["git", "branch", "--show-current"], path).stdout.strip() or "?"
             st = run_git_in(["git", "status", "--porcelain"], path).stdout.strip()
             dirty = f" · {len(st.splitlines())} change(s)" if st else " · clean"
-            lines.append(f"**{i}. {label}** (`{branch}`){dirty}\n   `{path}`")
+            active = " · active" if path == cwd else ""
+            lines.append(f"**{i}. {label}** (`{branch}`){dirty}{active}\n   `{path}`")
         await ch.send("**Git projects:**\n" + "\n".join(lines))
         return
 
