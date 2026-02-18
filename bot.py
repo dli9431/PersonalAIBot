@@ -612,7 +612,9 @@ Just type your follow-up — the engine keeps context
 `abort` — discard and end session immediately
 
 **After pushing:**
-`merge dev>main` — merge dev → main
+`merge <target>` — merge current/last-pushed branch into target
+`merge src>tgt` — merge src into tgt
+`merge src into tgt` — same with natural language
 `pr main` — create a PR to main
 
 **Recovery:**
@@ -817,16 +819,31 @@ async def on_message(message: discord.Message):
 
     # ── Merge commands ────────────────────────────────────────────────────
     if lower.startswith("merge "):
+        aliases = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}
         target_str = lower[6:].strip()
+
         if ">" in target_str:
+            # merge src>tgt
             parts = target_str.split(">", 1)
-            src = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(parts[0].strip(), parts[0].strip())
-            tgt = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(parts[1].strip(), parts[1].strip())
+            src = aliases.get(parts[0].strip(), parts[0].strip())
+            tgt = aliases.get(parts[1].strip(), parts[1].strip())
+        elif " into " in target_str:
+            # merge src into tgt
+            parts = target_str.split(" into ", 1)
+            src = aliases.get(parts[0].strip(), parts[0].strip())
+            tgt = aliases.get(parts[1].strip(), parts[1].strip())
         else:
-            src = last_pushed.get(ch.id)
-            tgt = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(target_str, target_str)
+            # merge <tgt> — use last pushed, session branch, or current branch as src
+            tgt = aliases.get(target_str, target_str)
+            src = (last_pushed.get(ch.id)
+                   or (session["branch"] if session else None)
+                   or current_branch(cwd))
+
         if not src:
-            await ch.send("No recently pushed branch. Push first.")
+            await ch.send("Usage: `merge <target>`, `merge src>tgt`, or `merge src into tgt`")
+            return
+        if src == tgt:
+            await ch.send(f"❌ Source and target are the same branch: `{src}`")
             return
         await ch.send(f"⏳ Merging `{src}` → `{tgt}`...")
         await ch.send(await merge_branch(src, tgt, cwd))
