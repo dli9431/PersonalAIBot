@@ -1,3 +1,4 @@
 .env
 venv/
 .claude/settings.local.json
+.bot_state.json

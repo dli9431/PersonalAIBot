@@ -25,7 +25,7 @@ No build step, test suite, or linter is configured.
 
 1. **Config & State** (~lines 29-97) — Environment variables via `python-dotenv`. `GIT_PROJECTS` list of (label, path) tuples for multi-repo support. Per-channel state: `active_sessions`, `last_pushed`, `channel_cwd`, `branch_listing`.
 
-2. **Helpers** (~lines 99-278) — Auth check, slugify, `run_git(cmd, path)` with optional cwd override, `resolve_project`, `resolve_branch` (#N ref lookup), `get_diff`/`get_diff_stat` (compares feature branch vs base, not just working tree), `branch_merged_status`.
+2. **Helpers** (~lines 99-278) — Auth check, slugify, `run_git(cmd, path)` with optional cwd override, `resolve_project`, `resolve_branch` (N ref lookup), `get_diff`/`get_diff_stat` (compares feature branch vs base, not just working tree), `branch_merged_status`.
 
 3. **Login Helpers** (~lines 280-363) — `login_claude()` and `login_codex()` run the respective CLI auth flows, streaming output to Discord.
 
@@ -42,7 +42,7 @@ No build step, test suite, or linter is configured.
 - **Review flow**: `done` → diff shown → `yes`/`push` to commit+push+merge, or `no`/`discard` to abandon.
 - **No-change cleanup**: If the engine makes no file changes, the feature branch is deleted and no session is started.
 - **Multi-repo**: `GIT_PROJECTS` env var registers additional repos. `cwd <n>` switches the active repo per channel. All git ops (`run_git`, `get_diff`, `create_branch`, etc.) accept an optional `path` param.
-- **Branch switching**: `switch <branch|#N>` mid-session auto-commits and checks out the target branch. `#N` refs are populated by the `branches` command via `branch_listing` dict.
+- **Branch switching**: `branch switch <branch|N>` mid-session auto-commits and checks out the target branch. `N` refs are populated by the `branches` command via `branch_listing` dict.
 - **Switchable cwd mid-session**: `cwd <n>` during an active session auto-commits current work and updates `session["cwd"]`.
 - **All git work happens on feature branches**, never directly on main/dev.
 - **Config uses `.env`** with sensible defaults. See `env.example` for all variables.
@@ -51,7 +51,7 @@ No build step, test suite, or linter is configured.
 
 **Task execution:** plain text, `claude: <task>`, `cc: <task>`, `codex: <task>`, `cx: <task>`
 **Session:** `done`, `yes`/`push`, `no`/`discard`, `abort`, `skip`, `diff`, `undo`
-**Branch nav:** `switch <branch|#N>`, `cwd [n]`, `branches`, `branch delete <name|#N> [local|remote] [force]`
+**Branch nav:** `branch switch <branch|N>`, `cwd [n]`, `branches`, `branch delete <name|N> [local|remote] [force]`
 **Git:** `merge <target>`, `merge src>tgt`, `merge src into tgt`, `pr <target>`, `pull [branch]`
 **Multi-repo:** `repos`, `repo <n> status|diff|commit|push|branches`
 **Recovery:** `recover`, `recover <id>`, `recover drop <id>`

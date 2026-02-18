@@ -14,6 +14,7 @@ Requirements:
 """
 
 import asyncio
+import json
 import os
 import pathlib
 import re
@@ -34,6 +35,7 @@ REPO_PATH = os.environ["REPO_PATH"]
 BRANCH_PREFIX = os.getenv("BRANCH_PREFIX", "auto")
 MAIN_BRANCH = os.getenv("MAIN_BRANCH", "main")
 DEV_BRANCH = os.getenv("DEV_BRANCH", "dev")
+PROTECTED_BRANCHES_ENV = os.getenv("PROTECTED_BRANCHES", "")
 MAX_DIFF_CHARS = 1800
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
@@ -71,9 +73,20 @@ def _load_git_projects() -> list[tuple[str, str]]:
 
 GIT_PROJECTS: list[tuple[str, str]] = _load_git_projects()
 
+_BASE_DIR = pathlib.Path(__file__).resolve().parent
+_STATE_ENV = os.getenv("BOT_STATE_FILE", "")
+STATE_FILE = pathlib.Path(_STATE_ENV) if _STATE_ENV else (_BASE_DIR / ".bot_state.json")
+if not STATE_FILE.is_absolute():
+    STATE_FILE = _BASE_DIR / STATE_FILE
+
 # Track login processes so we don't run two at once
 _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
 _restart_on_close = False
+
+# channel_id → asyncio.Event used to cancel current engine run
+stop_events: dict[int, asyncio.Event] = {}
+# channel_id → running subprocess for engine
+running_procs: dict[int, asyncio.subprocess.Process] = {}
 _RESTART_FLAG = pathlib.Path("/tmp/bot_restart_channel")
 
 # ── Discord client setup ─────────────────────────────────────────────────────
@@ -131,7 +144,7 @@ def resolve_project(arg: str) -> tuple[str, str] | None:
 
 
 def resolve_branch(ref: str, ch_id: int, cwd: str | None = None) -> str | None:
-    """Resolve a branch reference: #N (from branch_listing), plain number, or name.
+    """Resolve a branch reference: N (or #N) from branch_listing, or name.
 
     Returns the branch name, or None if not found.
     """
@@ -155,6 +168,32 @@ def get_branch_list(cwd: str | None = None) -> list[str]:
     return [b for b in result.stdout.strip().split("\n") if b]
 
 
+def resolve_branch_case_insensitive(name: str, cwd: str | None = None) -> str | None:
+    """Resolve branch name ignoring case, if unambiguous."""
+    if not name:
+        return None
+    branches = get_branch_list(cwd)
+    if name in branches:
+        return name
+    matches = [b for b in branches if b.lower() == name.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def expand_branch_args(tokens: list[str], ch_id: int, cwd: str) -> list[str]:
+    """Expand branch tokens, resolving N/#N references and splitting commas."""
+    names: list[str] = []
+    for token in tokens:
+        for chunk in token.split(","):
+            name = chunk.strip()
+            if not name:
+                continue
+            resolved = resolve_branch(name, ch_id, cwd) if name.lstrip("#").isdigit() else None
+            names.append(resolved or name)
+    return names
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -171,6 +210,111 @@ def truncate(text: str, limit: int = MAX_DIFF_CHARS) -> str:
 
 def current_branch(path: str | None = None) -> str:
     return run_git(["git", "branch", "--show-current"], path).stdout.strip()
+
+
+def _parse_branch_list(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return [b.strip() for b in re.split(r"[,\s]+", raw) if b.strip()]
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
+    except OSError:
+        pass
+
+
+PROTECTED_BRANCHES: list[str] = []
+_PROTECTED_BRANCH_KEYS: set[str] = set()
+
+
+def _default_protected_branches() -> list[str]:
+    defaults = [b for b in (MAIN_BRANCH, DEV_BRANCH) if b]
+    defaults.extend(_parse_branch_list(PROTECTED_BRANCHES_ENV))
+    return defaults
+
+
+def _set_protected_branches(branches: list[str], save: bool = True) -> None:
+    global PROTECTED_BRANCHES, _PROTECTED_BRANCH_KEYS
+    uniq = []
+    seen = set()
+    for b in (b.strip() for b in branches if b and b.strip()):
+        key = b.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(b)
+    PROTECTED_BRANCHES = uniq
+    _PROTECTED_BRANCH_KEYS = {b.lower() for b in PROTECTED_BRANCHES}
+    if save:
+        state = _load_state()
+        state["protected_branches"] = PROTECTED_BRANCHES
+        _save_state(state)
+
+
+def _init_protected_branches() -> None:
+    state = _load_state()
+    branches = state.get("protected_branches") or _default_protected_branches()
+    _set_protected_branches(branches, save=not bool(state.get("protected_branches")))
+
+
+def is_protected_branch(branch: str) -> bool:
+    return branch.strip().lower() in _PROTECTED_BRANCH_KEYS
+
+
+_init_protected_branches()
+
+
+def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
+    data = _load_state()
+    channels = data.setdefault("channels", {})
+    if not branch:
+        try:
+            branch = current_branch(cwd) or "?"
+        except (FileNotFoundError, OSError):
+            branch = "?"
+    channels[str(ch_id)] = {
+        "cwd": cwd,
+        "branch": branch,
+        "updated": int(time.time()),
+    }
+    data["last_active_channel"] = ch_id
+    _save_state(data)
+
+
+def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
+    data = _load_state()
+    channels = data.get("channels", {}) or {}
+    for ch_id_str, info in channels.items():
+        if isinstance(info, dict):
+            cwd = info.get("cwd")
+            if cwd:
+                try:
+                    channel_cwd[int(ch_id_str)] = cwd
+                except ValueError:
+                    continue
+    last_id = data.get("last_active_channel")
+    if last_id is None:
+        return None, None, None, None
+    info = channels.get(str(last_id)) or {}
+    cwd = info.get("cwd")
+    branch = info.get("branch")
+    checkout_error = None
+    if cwd and branch and pathlib.Path(cwd).exists():
+        res = run_git(["git", "checkout", branch], cwd)
+        if res.returncode != 0:
+            checkout_error = (res.stderr or res.stdout or "").strip() or "checkout failed"
+    return last_id, cwd, branch, checkout_error
 
 
 def has_gh_cli() -> bool:
@@ -403,7 +547,12 @@ async def login_claude(ch: discord.TextChannel) -> None:
 STATUS_REFRESH = 5  # seconds between live status updates
 
 
-async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: str, cwd: str | None = None) -> str:
+async def _run_with_live_output(
+    cmd: list[str],
+    ch: discord.TextChannel,
+    label: str,
+    cwd: str | None = None,
+) -> str:
     """Run a subprocess, live-updating a single Discord message with output."""
     status_msg = await ch.send(f"⚙️ {label} started...")
 
@@ -413,6 +562,7 @@ async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    running_procs[ch.id] = proc
 
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
@@ -469,6 +619,7 @@ async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: 
     finally:
         done.set()
         update_task.cancel()
+        running_procs.pop(ch.id, None)
         # Final update to show completion
         elapsed = int(time.time() - start)
         try:
@@ -537,18 +688,39 @@ async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, im
 MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
 
 
-async def run_engine(engine: str, task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
+async def run_engine(
+    engine: str,
+    task: str,
+    ch: discord.TextChannel,
+    resume: bool = False,
+    images: list[str] | None = None,
+    cwd: str | None = None,
+    stop_event: asyncio.Event | None = None,
+) -> str:
     runner = run_codex if engine == "codex" else run_claude_code
 
+    if stop_event and stop_event.is_set():
+        return "(stopped)"
+
     try:
-        return await runner(task, ch, resume, images, cwd=cwd)
+        output = await runner(task, ch, resume, images, cwd=cwd)
+        if stop_event and stop_event.is_set():
+            return "(stopped)"
+        return output
     except subprocess.TimeoutExpired:
+        if stop_event and stop_event.is_set():
+            return "(stopped)"
         # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
         for attempt in range(1, MAX_AUTO_CONTINUES + 1):
+            if stop_event and stop_event.is_set():
+                return "(stopped)"
             auto_commit(task, 0, cwd)  # save any partial work
             await ch.send(f"⏳ Timed out — auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
             try:
-                return await runner("continue where you left off", ch, resume=True, cwd=cwd)
+                output = await runner("continue where you left off", ch, resume=True, cwd=cwd)
+                if stop_event and stop_event.is_set():
+                    return "(stopped)"
+                return output
             except subprocess.TimeoutExpired:
                 continue
         auto_commit(task, 0, cwd)
@@ -597,6 +769,8 @@ async def discard_changes(branch: str, path: str | None = None) -> None:
     run_git(["git", "checkout", "."], path)
     run_git(["git", "clean", "-fd"], path)
     run_git(["git", "checkout", DEV_BRANCH], path)
+    if is_protected_branch(branch):
+        return
     run_git(["git", "branch", "-D", branch], path)
 
 
@@ -623,9 +797,12 @@ async def merge_branch(source: str, target: str, path: str | None = None) -> str
 
     # Clean up: delete the feature branch locally and remotely after merging
     if source.startswith(f"{BRANCH_PREFIX}/"):
-        run_git(["git", "branch", "-D", source], path)
-        run_git(["git", "push", "origin", "--delete", source], path)
-        result += f"\n🗑️ Deleted branch `{source}`."
+        if is_protected_branch(source):
+            result += f"\n🛡️ Protected branch; skipping delete for `{source}`."
+        else:
+            run_git(["git", "branch", "-D", source], path)
+            run_git(["git", "push", "origin", "--delete", source], path)
+            result += f"\n🗑️ Deleted branch `{source}`."
 
     # Pull the target branch so the local repo stays up to date
     run_git(["git", "pull", "--ff-only"], path)
@@ -655,7 +832,8 @@ HELP_TEXT_1 = """**Starting a session:**
 
 **During a session:**
 Type follow-ups freely — engine keeps context
-`switch <branch|#N>` — save & switch branch (creates if new)
+`stop` — cancel the current run
+`branch switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — peek at changes · `undo` — revert last run
 
@@ -670,9 +848,10 @@ Type follow-ups freely — engine keeps context
 `pr <target>` — open a pull request""".format(default=DEFAULT_ENGINE)
 
 HELP_TEXT_2 = """**Branches:**
-`branches` — list branches (use `#N` in commands)
-`branch delete <name|#N> [local|remote] [force]`
-`switch <branch|#N>` — switch branch (in active session)
+`branches` — list branches (use `N` in commands)
+`branch delete <name|N> [local|remote] [force]`
+`branch protect [list|add|remove|clear|reset]`
+`branch switch <branch|N>` — switch branch (in active session)
 
 **Recovery:**
 `recover` — list orphaned branches · `recover <id>` — resume
@@ -782,6 +961,7 @@ async def on_ready():
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user  : {ALLOWED_USER_ID}")
     print(f"   Default engine: {DEFAULT_ENGINE}")
+    print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
     print(f"   gh CLI        : {'yes' if has_gh_cli() else 'no'}")
     print(f"   GitHub SSH    : {'yes' if ssh_ok else '⚠️  FAILED'}")
     print(f"   Claude CLI    : {claude_status}")
@@ -813,6 +993,7 @@ async def on_ready():
                 except Exception:
                     pass
     await _send_restart_confirmation()
+    await _send_restore_notice()
 
 
 async def _send_restart_confirmation():
@@ -828,6 +1009,22 @@ async def _send_restart_confirmation():
             pass
 
 
+async def _send_restore_notice():
+    """Notify last active channel with restored cwd/branch on startup."""
+    if not STATE_FILE.exists():
+        return
+    ch_id, cwd, branch, checkout_error = restore_state()
+    if not ch_id or not cwd or not branch:
+        return
+    ch = client.get_channel(ch_id)
+    if not ch:
+        return
+    msg = f"📍 Restored repo: `{cwd}`\n🌿 Restored branch: `{branch}`"
+    if checkout_error:
+        msg += f"\n⚠️ Could not checkout branch: `{checkout_error}`"
+    await ch.send(msg)
+
+
 @client.event
 async def on_resumed():
     print(f"🤖 Bot reconnected (session resumed) as {client.user}")
@@ -836,7 +1033,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message: discord.Message):
-    global CLAUDE_MODEL, CODEX_MODEL
+    global CLAUDE_MODEL, CODEX_MODEL, _restart_on_close
     if message.author.bot or not is_authorised(message):
         return
 
@@ -853,6 +1050,25 @@ async def on_message(message: discord.Message):
     session = active_sessions.get(ch.id)
     # Resolve active cwd: prefer session's cwd, then channel's, then default
     cwd = (session or {}).get("cwd") or channel_cwd.get(ch.id) or REPO_PATH
+    record_state(ch.id, cwd)
+
+    # ── Stop current run ────────────────────────────────────────────────
+    if lower == "stop":
+        stop_event = stop_events.get(ch.id)
+        proc = running_procs.get(ch.id)
+        if stop_event:
+            stop_event.set()
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+        if stop_event or proc:
+            await ch.send("🛑 Stopped current run.")
+        else:
+            await ch.send("No active run to stop.")
+        return
 
     # ── Session: done → show full diff and prompt ─────────────────────────
     if lower == "done" and session:
@@ -881,6 +1097,7 @@ async def on_message(message: discord.Message):
                     await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
                     merge_result = await merge_branch(session["branch"], DEV_BRANCH, cwd)
                     await ch.send(merge_result)
+                    record_state(ch.id, cwd, DEV_BRANCH)
                     await ch.send("`pr main` to create a PR to main")
                     del active_sessions[ch.id]
                 else:
@@ -906,9 +1123,20 @@ async def on_message(message: discord.Message):
             await ch.send("⏭️ Skipped merge. Use `merge <branch>` or `pr <branch>` any time.")
             del active_sessions[ch.id]
             return
-        target = content.strip()
+        target_input = content.strip()
+        target = resolve_branch_case_insensitive(target_input, cwd) or target_input
         check = run_git(["git", "rev-parse", "--verify", target], cwd)
         if check.returncode != 0:
+            # If there are multiple case-insensitive matches, ask for exact name.
+            branches = get_branch_list(cwd)
+            ci_matches = [b for b in branches if b.lower() == target_input.lower()]
+            if len(ci_matches) > 1:
+                listing = "\n".join(f"• `{b}`" for b in ci_matches[:10])
+                await ch.send(
+                    f"Multiple branches match `{target_input}` (case-insensitive). "
+                    f"Reply with the exact branch name:\n{listing}"
+                )
+                return
             branches = [b for b in run_git(
                 ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], cwd
             ).stdout.strip().split("\n") if b and b != session["branch"]]
@@ -918,6 +1146,7 @@ async def on_message(message: discord.Message):
         await ch.send(f"⏳ Merging into `{target}`...")
         merge_result = await merge_branch(session["branch"], target, cwd)
         await ch.send(merge_result)
+        record_state(ch.id, cwd, target)
         del active_sessions[ch.id]
         return
 
@@ -998,6 +1227,7 @@ async def on_message(message: discord.Message):
             return
         await ch.send(f"⏳ Merging `{src}` → `{tgt}`...")
         await ch.send(await merge_branch(src, tgt, cwd))
+        record_state(ch.id, cwd, tgt)
         return
 
     # ── PR commands ───────────────────────────────────────────────────────
@@ -1033,7 +1263,6 @@ async def on_message(message: discord.Message):
 
     # ── Info commands ─────────────────────────────────────────────────────
     if lower == "restart":
-        global _restart_on_close
         _RESTART_FLAG.write_text(str(ch.id))
         await ch.send("🔄 Restarting bot...")
         _restart_on_close = True
@@ -1043,6 +1272,7 @@ async def on_message(message: discord.Message):
             print("⚠️ Close timed out, forcing restart...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
         return
+
 
     if lower == "help":
         await ensure_pinned_help(ch)
@@ -1062,14 +1292,14 @@ async def on_message(message: discord.Message):
 
     if lower == "branches":
         branches = get_branch_list(cwd)[:15]
-        branch_listing[ch.id] = branches  # cache for #N references
+        branch_listing[ch.id] = branches  # cache for N references
         cur = current_branch(cwd)
         listing = "\n".join(
             f"{'→' if b == cur else '•'} **{i}.** `{b}`"
             for i, b in enumerate(branches, 1)
         )
         await ch.send(f"**Recent branches ({cwd}):**\n{listing}\n\n"
-                       f"_Use `#N` in commands (e.g. `merge #1`, `switch #3`)_")
+                       f"_Use `N` in commands (e.g. `merge 1`, `branch switch 3`)_")
         return
 
     if lower.startswith("pull"):
@@ -1094,7 +1324,8 @@ async def on_message(message: discord.Message):
             branch = run_git_in(["git", "branch", "--show-current"], path).stdout.strip() or "?"
             st = run_git_in(["git", "status", "--porcelain"], path).stdout.strip()
             dirty = f" · {len(st.splitlines())} change(s)" if st else " · clean"
-            lines.append(f"**{i}. {label}** (`{branch}`){dirty}\n   `{path}`")
+            active = " · active" if path == cwd else ""
+            lines.append(f"**{i}. {label}** (`{branch}`){dirty}{active}\n   `{path}`")
         await ch.send("**Git projects:**\n" + "\n".join(lines))
         return
 
@@ -1175,16 +1406,18 @@ async def on_message(message: discord.Message):
             session["branch"] = new_branch
         channel_cwd[ch.id] = path
         new_branch = current_branch(path)
+        record_state(ch.id, path, new_branch)
         await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
         return
 
     # ── Switch branch mid-session ─────────────────────────────────────────
-    if lower.startswith("switch "):
-        branch_ref = content[7:].strip()  # preserve case for branch name
+    if lower.startswith("branch switch ") or lower.startswith("switch "):
+        prefix_len = len("branch switch ") if lower.startswith("branch switch ") else len("switch ")
+        branch_ref = content[prefix_len:].strip()  # preserve case for branch name
         if not session:
             await ch.send("No active session. Start a task first.")
             return
-        # Resolve #N references
+        # Resolve N references
         branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
         # Auto-commit current work before switching
         auto_commit(session["description"], session["turns"], cwd)
@@ -1196,21 +1429,78 @@ async def on_message(message: discord.Message):
             run_git(["git", "checkout", branch_name], cwd)
             await ch.send(f"🌿 Switched to `{branch_name}`")
         session["branch"] = branch_name
+        record_state(ch.id, cwd, branch_name)
         stat = get_diff_stat(cwd)
         await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
         return
 
     # ── Branch delete ─────────────────────────────────────────────────────
+    if lower.startswith("branch protect"):
+        args = content[len("branch protect"):].strip().split()
+        if not args or args[0].lower() == "list":
+            listing = "\n".join(f"• `{b}`" for b in PROTECTED_BRANCHES) or "(none)"
+            await ch.send(
+                f"**Protected branches:**\n{listing}\n\n"
+                "Use `branch protect add <branch>` or `branch protect remove <branch>`."
+            )
+            return
+
+        action = args[0].lower()
+        rest = args[1:]
+        if action == "add":
+            names = expand_branch_args(rest, ch.id, cwd)
+            if not names:
+                await ch.send("Usage: `branch protect add <branch...>`")
+                return
+            combined = PROTECTED_BRANCHES + names
+            _set_protected_branches(combined)
+            added = [b for b in names if is_protected_branch(b)]
+            listing = "\n".join(f"• `{b}`" for b in added) or "(none)"
+            await ch.send(f"✅ Added protected branches:\n{listing}")
+            return
+
+        if action in ("remove", "rm", "del", "delete"):
+            names = expand_branch_args(rest, ch.id, cwd)
+            if not names:
+                await ch.send("Usage: `branch protect remove <branch...>`")
+                return
+            remove_keys = {b.lower() for b in names}
+            remaining = [b for b in PROTECTED_BRANCHES if b.lower() not in remove_keys]
+            _set_protected_branches(remaining)
+            listing = "\n".join(f"• `{b}`" for b in names) or "(none)"
+            await ch.send(f"✅ Removed protected branches:\n{listing}")
+            return
+
+        if action in ("clear",):
+            _set_protected_branches([])
+            await ch.send("✅ Cleared protected branches list.")
+            return
+
+        if action in ("reset", "default"):
+            _set_protected_branches(_default_protected_branches())
+            listing = "\n".join(f"• `{b}`" for b in PROTECTED_BRANCHES) or "(none)"
+            await ch.send(f"✅ Reset protected branches:\n{listing}")
+            return
+
+        await ch.send("Usage: `branch protect [list|add|remove|clear|reset]`")
+        return
+
     if lower.startswith("branch delete ") or lower.startswith("branch del "):
         prefix_len = len("branch delete ") if lower.startswith("branch delete ") else len("branch del ")
         parts = content[prefix_len:].strip().split()
         if not parts:
-            await ch.send("Usage: `branch delete <name|#N> [local|remote|both] [force]`")
+            await ch.send("Usage: `branch delete <name|N> [local|remote|both] [force]`")
             return
         branch_ref = parts[0]
         branch_name = resolve_branch(branch_ref, ch.id, cwd)
         if branch_name is None:
-            await ch.send(f"❌ `{branch_ref}` didn't match any branch. Run `branches` first to use `#N` refs.")
+            await ch.send(f"❌ `{branch_ref}` didn't match any branch. Run `branches` first to use `N` refs.")
+            return
+        if is_protected_branch(branch_name):
+            await ch.send(
+                f"🛡️ `{branch_name}` is protected and cannot be deleted.\n"
+                f"Use `branch protect remove {branch_name}` if you really need to delete it."
+            )
             return
         flags = {p.lower() for p in parts[1:]}
         scope = "both"
@@ -1341,6 +1631,12 @@ async def on_message(message: discord.Message):
                 return
 
         if is_drop:
+            if is_protected_branch(arg):
+                await ch.send(
+                    f"🛡️ `{arg}` is protected and cannot be deleted.\n"
+                    f"Use `branch protect remove {arg}` if you really need to delete it."
+                )
+                return
             run_git(["git", "branch", "-D", arg], cwd)
             run_git(["git", "push", "origin", "--delete", arg], cwd)
             await ch.send(f"🗑️ Deleted `{arg}` locally and remotely.")
@@ -1384,10 +1680,25 @@ async def on_message(message: discord.Message):
         await ch.send(f"🔄 **{label}** follow-up (turn {session['turns']})...\n"
                        f"> {truncate(follow_up_task, 200)}"
                        + (f"\n📎 {len(images)} image(s) attached" if images else ""))
+        stop_event = asyncio.Event()
+        stop_events[ch.id] = stop_event
         try:
-            output = await run_engine(engine, follow_up_task, ch, resume=True, images=images, cwd=cwd)
+            output = await run_engine(
+                engine,
+                follow_up_task,
+                ch,
+                resume=True,
+                images=images,
+                cwd=cwd,
+                stop_event=stop_event,
+            )
         except Exception as e:
             await ch.send(f"❌ Error: `{e}`")
+            return
+        finally:
+            stop_events.pop(ch.id, None)
+
+        if stop_event.is_set():
             return
 
         auto_commit(session["description"], session["turns"], cwd)
@@ -1421,11 +1732,28 @@ async def on_message(message: discord.Message):
     except Exception as e:
         await ch.send(f"❌ Branch creation failed: `{e}`")
         return
+    record_state(ch.id, cwd, branch)
 
+    stop_event = asyncio.Event()
+    stop_events[ch.id] = stop_event
     try:
-        output = await run_engine(engine, task, ch, resume=False, images=images, cwd=cwd)
+        output = await run_engine(
+            engine,
+            task,
+            ch,
+            resume=False,
+            images=images,
+            cwd=cwd,
+            stop_event=stop_event,
+        )
     except Exception as e:
         await ch.send(f"❌ {label} error: `{e}`")
+        await discard_changes(branch, cwd)
+        return
+    finally:
+        stop_events.pop(ch.id, None)
+
+    if stop_event.is_set():
         await discard_changes(branch, cwd)
         return
 
@@ -1433,6 +1761,7 @@ async def on_message(message: discord.Message):
     if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
         run_git(["git", "checkout", _base_branch(cwd)], cwd)
         run_git(["git", "branch", "-D", branch], cwd)
+        record_state(ch.id, cwd, _base_branch(cwd))
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
         await ch.send("ℹ️ No files changed — no session started.")
         return
