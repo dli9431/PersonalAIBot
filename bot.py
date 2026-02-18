@@ -74,6 +74,11 @@ GIT_PROJECTS: list[tuple[str, str]] = _load_git_projects()
 # Track login processes so we don't run two at once
 _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
 _restart_on_close = False
+
+# channel_id → asyncio.Event used to cancel current engine run
+stop_events: dict[int, asyncio.Event] = {}
+# channel_id → running subprocess for engine
+running_procs: dict[int, asyncio.subprocess.Process] = {}
 _RESTART_FLAG = pathlib.Path("/tmp/bot_restart_channel")
 
 # ── Discord client setup ─────────────────────────────────────────────────────
@@ -367,7 +372,12 @@ async def login_claude(ch: discord.TextChannel) -> None:
 STATUS_REFRESH = 5  # seconds between live status updates
 
 
-async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: str, cwd: str | None = None) -> str:
+async def _run_with_live_output(
+    cmd: list[str],
+    ch: discord.TextChannel,
+    label: str,
+    cwd: str | None = None,
+) -> str:
     """Run a subprocess, live-updating a single Discord message with output."""
     status_msg = await ch.send(f"⚙️ {label} started...")
 
@@ -377,6 +387,7 @@ async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    running_procs[ch.id] = proc
 
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
@@ -433,6 +444,7 @@ async def _run_with_live_output(cmd: list[str], ch: discord.TextChannel, label: 
     finally:
         done.set()
         update_task.cancel()
+        running_procs.pop(ch.id, None)
         # Final update to show completion
         elapsed = int(time.time() - start)
         try:
@@ -501,18 +513,39 @@ async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, im
 MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
 
 
-async def run_engine(engine: str, task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
+async def run_engine(
+    engine: str,
+    task: str,
+    ch: discord.TextChannel,
+    resume: bool = False,
+    images: list[str] | None = None,
+    cwd: str | None = None,
+    stop_event: asyncio.Event | None = None,
+) -> str:
     runner = run_codex if engine == "codex" else run_claude_code
 
+    if stop_event and stop_event.is_set():
+        return "(stopped)"
+
     try:
-        return await runner(task, ch, resume, images, cwd=cwd)
+        output = await runner(task, ch, resume, images, cwd=cwd)
+        if stop_event and stop_event.is_set():
+            return "(stopped)"
+        return output
     except subprocess.TimeoutExpired:
+        if stop_event and stop_event.is_set():
+            return "(stopped)"
         # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
         for attempt in range(1, MAX_AUTO_CONTINUES + 1):
+            if stop_event and stop_event.is_set():
+                return "(stopped)"
             auto_commit(task, 0, cwd)  # save any partial work
             await ch.send(f"⏳ Timed out — auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
             try:
-                return await runner("continue where you left off", ch, resume=True, cwd=cwd)
+                output = await runner("continue where you left off", ch, resume=True, cwd=cwd)
+                if stop_event and stop_event.is_set():
+                    return "(stopped)"
+                return output
             except subprocess.TimeoutExpired:
                 continue
         auto_commit(task, 0, cwd)
@@ -619,6 +652,7 @@ HELP_TEXT_1 = """**Starting a session:**
 
 **During a session:**
 Type follow-ups freely — engine keeps context
+`stop` — cancel the current run
 `switch <branch|#N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — peek at changes · `undo` — revert last run
@@ -653,7 +687,7 @@ HELP_TEXT_2 = """**Branches:**
 **Info:** `status` · `branches` · `pull [main]` · `help`
 
 **Login:** `claude login` · `codex login` · `login both`
-**System:** `restart` · `stop`"""
+**System:** `restart`"""
 
 HELP_PIN_TITLE_1 = "Help (1/2)"
 HELP_PIN_TITLE_2 = "Help (2/2)"
@@ -801,6 +835,24 @@ async def on_message(message: discord.Message):
     session = active_sessions.get(ch.id)
     # Resolve active cwd: prefer session's cwd, then channel's, then default
     cwd = (session or {}).get("cwd") or channel_cwd.get(ch.id) or REPO_PATH
+
+    # ── Stop current run ────────────────────────────────────────────────
+    if lower == "stop":
+        stop_event = stop_events.get(ch.id)
+        proc = running_procs.get(ch.id)
+        if stop_event:
+            stop_event.set()
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+        if stop_event or proc:
+            await ch.send("🛑 Stopped current run.")
+        else:
+            await ch.send("No active run to stop.")
+        return
 
     # ── Session: done → show full diff and prompt ─────────────────────────
     if lower == "done" and session:
@@ -991,11 +1043,6 @@ async def on_message(message: discord.Message):
             os.execv(sys.executable, [sys.executable] + sys.argv)
         return
 
-    if lower in ("stop", "shutdown"):
-        _restart_on_close = False
-        await ch.send("🛑 Stopping bot...")
-        await client.close()
-        return
 
     if lower == "help":
         await ensure_pinned_help(ch)
@@ -1337,10 +1384,25 @@ async def on_message(message: discord.Message):
         await ch.send(f"🔄 **{label}** follow-up (turn {session['turns']})...\n"
                        f"> {truncate(follow_up_task, 200)}"
                        + (f"\n📎 {len(images)} image(s) attached" if images else ""))
+        stop_event = asyncio.Event()
+        stop_events[ch.id] = stop_event
         try:
-            output = await run_engine(engine, follow_up_task, ch, resume=True, images=images, cwd=cwd)
+            output = await run_engine(
+                engine,
+                follow_up_task,
+                ch,
+                resume=True,
+                images=images,
+                cwd=cwd,
+                stop_event=stop_event,
+            )
         except Exception as e:
             await ch.send(f"❌ Error: `{e}`")
+            return
+        finally:
+            stop_events.pop(ch.id, None)
+
+        if stop_event.is_set():
             return
 
         auto_commit(session["description"], session["turns"], cwd)
@@ -1375,10 +1437,26 @@ async def on_message(message: discord.Message):
         await ch.send(f"❌ Branch creation failed: `{e}`")
         return
 
+    stop_event = asyncio.Event()
+    stop_events[ch.id] = stop_event
     try:
-        output = await run_engine(engine, task, ch, resume=False, images=images, cwd=cwd)
+        output = await run_engine(
+            engine,
+            task,
+            ch,
+            resume=False,
+            images=images,
+            cwd=cwd,
+            stop_event=stop_event,
+        )
     except Exception as e:
         await ch.send(f"❌ {label} error: `{e}`")
+        await discard_changes(branch, cwd)
+        return
+    finally:
+        stop_events.pop(ch.id, None)
+
+    if stop_event.is_set():
         await discard_changes(branch, cwd)
         return
 
