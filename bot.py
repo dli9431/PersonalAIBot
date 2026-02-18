@@ -633,14 +633,80 @@ HELP_TEXT_2 = """**Recovery:**
 **Login:**
 `login claude` · `login codex` · `login both`"""
 
+HELP_PIN_TITLE_1 = "Help (1/2)"
+HELP_PIN_TITLE_2 = "Help (2/2)"
+
+
+def _help_embed(title: str, text: str) -> discord.Embed:
+    return discord.Embed(title=title, description=text)
+
+
+async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
+    """Ensure help messages are pinned and up to date. Returns True if changed."""
+    changed = False
+    try:
+        pins = await channel.pins()
+    except (AttributeError, discord.Forbidden, discord.HTTPException):
+        await channel.send(HELP_TEXT_1)
+        await channel.send(HELP_TEXT_2)
+        return True
+
+    help_by_title: dict[str, list[discord.Message]] = {
+        HELP_PIN_TITLE_1: [],
+        HELP_PIN_TITLE_2: [],
+    }
+    for msg in pins:
+        if not msg.embeds or msg.author.id != client.user.id:
+            continue
+        title = msg.embeds[0].title
+        if title in help_by_title:
+            help_by_title[title].append(msg)
+
+    def _latest(msgs: list[discord.Message]) -> discord.Message | None:
+        return max(msgs, key=lambda m: m.created_at) if msgs else None
+
+    pinned_1 = _latest(help_by_title[HELP_PIN_TITLE_1])
+    pinned_2 = _latest(help_by_title[HELP_PIN_TITLE_2])
+
+    for title, msgs in help_by_title.items():
+        keep = pinned_1 if title == HELP_PIN_TITLE_1 else pinned_2
+        for msg in msgs:
+            if keep and msg.id == keep.id:
+                continue
+            await msg.unpin(reason="Superseded help pin")
+            changed = True
+
+    if pinned_1:
+        existing = pinned_1.embeds[0].description or ""
+        if existing != HELP_TEXT_1:
+            await pinned_1.edit(embed=_help_embed(HELP_PIN_TITLE_1, HELP_TEXT_1))
+            changed = True
+    else:
+        msg = await channel.send(embed=_help_embed(HELP_PIN_TITLE_1, HELP_TEXT_1))
+        await msg.pin(reason="Help message 1")
+        changed = True
+
+    if pinned_2:
+        existing = pinned_2.embeds[0].description or ""
+        if existing != HELP_TEXT_2:
+            await pinned_2.edit(embed=_help_embed(HELP_PIN_TITLE_2, HELP_TEXT_2))
+            changed = True
+    else:
+        msg = await channel.send(embed=_help_embed(HELP_PIN_TITLE_2, HELP_TEXT_2))
+        await msg.pin(reason="Help message 2")
+        changed = True
+
+    return changed
+
 
 @tree.command(name="help", description="Show all available bot commands")
 async def slash_help(interaction: discord.Interaction):
     if interaction.user.id != ALLOWED_USER_ID:
         await interaction.response.send_message("Not authorised.", ephemeral=True)
         return
-    await interaction.response.send_message(HELP_TEXT_1)
-    await interaction.followup.send(HELP_TEXT_2)
+    await interaction.response.send_message("Help is pinned at the top of the channel.", ephemeral=True)
+    if interaction.channel:
+        await ensure_pinned_help(interaction.channel)
 
 
 @client.event
@@ -884,8 +950,8 @@ async def on_message(message: discord.Message):
         return
 
     if lower == "help":
-        await ch.send(HELP_TEXT_1)
-        await ch.send(HELP_TEXT_2)
+        await ensure_pinned_help(ch)
+        await ch.send("Help is pinned at the top of the channel.")
         return
 
     if lower == "status":
