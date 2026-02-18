@@ -1164,7 +1164,10 @@ async def on_message(message: discord.Message):
             await ch.send("Usage: `branch delete <name|#N> [local|remote|both] [force]`")
             return
         branch_ref = parts[0]
-        branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
+        branch_name = resolve_branch(branch_ref, ch.id, cwd)
+        if branch_name is None:
+            await ch.send(f"❌ `{branch_ref}` didn't match any branch. Run `branches` first to use `#N` refs.")
+            return
         flags = {p.lower() for p in parts[1:]}
         scope = "both"
         if "local" in flags:
