@@ -673,23 +673,21 @@ async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
     changed = False
 
     # Fetch existing pins — if forbidden, fall back to plain text
-    try:
-        pins = await channel.pins()
-    except (AttributeError, discord.Forbidden, discord.HTTPException):
-        await channel.send(HELP_TEXT_1)
-        await channel.send(HELP_TEXT_2)
-        return True
-
     help_by_title: dict[str, list[discord.Message]] = {
         HELP_PIN_TITLE_1: [],
         HELP_PIN_TITLE_2: [],
     }
-    for msg in pins:
-        if not msg.embeds or msg.author.id != client.user.id:
-            continue
-        title = msg.embeds[0].title
-        if title in help_by_title:
-            help_by_title[title].append(msg)
+    try:
+        async for msg in channel.pins():
+            if not msg.embeds or msg.author.id != client.user.id:
+                continue
+            title = msg.embeds[0].title
+            if title in help_by_title:
+                help_by_title[title].append(msg)
+    except (AttributeError, discord.Forbidden, discord.HTTPException):
+        await channel.send(HELP_TEXT_1)
+        await channel.send(HELP_TEXT_2)
+        return True
 
     def _latest(msgs: list[discord.Message]) -> discord.Message | None:
         return max(msgs, key=lambda m: m.created_at) if msgs else None
