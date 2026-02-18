@@ -644,6 +644,8 @@ def _help_embed(title: str, text: str) -> discord.Embed:
 async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
     """Ensure help messages are pinned and up to date. Returns True if changed."""
     changed = False
+
+    # Fetch existing pins — if forbidden, fall back to plain text
     try:
         pins = await channel.pins()
     except (AttributeError, discord.Forbidden, discord.HTTPException):
@@ -668,33 +670,39 @@ async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
     pinned_1 = _latest(help_by_title[HELP_PIN_TITLE_1])
     pinned_2 = _latest(help_by_title[HELP_PIN_TITLE_2])
 
+    # Remove duplicate pins
     for title, msgs in help_by_title.items():
         keep = pinned_1 if title == HELP_PIN_TITLE_1 else pinned_2
         for msg in msgs:
             if keep and msg.id == keep.id:
                 continue
-            await msg.unpin(reason="Superseded help pin")
-            changed = True
+            try:
+                await msg.unpin(reason="Superseded help pin")
+                changed = True
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
-    if pinned_1:
-        existing = pinned_1.embeds[0].description or ""
-        if existing != HELP_TEXT_1:
-            await pinned_1.edit(embed=_help_embed(HELP_PIN_TITLE_1, HELP_TEXT_1))
-            changed = True
-    else:
-        msg = await channel.send(embed=_help_embed(HELP_PIN_TITLE_1, HELP_TEXT_1))
-        await msg.pin(reason="Help message 1")
-        changed = True
-
-    if pinned_2:
-        existing = pinned_2.embeds[0].description or ""
-        if existing != HELP_TEXT_2:
-            await pinned_2.edit(embed=_help_embed(HELP_PIN_TITLE_2, HELP_TEXT_2))
-            changed = True
-    else:
-        msg = await channel.send(embed=_help_embed(HELP_PIN_TITLE_2, HELP_TEXT_2))
-        await msg.pin(reason="Help message 2")
-        changed = True
+    # Update or create each help message
+    for pinned, title, text in [
+        (pinned_1, HELP_PIN_TITLE_1, HELP_TEXT_1),
+        (pinned_2, HELP_PIN_TITLE_2, HELP_TEXT_2),
+    ]:
+        if pinned:
+            existing = pinned.embeds[0].description or ""
+            if existing != text:
+                try:
+                    await pinned.edit(embed=_help_embed(title, text))
+                    changed = True
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        else:
+            try:
+                msg = await channel.send(embed=_help_embed(title, text))
+                await msg.pin(reason=title)
+                changed = True
+            except (discord.Forbidden, discord.HTTPException):
+                await channel.send(text)
+                changed = True
 
     return changed
 
@@ -725,13 +733,13 @@ async def on_ready():
         print(f"   Fix:   eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519")
         print(f"   Test:  ssh -T git@github.com")
     print(f"   Slash commands synced")
-    try:
-        for ch_id in {**channel_cwd, **active_sessions}:
-            ch = client.get_channel(ch_id)
-            if ch:
-                await ensure_pinned_help(ch)
-    except Exception:
-        pass
+    for guild in client.guilds:
+        for ch in guild.text_channels:
+            if ch.permissions_for(guild.me).send_messages:
+                try:
+                    await ensure_pinned_help(ch)
+                except Exception:
+                    pass
     await _send_restart_confirmation()
 
 
