@@ -52,6 +52,25 @@ CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.2-codex")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 
+# Additional git repos the bot can commit/push to.
+# Format: comma-separated paths (absolute, or relative to REPO_PATH).
+# Project 1 is always REPO_PATH itself.
+def _load_git_projects() -> list[tuple[str, str]]:
+    """Return list of (label, absolute_path) tuples. Index 0 = project 1."""
+    projects = [(pathlib.Path(REPO_PATH).name, REPO_PATH)]
+    raw = os.getenv("GIT_PROJECTS", "")
+    for entry in (e.strip() for e in raw.split(",") if e.strip()):
+        if ":" in entry:
+            name, path = entry.split(":", 1)
+        else:
+            path = entry
+            name = pathlib.Path(path).name
+        abs_path = path if pathlib.Path(path).is_absolute() else str(pathlib.Path(REPO_PATH) / path)
+        projects.append((name.strip(), abs_path))
+    return projects
+
+GIT_PROJECTS: list[tuple[str, str]] = _load_git_projects()
+
 # Track login processes so we don't run two at once
 _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
 
@@ -86,6 +105,25 @@ def run_git(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd, cwd=REPO_PATH, capture_output=True, text=True, timeout=60,
     )
+
+
+def run_git_in(cmd: list[str], path: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd, cwd=path, capture_output=True, text=True, timeout=60,
+    )
+
+
+def resolve_project(arg: str) -> tuple[str, str] | None:
+    """Resolve '1', '2', or a name substring to (label, path). None if not found."""
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(GIT_PROJECTS):
+            return GIT_PROJECTS[idx]
+        return None
+    for label, path in GIT_PROJECTS:
+        if arg.lower() in label.lower():
+            return label, path
+    return None
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -565,6 +603,13 @@ Just type your follow-up — the engine keeps context
 `model codex <name>` — change Codex model
 `engine` — show current models
 
+**Multi-repo:**
+`repos` — list all configured git projects
+`repo <n> status` — git status for project n
+`repo <n> diff` — diff for project n
+`repo <n> commit [msg]` — stage all & commit in project n
+`repo <n> push` — push project n
+
 **Info:**
 `status` · `branches` · `help`
 `pull` — pull latest dev from remote
@@ -782,6 +827,66 @@ async def on_message(message: discord.Message):
             await ch.send(f"❌ Pull failed:\n```\n{pull.stderr.strip()}\n```")
             return
         await ch.send(f"✅ `{branch}` is up to date.\n```\n{pull.stdout.strip() or pull.stderr.strip()}\n```")
+        return
+
+    # ── Multi-repo commands ───────────────────────────────────────────────
+    if lower == "repos":
+        lines = []
+        for i, (label, path) in enumerate(GIT_PROJECTS, 1):
+            branch = run_git_in(["git", "branch", "--show-current"], path).stdout.strip() or "?"
+            st = run_git_in(["git", "status", "--porcelain"], path).stdout.strip()
+            dirty = f" · {len(st.splitlines())} change(s)" if st else " · clean"
+            lines.append(f"**{i}. {label}** (`{branch}`){dirty}\n   `{path}`")
+        await ch.send("**Git projects:**\n" + "\n".join(lines))
+        return
+
+    if lower.startswith("repo "):
+        parts = content[5:].strip().split(None, 1)  # use original case for commit msg
+        if not parts:
+            await ch.send("Usage: `repo <n> status|diff|commit [msg]|push`")
+            return
+        proj = resolve_project(parts[0].lower())
+        if proj is None:
+            await ch.send(f"Project `{parts[0]}` not found. Use `repos` to list them.")
+            return
+        label, path = proj
+        subcmd = parts[1].strip() if len(parts) > 1 else ""
+        subcmd_lower = subcmd.lower()
+
+        if subcmd_lower == "status":
+            branch = run_git_in(["git", "branch", "--show-current"], path).stdout.strip()
+            st = run_git_in(["git", "status", "--short"], path).stdout.strip()
+            await ch.send(f"**{label}** · `{branch}`\n```\n{st or '(clean)'}\n```")
+
+        elif subcmd_lower == "diff":
+            diff = run_git_in(["git", "diff"], path).stdout.strip()
+            staged = run_git_in(["git", "diff", "--cached"], path).stdout.strip()
+            combined = (diff + "\n" + staged).strip() or "(no changes)"
+            await ch.send(f"**{label} diff:**\n```diff\n{truncate(combined, 1800)}\n```")
+
+        elif subcmd_lower.startswith("commit"):
+            msg = subcmd[6:].strip() or "auto: bot commit"
+            run_git_in(["git", "add", "."], path)
+            st = run_git_in(["git", "status", "--porcelain"], path).stdout.strip()
+            if not st:
+                await ch.send(f"**{label}**: nothing to commit.")
+                return
+            result = run_git_in(["git", "commit", "-m", msg], path)
+            if result.returncode == 0:
+                await ch.send(f"✅ **{label}**: committed.\n```\n{result.stdout.strip()}\n```")
+            else:
+                await ch.send(f"❌ **{label}** commit failed:\n```\n{result.stderr.strip()}\n```")
+
+        elif subcmd_lower == "push":
+            branch = run_git_in(["git", "branch", "--show-current"], path).stdout.strip()
+            result = run_git_in(["git", "push", "-u", "origin", branch], path)
+            if result.returncode == 0:
+                await ch.send(f"✅ **{label}**: pushed `{branch}`.")
+            else:
+                await ch.send(f"❌ **{label}** push failed:\n```\n{result.stderr.strip()}\n```")
+
+        else:
+            await ch.send("Usage: `repo <n> status|diff|commit [msg]|push`")
         return
 
     if lower == "engine":
