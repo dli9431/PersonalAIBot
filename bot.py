@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 
 import discord
 from dotenv import load_dotenv
@@ -373,6 +374,23 @@ def check_codex_cli() -> tuple[bool, str]:
         return True, f"{version} (⚠️  no auth — run `codex login`)"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False, "not installed — run: npm install -g @openai/codex"
+
+
+def _load_codex_trusted_dirs() -> set[str]:
+    """Return the set of directory paths that Codex has marked as trusted."""
+    config_path = pathlib.Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return set()
+    try:
+        with open(config_path, "rb") as f:
+            config = tomllib.load(f)
+        return {
+            path
+            for path, settings in config.get("projects", {}).items()
+            if settings.get("trust_level") == "trusted"
+        }
+    except Exception:
+        return set()
 
 
 def branch_merged_status(branch: str, path: str | None = None) -> tuple[bool, bool]:
@@ -966,6 +984,7 @@ async def on_ready():
     print(f"   GitHub SSH    : {'yes' if ssh_ok else '⚠️  FAILED'}")
     print(f"   Claude CLI    : {claude_status}")
     print(f"   Codex CLI     : {codex_status}")
+    codex_trusted = _load_codex_trusted_dirs()
     print(f"   Project dirs  :")
     for label, path in GIT_PROJECTS:
         p = pathlib.Path(path)
@@ -975,7 +994,11 @@ async def on_ready():
             print(f"     ⚠️  [{label}] not a git repo: {path}")
         else:
             branch = current_branch(path)
-            print(f"     ✓  [{label}] on '{branch}': {path}")
+            # Claude: -p mode skips the workspace trust dialog (always ok)
+            # Codex: trust_level="trusted" must be set in ~/.codex/config.toml
+            codex_tag = "trusted" if path in codex_trusted else "⚠️ NOT TRUSTED"
+            print(f"     ✓  [{label}] on '{branch}' — claude: ok  codex: {codex_tag}")
+            print(f"          {path}")
     if not ssh_ok:
         print(f"\n⚠️  Cannot connect to GitHub via SSH.")
         print(f"   Fix:   eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519")
@@ -984,6 +1007,11 @@ async def on_ready():
         print(f"\n⚠️  Claude CLI unavailable: {claude_status}")
     if not codex_ok:
         print(f"\n⚠️  Codex CLI unavailable: {codex_status}")
+    untrusted = [path for _, path in GIT_PROJECTS if path not in codex_trusted]
+    if untrusted and codex_ok:
+        print(f"\n⚠️  Codex is NOT trusted in {len(untrusted)} project dir(s).")
+        print(f"   Codex will hang waiting for interactive input in those dirs.")
+        print(f"   Fix: run `codex` once interactively in each dir and approve trust.")
     print(f"   Slash commands synced")
     for guild in client.guilds:
         for ch in guild.text_channels:
