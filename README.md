@@ -163,7 +163,7 @@ pr main               → open a GitHub PR targeting main
 | `<follow-up>` | Continue with same engine and context |
 | `diff` | Peek at current changes |
 | `undo` | Revert the last engine run |
-| `switch <branch\|N>` | Save & switch to another branch |
+| `branch switch <branch\|N>` | Save & switch to another branch |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
 | `abort` | Discard all changes immediately |
 
@@ -190,8 +190,8 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `branches` | List recent branches (assigns `N`/`#N` references) |
-| `switch <branch\|N>` | Switch branch in active session |
+| `branches` | List recent branches (assigns `N` references) |
+| `branch switch <branch\|N>` | Switch branch in active session |
 | `branch delete <name\|N> [local\|remote] [force]` | Delete a branch (checks if merged first) |
 
 ### Multi-repo
