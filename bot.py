@@ -725,6 +725,13 @@ async def on_ready():
         print(f"   Fix:   eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519")
         print(f"   Test:  ssh -T git@github.com")
     print(f"   Slash commands synced")
+    try:
+        for ch_id in {**channel_cwd, **active_sessions}:
+            ch = client.get_channel(ch_id)
+            if ch:
+                await ensure_pinned_help(ch)
+    except Exception:
+        pass
     await _send_restart_confirmation()
 
 
