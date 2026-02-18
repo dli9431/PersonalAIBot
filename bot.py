@@ -168,6 +168,21 @@ def check_github_ssh() -> bool:
         return False
 
 
+def branch_merged_status(branch: str, path: str | None = None) -> tuple[bool, bool]:
+    """Return (local_merged, remote_merged) for a branch."""
+    local_merged = branch in [
+        b.strip().lstrip("* ")
+        for b in run_git(["git", "branch", "--merged"], path).stdout.strip().split("\n")
+        if b.strip()
+    ]
+    remote_merged = f"origin/{branch}" in [
+        b.strip()
+        for b in run_git(["git", "branch", "-r", "--merged"], path).stdout.strip().split("\n")
+        if b.strip()
+    ]
+    return local_merged, remote_merged
+
+
 def parse_engine_and_task(content: str) -> tuple[str, str]:
     lower = content.lower()
     for prefix in ("claude:", "cc:", "claude code:"):
@@ -583,6 +598,12 @@ Just type your follow-up — the engine keeps context
 `cwd <n>` — save work & switch to a different repo
 `diff` — see current changes so far
 `undo` — revert last engine run (git checkout)
+
+**Branch management:**
+`branch delete <name>` — delete local + remote (checks merged first)
+`branch delete <name> local` — local only
+`branch delete <name> remote` — remote only
+`branch delete <name> force` — skip merge check
 
 **Ending a session:**
 `done` — see full diff + push prompt
@@ -1005,6 +1026,75 @@ async def on_message(message: discord.Message):
         session["branch"] = branch_name
         stat = get_diff_stat(cwd)
         await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
+        return
+
+    # ── Branch delete ─────────────────────────────────────────────────────
+    if lower.startswith("branch delete ") or lower.startswith("branch del "):
+        prefix_len = len("branch delete ") if lower.startswith("branch delete ") else len("branch del ")
+        parts = content[prefix_len:].strip().split()
+        if not parts:
+            await ch.send("Usage: `branch delete <name> [local|remote|both] [force]`")
+            return
+        branch_name = parts[0]
+        flags = {p.lower() for p in parts[1:]}
+        scope = "both"
+        if "local" in flags:
+            scope = "local"
+        elif "remote" in flags:
+            scope = "remote"
+        force = "force" in flags
+
+        # Don't delete currently checked-out branch
+        if branch_name == current_branch(cwd):
+            await ch.send(f"❌ `{branch_name}` is currently checked out. Switch branches first.")
+            return
+
+        # Check existence
+        local_exists = run_git(["git", "rev-parse", "--verify", branch_name], cwd).returncode == 0
+        remote_ref = run_git(["git", "ls-remote", "--heads", "origin", branch_name], cwd).stdout.strip()
+        remote_exists = bool(remote_ref)
+
+        if scope in ("local", "both") and not local_exists:
+            await ch.send(f"⚠️ Local branch `{branch_name}` does not exist.")
+            if scope == "local":
+                return
+        if scope in ("remote", "both") and not remote_exists:
+            await ch.send(f"⚠️ Remote branch `origin/{branch_name}` does not exist.")
+            if scope == "remote":
+                return
+
+        # Merged check
+        if not force:
+            run_git(["git", "fetch", "origin"], cwd)
+            local_merged, remote_merged = branch_merged_status(branch_name, cwd)
+            warnings = []
+            if scope in ("local", "both") and local_exists and not local_merged:
+                warnings.append("local branch has **unmerged commits**")
+            if scope in ("remote", "both") and remote_exists and not remote_merged:
+                warnings.append("remote branch has **unmerged commits**")
+            if warnings:
+                await ch.send(
+                    f"⚠️ `{branch_name}`: {' and '.join(warnings)}.\n"
+                    f"Add `force` to delete anyway: `branch delete {branch_name} {scope} force`"
+                )
+                return
+
+        # Delete
+        msgs = []
+        if scope in ("local", "both") and local_exists:
+            flag = "-D" if force else "-d"
+            res = run_git(["git", "branch", flag, branch_name], cwd)
+            if res.returncode == 0:
+                msgs.append(f"✅ Local `{branch_name}` deleted.")
+            else:
+                msgs.append(f"❌ Local delete failed: {res.stderr.strip()}")
+        if scope in ("remote", "both") and remote_exists:
+            res = run_git(["git", "push", "origin", "--delete", branch_name], cwd)
+            if res.returncode == 0:
+                msgs.append(f"✅ Remote `origin/{branch_name}` deleted.")
+            else:
+                msgs.append(f"❌ Remote delete failed: {res.stderr.strip()}")
+        await ch.send("\n".join(msgs))
         return
 
     if lower == "engine":
