@@ -40,10 +40,11 @@ gh auth login  # GitHub.com → SSH → web browser
 ### 3. Bot Setup
 
 ```bash
-cd ~/PersonalAIBot
+git clone https://github.com/dli9431/PersonalAIBot.git
+cd PersonalAIBot
 python3 -m venv venv
 source venv/bin/activate
-pip install discord.py python-dotenv
+pip install -r requirements.txt
 
 cp env.example .env
 nano .env   # fill in required values (see below)
@@ -122,7 +123,6 @@ make the error messages more descriptive
 done      → shows full diff + push prompt
 yes       → commit, push & merge to dev/main
 no        → discard all changes
-skip      → commit & push, skip merge step
 abort     → discard immediately (any time)
 ```
 
@@ -275,7 +275,7 @@ The bot can even manage its own code — add `PersonalAIBot:/path/to/PersonalAIB
 
 ```bash
 tmux new -s bot
-bash ~/PersonalAIBot/start.sh
+bash /path/to/PersonalAIBot/start.sh
 # Ctrl+B, D to detach
 # tmux attach -t bot  to return
 ```
@@ -293,7 +293,7 @@ Or add a Windows Task Scheduler task on login:
 
 ```
 Program:   wsl
-Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd ~/PersonalAIBot && bash start.sh"
+Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot && bash start.sh"
 ```
 
 ---
@@ -304,7 +304,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd ~/PersonalAIBot && bash s
 
 - **ALLOWED_USER_ID gate** — every message is checked against your Discord user ID; no one else can trigger anything
 - **Tool deny list** — Claude Code is blocked from `rm`, `sudo`, `curl`, `wget`, and `WebFetch` by default
-- **Codex sandbox** — `workspace-write` mode with network off by default
+- **Codex sandbox** — `workspace-write` mode with network off, configured via `~/.codex/config.toml` (see `codex-config-example.toml`)
 - **Feature branches only** — the bot never commits directly to main or dev; you always review a diff first
 - **No secrets in code** — all tokens loaded from `.env` at runtime, never hardcoded, `.env` gitignored
 - **SSH auth for git** — no stored HTTPS passwords
@@ -323,7 +323,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd ~/PersonalAIBot && bash s
 - [ ] Bot checks `ALLOWED_USER_ID` on every message
 - [ ] `.env` in `.gitignore`
 - [ ] Claude Code: `rm`, `sudo`, `curl`, `wget` denied via `CLAUDE_DENIED_TOOLS`
-- [ ] Codex: workspace-write sandbox, network off by default
+- [ ] Codex: copy `codex-config-example.toml` → `~/.codex/config.toml` for workspace-write sandbox + no network
 - [ ] All git work on feature branches, never main directly
 - [ ] Review the diff before saying `yes`
 - [ ] SSH keys for git auth (not HTTPS with stored password)
