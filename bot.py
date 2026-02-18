@@ -700,7 +700,9 @@ async def on_message(message: discord.Message):
             await ch.send("No changes to commit.")
             return
         session["phase"] = "review"
-        await ch.send("Reply **yes** to commit, push & merge to dev, or **no** to discard.")
+        dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
+        merge_hint = f"merge to `{DEV_BRANCH}`" if dev_exists else "select a merge target"
+        await ch.send(f"Reply **yes** to commit, push & {merge_hint}, or **no** to discard.")
         return
 
     # ── Session: push approval ────────────────────────────────────────────
@@ -711,17 +713,49 @@ async def on_message(message: discord.Message):
             await ch.send(result)
             if "✅" in result:
                 last_pushed[ch.id] = session["branch"]
-                # Auto-merge into dev
-                await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
-                merge_result = await merge_branch(session["branch"], DEV_BRANCH, cwd)
-                await ch.send(merge_result)
-                await ch.send(f"`pr main` to create a PR to main")
+                dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
+                if dev_exists:
+                    await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
+                    merge_result = await merge_branch(session["branch"], DEV_BRANCH, cwd)
+                    await ch.send(merge_result)
+                    await ch.send("`pr main` to create a PR to main")
+                    del active_sessions[ch.id]
+                else:
+                    branches = [b for b in run_git(
+                        ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], cwd
+                    ).stdout.strip().split("\n") if b and b != session["branch"]]
+                    listing = "\n".join(f"• `{b}`" for b in branches[:10])
+                    session["phase"] = "merge_target"
+                    await ch.send(
+                        f"⚠️ No `{DEV_BRANCH}` branch found. Which branch should `{session['branch']}` merge into?\n{listing}\nReply with the branch name, or `skip` to skip merging."
+                    )
             else:
                 run_git(["git", "checkout", DEV_BRANCH], cwd)
-            del active_sessions[ch.id]
+                del active_sessions[ch.id]
             return
         # If no session but maybe old-style pending
         await ch.send("No session awaiting approval. Send `done` first to review changes.")
+        return
+
+    # ── Session: merge target selection ───────────────────────────────────
+    if session and session.get("phase") == "merge_target":
+        if lower == "skip":
+            await ch.send("⏭️ Skipped merge. Use `merge <branch>` or `pr <branch>` any time.")
+            del active_sessions[ch.id]
+            return
+        target = content.strip()
+        check = run_git(["git", "rev-parse", "--verify", target], cwd)
+        if check.returncode != 0:
+            branches = [b for b in run_git(
+                ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], cwd
+            ).stdout.strip().split("\n") if b and b != session["branch"]]
+            listing = "\n".join(f"• `{b}`" for b in branches[:10])
+            await ch.send(f"Branch `{target}` not found. Pick one:\n{listing}\nOr `skip` to skip.")
+            return
+        await ch.send(f"⏳ Merging into `{target}`...")
+        merge_result = await merge_branch(session["branch"], target, cwd)
+        await ch.send(merge_result)
+        del active_sessions[ch.id]
         return
 
     # ── Session: discard ──────────────────────────────────────────────────
