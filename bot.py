@@ -195,6 +195,42 @@ def check_github_ssh() -> bool:
         return False
 
 
+def check_claude_cli() -> tuple[bool, str]:
+    """Check if claude CLI is installed and has auth configured. Returns (ok, status)."""
+    try:
+        r = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False, "not installed"
+        version = (r.stdout or r.stderr).strip().splitlines()[0]
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return True, f"{version} (API key)"
+        if (pathlib.Path.home() / ".claude" / "credentials.json").exists():
+            return True, f"{version} (OAuth)"
+        return True, f"{version} (⚠️  no auth — run `claude login`)"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, "not installed — run: npm install -g @anthropic-ai/claude-code"
+
+
+def check_codex_cli() -> tuple[bool, str]:
+    """Check if codex CLI is installed and has auth configured. Returns (ok, status)."""
+    try:
+        r = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False, "not installed"
+        version = (r.stdout or r.stderr).strip().splitlines()[0]
+        if os.environ.get("OPENAI_API_KEY"):
+            return True, f"{version} (API key)"
+        for cred in [
+            pathlib.Path.home() / ".codex" / "auth.json",
+            pathlib.Path.home() / ".config" / "codex" / "auth.json",
+        ]:
+            if cred.exists():
+                return True, f"{version} (OAuth)"
+        return True, f"{version} (⚠️  no auth — run `codex login`)"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, "not installed — run: npm install -g @openai/codex"
+
+
 def branch_merged_status(branch: str, path: str | None = None) -> tuple[bool, bool]:
     """Return (local_merged, remote_merged) for a branch."""
     local_merged = branch in [
@@ -741,17 +777,33 @@ async def slash_help(interaction: discord.Interaction):
 async def on_ready():
     await tree.sync()
     ssh_ok = check_github_ssh()
+    claude_ok, claude_status = check_claude_cli()
+    codex_ok, codex_status = check_codex_cli()
     print(f"🤖 Bot online as {client.user}")
-    print(f"   Allowed user : {ALLOWED_USER_ID}")
-    print(f"   Repo         : {REPO_PATH}")
+    print(f"   Allowed user  : {ALLOWED_USER_ID}")
     print(f"   Default engine: {DEFAULT_ENGINE}")
-    print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
-    print(f"   gh CLI       : {'yes' if has_gh_cli() else 'no'}")
-    print(f"   GitHub SSH   : {'yes' if ssh_ok else '⚠️  FAILED'}")
+    print(f"   gh CLI        : {'yes' if has_gh_cli() else 'no'}")
+    print(f"   GitHub SSH    : {'yes' if ssh_ok else '⚠️  FAILED'}")
+    print(f"   Claude CLI    : {claude_status}")
+    print(f"   Codex CLI     : {codex_status}")
+    print(f"   Project dirs  :")
+    for label, path in GIT_PROJECTS:
+        p = pathlib.Path(path)
+        if not p.exists():
+            print(f"     ⚠️  [{label}] directory not found: {path}")
+        elif run_git(["git", "rev-parse", "--git-dir"], path).returncode != 0:
+            print(f"     ⚠️  [{label}] not a git repo: {path}")
+        else:
+            branch = current_branch(path)
+            print(f"     ✓  [{label}] on '{branch}': {path}")
     if not ssh_ok:
         print(f"\n⚠️  Cannot connect to GitHub via SSH.")
         print(f"   Fix:   eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519")
         print(f"   Test:  ssh -T git@github.com")
+    if not claude_ok:
+        print(f"\n⚠️  Claude CLI unavailable: {claude_status}")
+    if not codex_ok:
+        print(f"\n⚠️  Codex CLI unavailable: {codex_status}")
     print(f"   Slash commands synced")
     for guild in client.guilds:
         for ch in guild.text_channels:
