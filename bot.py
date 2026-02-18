@@ -578,6 +578,8 @@ HELP_TEXT = """**Starting a session:**
 
 **During a session** (iterative back-and-forth):
 Just type your follow-up — the engine keeps context
+`switch <branch>` — save work & switch branch (creates if needed)
+`cwd <n>` — save work & switch to a different repo
 `diff` — see current changes so far
 `undo` — revert last engine run (git checkout)
 
@@ -911,10 +913,34 @@ async def on_message(message: discord.Message):
             return
         label, path = proj
         if session:
-            await ch.send("⚠️ Cannot switch repo mid-session. `abort` first.")
-            return
+            # Auto-commit current work before switching repos
+            auto_commit(session["description"], session["turns"], cwd)
+            new_branch = current_branch(path)
+            session["cwd"] = path
+            session["branch"] = new_branch
         channel_cwd[ch.id] = path
-        await ch.send(f"✅ Switched to **{label}** (`{path}`)")
+        new_branch = current_branch(path)
+        await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
+        return
+
+    # ── Switch branch mid-session ─────────────────────────────────────────
+    if lower.startswith("switch "):
+        branch_name = content[7:].strip()  # preserve case for branch name
+        if not session:
+            await ch.send("No active session. Start a task first.")
+            return
+        # Auto-commit current work before switching
+        auto_commit(session["description"], session["turns"], cwd)
+        check = run_git(["git", "rev-parse", "--verify", branch_name], cwd)
+        if check.returncode != 0:
+            run_git(["git", "checkout", "-b", branch_name], cwd)
+            await ch.send(f"🌿 Created and switched to `{branch_name}`")
+        else:
+            run_git(["git", "checkout", branch_name], cwd)
+            await ch.send(f"🌿 Switched to `{branch_name}`")
+        session["branch"] = branch_name
+        stat = get_diff_stat(cwd)
+        await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
         return
 
     if lower == "engine":
