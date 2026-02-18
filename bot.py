@@ -74,6 +74,7 @@ GIT_PROJECTS: list[tuple[str, str]] = _load_git_projects()
 # Track login processes so we don't run two at once
 _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
 _restart_on_close = False
+_RESTART_FLAG = pathlib.Path("/tmp/bot_restart_channel")
 
 # ── Discord client setup ─────────────────────────────────────────────────────
 
@@ -647,11 +648,26 @@ async def on_ready():
         print(f"   Fix:   eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519")
         print(f"   Test:  ssh -T git@github.com")
     print(f"   Slash commands synced")
+    await _send_restart_confirmation()
+
+
+async def _send_restart_confirmation():
+    """If a restart was requested, notify the requesting channel."""
+    if _RESTART_FLAG.exists():
+        try:
+            ch_id = int(_RESTART_FLAG.read_text().strip())
+            _RESTART_FLAG.unlink()
+            ch = client.get_channel(ch_id)
+            if ch:
+                await ch.send("✅ Bot restarted successfully.")
+        except Exception:
+            pass
 
 
 @client.event
 async def on_resumed():
     print(f"🤖 Bot reconnected (session resumed) as {client.user}")
+    await _send_restart_confirmation()
 
 
 @client.event
@@ -797,9 +813,14 @@ async def on_message(message: discord.Message):
     # ── Info commands ─────────────────────────────────────────────────────
     if lower == "restart":
         global _restart_on_close
+        _RESTART_FLAG.write_text(str(ch.id))
         await ch.send("🔄 Restarting bot...")
         _restart_on_close = True
-        await client.close()
+        try:
+            await asyncio.wait_for(client.close(), timeout=10)
+        except asyncio.TimeoutError:
+            print("⚠️ Close timed out, forcing restart...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         return
 
     if lower == "help":
