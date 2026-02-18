@@ -136,7 +136,7 @@ def resolve_project(arg: str) -> tuple[str, str] | None:
 
 
 def resolve_branch(ref: str, ch_id: int, cwd: str | None = None) -> str | None:
-    """Resolve a branch reference: #N (from branch_listing), plain number, or name.
+    """Resolve a branch reference: N or #N (from branch_listing), or name.
 
     Returns the branch name, or None if not found.
     """
@@ -653,7 +653,7 @@ HELP_TEXT_1 = """**Starting a session:**
 **During a session:**
 Type follow-ups freely — engine keeps context
 `stop` — cancel the current run
-`switch <branch|#N>` — save & switch branch (creates if new)
+`switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — peek at changes · `undo` — revert last run
 
@@ -668,9 +668,9 @@ Type follow-ups freely — engine keeps context
 `pr <target>` — open a pull request""".format(default=DEFAULT_ENGINE)
 
 HELP_TEXT_2 = """**Branches:**
-`branches` — list branches (use `#N` in commands)
-`branch delete <name|#N> [local|remote] [force]`
-`switch <branch|#N>` — switch branch (in active session)
+`branches` — list branches (use `N` or `#N` in commands)
+`branch delete <name|N> [local|remote] [force]`
+`switch <branch|N>` — switch branch (in active session)
 
 **Recovery:**
 `recover` — list orphaned branches · `recover <id>` — resume
@@ -1062,14 +1062,14 @@ async def on_message(message: discord.Message):
 
     if lower == "branches":
         branches = get_branch_list(cwd)[:15]
-        branch_listing[ch.id] = branches  # cache for #N references
+        branch_listing[ch.id] = branches  # cache for N/#N references
         cur = current_branch(cwd)
         listing = "\n".join(
             f"{'→' if b == cur else '•'} **{i}.** `{b}`"
             for i, b in enumerate(branches, 1)
         )
         await ch.send(f"**Recent branches ({cwd}):**\n{listing}\n\n"
-                       f"_Use `#N` in commands (e.g. `merge #1`, `switch #3`)_")
+                       f"_Use `N` or `#N` in commands (e.g. `merge 1`, `switch 3`)_")
         return
 
     if lower.startswith("pull"):
@@ -1184,7 +1184,7 @@ async def on_message(message: discord.Message):
         if not session:
             await ch.send("No active session. Start a task first.")
             return
-        # Resolve #N references
+        # Resolve N/#N references
         branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
         # Auto-commit current work before switching
         auto_commit(session["description"], session["turns"], cwd)
@@ -1205,12 +1205,12 @@ async def on_message(message: discord.Message):
         prefix_len = len("branch delete ") if lower.startswith("branch delete ") else len("branch del ")
         parts = content[prefix_len:].strip().split()
         if not parts:
-            await ch.send("Usage: `branch delete <name|#N> [local|remote|both] [force]`")
+            await ch.send("Usage: `branch delete <name|N> [local|remote|both] [force]`")
             return
         branch_ref = parts[0]
         branch_name = resolve_branch(branch_ref, ch.id, cwd)
         if branch_name is None:
-            await ch.send(f"❌ `{branch_ref}` didn't match any branch. Run `branches` first to use `#N` refs.")
+            await ch.send(f"❌ `{branch_ref}` didn't match any branch. Run `branches` first to use `N` or `#N` refs.")
             return
         flags = {p.lower() for p in parts[1:]}
         scope = "both"
