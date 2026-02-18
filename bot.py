@@ -653,7 +653,7 @@ HELP_TEXT_2 = """**Branches:**
 **Info:** `status` · `branches` · `pull [main]` · `help`
 
 **Login:** `claude login` · `codex login` · `login both`
-**System:** `restart`"""
+**System:** `restart` · `stop`"""
 
 HELP_PIN_TITLE_1 = "Help (1/2)"
 HELP_PIN_TITLE_2 = "Help (2/2)"
@@ -784,7 +784,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message: discord.Message):
-    global CLAUDE_MODEL, CODEX_MODEL
+    global CLAUDE_MODEL, CODEX_MODEL, _restart_on_close
     if message.author.bot or not is_authorised(message):
         return
 
@@ -981,7 +981,6 @@ async def on_message(message: discord.Message):
 
     # ── Info commands ─────────────────────────────────────────────────────
     if lower == "restart":
-        global _restart_on_close
         _RESTART_FLAG.write_text(str(ch.id))
         await ch.send("🔄 Restarting bot...")
         _restart_on_close = True
@@ -990,6 +989,12 @@ async def on_message(message: discord.Message):
         except asyncio.TimeoutError:
             print("⚠️ Close timed out, forcing restart...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
+
+    if lower in ("stop", "shutdown"):
+        _restart_on_close = False
+        await ch.send("🛑 Stopping bot...")
+        await client.close()
         return
 
     if lower == "help":
