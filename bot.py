@@ -73,6 +73,7 @@ GIT_PROJECTS: list[tuple[str, str]] = _load_git_projects()
 
 # Track login processes so we don't run two at once
 _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
+_restart_on_close = False
 
 # ── Discord client setup ─────────────────────────────────────────────────────
 
@@ -611,7 +612,7 @@ Just type your follow-up — the engine keeps context
 `repo <n> push` — push project n
 
 **Info:**
-`status` · `branches` · `help`
+`status` · `branches` · `help` · `restart`
 `pull` — pull latest dev from remote
 `pull main` — pull latest main from remote
 
@@ -791,6 +792,13 @@ async def on_message(message: discord.Message):
         return
 
     # ── Info commands ─────────────────────────────────────────────────────
+    if lower == "restart":
+        global _restart_on_close
+        await ch.send("🔄 Restarting bot...")
+        _restart_on_close = True
+        await client.close()
+        return
+
     if lower == "help":
         await ch.send(HELP_TEXT)
         return
@@ -1081,6 +1089,9 @@ async def main():
     async with client:
         client.loop.create_task(stdin_listener())
         await client.start(DISCORD_TOKEN)
+    if _restart_on_close:
+        print("🔄 Restarting process...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
