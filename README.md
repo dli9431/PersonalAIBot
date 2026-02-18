@@ -4,6 +4,13 @@ Self-hosted Discord bot: send coding tasks from your phone, run them through
 Claude Code or Codex CLI on your local machine (WSL2), review the diff, push,
 and merge — all from Discord.
 
+> **Note:** This project replicates one specific workflow from GitHub Copilot —
+> the agent chat mode where you describe a task and it makes code changes for you.
+> It does **not** replace Copilot entirely, and it still requires an active
+> [Anthropic](https://anthropic.com) or [OpenAI](https://openai.com) subscription
+> to use the underlying CLIs. This is a personal side project built for fun.
+> GitHub, please don't sue me.
+
 ---
 
 ## Quick Setup
