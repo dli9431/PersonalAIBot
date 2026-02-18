@@ -1382,6 +1382,14 @@ async def on_message(message: discord.Message):
         await discard_changes(branch, cwd)
         return
 
+    # If no files changed, clean up the branch and skip starting a session
+    if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
+        run_git(["git", "checkout", _base_branch(cwd)], cwd)
+        run_git(["git", "branch", "-D", branch], cwd)
+        await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+        await ch.send("ℹ️ No files changed — no session started.")
+        return
+
     # Create session
     active_sessions[ch.id] = {
         "branch": branch,
