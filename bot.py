@@ -587,65 +587,51 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 
 # ── Discord handlers ─────────────────────────────────────────────────────────
 
-HELP_TEXT = """**Starting a session:**
+HELP_TEXT_1 = """**Starting a session:**
 `<task>` — start with default engine ({default})
-`claude: <task>` / `cc: <task>` — start with Claude Code
-`codex: <task>` / `cx: <task>` — start with Codex CLI
+`claude: <task>` / `cc: <task>` — use Claude Code
+`codex: <task>` / `cx: <task>` — use Codex CLI
 
-**During a session** (iterative back-and-forth):
-Just type your follow-up — the engine keeps context
+**During a session:**
+Just type your follow-up — engine keeps context
 `switch <branch>` — save work & switch branch (creates if needed)
-`cwd <n>` — save work & switch to a different repo
-`diff` — see current changes so far
-`undo` — revert last engine run (git checkout)
-
-**Branch management:**
-`branch delete <name>` — delete local + remote (checks merged first)
-`branch delete <name> local` — local only
-`branch delete <name> remote` — remote only
-`branch delete <name> force` — skip merge check
+`cwd <n>` — save work & switch repo
+`diff` · `undo` · `abort`
 
 **Ending a session:**
 `done` — see full diff + push prompt
-`yes` / `push` — commit, push & auto-merge to dev
+`yes` / `push` — commit, push & merge
 `no` / `discard` — discard all changes
-`abort` — discard and end session immediately
 
 **After pushing:**
-`merge <target>` — merge current/last-pushed branch into target
-`merge src>tgt` — merge src into tgt
-`merge src into tgt` — same with natural language
-`pr main` — create a PR to main
+`merge <target>` — merge current/last-pushed into target
+`merge src>tgt` / `merge src into tgt` — explicit
+`pr <target>` — create a PR
 
-**Recovery:**
+**Branch management:**
+`branch delete <name>` — delete local + remote (checks merged)
+`branch delete <name> local|remote` — scope
+`branch delete <name> force` — skip merge check""".format(default=DEFAULT_ENGINE)
+
+HELP_TEXT_2 = """**Recovery:**
 `recover` — list orphaned feature branches
-`recover <id>` — resume by short ID (last digits) or full name
-`recover drop <id>` — delete by short ID or full name
-
-**Config:**
-`model claude <name>` — change Claude model (e.g. opus, sonnet, haiku)
-`model codex <name>` — change Codex model
-`engine` — show current models
+`recover <id>` — resume by short ID or full name
+`recover drop <id>` — delete orphaned branch
 
 **Multi-repo:**
 `repos` — list all configured git projects
-`cwd` — show active repo
-`cwd <n>` — switch engine & git ops to project n
-`repo <n> status` — git status for project n
-`repo <n> diff` — diff for project n
-`repo <n> commit [msg]` — stage all & commit in project n
-`repo <n> push` — push project n
-`repo <n> branches` — list branches for project n
+`cwd` / `cwd <n>` — show or switch active repo
+`repo <n> status|diff|commit|push|branches`
 
 **Info:**
-`status` · `branches` · `help` · `restart`
-`pull` — pull latest dev from remote
-`pull main` — pull latest main from remote
+`status` · `branches` · `pull` · `pull main` · `restart`
+
+**Config:**
+`model claude <name>` — e.g. opus, sonnet, haiku
+`model codex <name>` · `engine`
 
 **Login:**
-`login claude` — authenticate Claude Code (browser OAuth)
-`login codex` — authenticate Codex CLI (device code)
-`login both` — authenticate both""".format(default=DEFAULT_ENGINE)
+`login claude` · `login codex` · `login both`"""
 
 
 @tree.command(name="help", description="Show all available bot commands")
@@ -653,7 +639,8 @@ async def slash_help(interaction: discord.Interaction):
     if interaction.user.id != ALLOWED_USER_ID:
         await interaction.response.send_message("Not authorised.", ephemeral=True)
         return
-    await interaction.response.send_message(HELP_TEXT)
+    await interaction.response.send_message(HELP_TEXT_1)
+    await interaction.followup.send(HELP_TEXT_2)
 
 
 @client.event
@@ -897,7 +884,8 @@ async def on_message(message: discord.Message):
         return
 
     if lower == "help":
-        await ch.send(HELP_TEXT)
+        await ch.send(HELP_TEXT_1)
+        await ch.send(HELP_TEXT_2)
         return
 
     if lower == "status":
