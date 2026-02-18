@@ -160,6 +160,19 @@ def get_branch_list(cwd: str | None = None) -> list[str]:
     return [b for b in result.stdout.strip().split("\n") if b]
 
 
+def resolve_branch_case_insensitive(name: str, cwd: str | None = None) -> str | None:
+    """Resolve branch name ignoring case, if unambiguous."""
+    if not name:
+        return None
+    branches = get_branch_list(cwd)
+    if name in branches:
+        return name
+    matches = [b for b in branches if b.lower() == name.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -906,9 +919,20 @@ async def on_message(message: discord.Message):
             await ch.send("⏭️ Skipped merge. Use `merge <branch>` or `pr <branch>` any time.")
             del active_sessions[ch.id]
             return
-        target = content.strip()
+        target_input = content.strip()
+        target = resolve_branch_case_insensitive(target_input, cwd) or target_input
         check = run_git(["git", "rev-parse", "--verify", target], cwd)
         if check.returncode != 0:
+            # If there are multiple case-insensitive matches, ask for exact name.
+            branches = get_branch_list(cwd)
+            ci_matches = [b for b in branches if b.lower() == target_input.lower()]
+            if len(ci_matches) > 1:
+                listing = "\n".join(f"• `{b}`" for b in ci_matches[:10])
+                await ch.send(
+                    f"Multiple branches match `{target_input}` (case-insensitive). "
+                    f"Reply with the exact branch name:\n{listing}"
+                )
+                return
             branches = [b for b in run_git(
                 ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], cwd
             ).stdout.strip().split("\n") if b and b != session["branch"]]
