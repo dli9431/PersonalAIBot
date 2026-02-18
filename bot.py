@@ -615,50 +615,45 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 # ── Discord handlers ─────────────────────────────────────────────────────────
 
 HELP_TEXT_1 = """**Starting a session:**
-`<task>` — start with default engine ({default})
-`claude: <task>` / `cc: <task>` — use Claude Code
-`codex: <task>` / `cx: <task>` — use Codex CLI
+`<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:`
 
 **During a session:**
-Just type your follow-up — engine keeps context
-`switch <branch>` — save work & switch branch (creates if needed)
-`cwd <n>` — save work & switch repo
-`diff` · `undo` · `abort`
+Type follow-ups freely — engine keeps context
+`switch <branch|#N>` — save & switch branch (creates if new)
+`cwd <n>` — save & switch repo mid-session
+`diff` — peek at changes · `undo` — revert last run
 
 **Ending a session:**
-`done` — see full diff + push prompt
-`yes` / `push` — commit, push & merge
-`no` / `discard` — discard all changes
+`done` — full diff + push prompt
+`yes` / `push` — commit, push & merge · `no` / `discard` — discard
+`abort` — discard immediately · `skip` — skip merge step
 
 **After pushing:**
-`merge <target>` — merge current/last-pushed into target
-`merge src>tgt` / `merge src into tgt` — explicit
-`pr <target>` — create a PR
+`merge <target>` — merge current/session/last-pushed into target
+`merge src>tgt` / `merge src into tgt` — explicit source & target
+`pr <target>` — open a pull request""".format(default=DEFAULT_ENGINE)
 
-**Branch management:**
-`branch delete <name>` — delete local + remote (checks merged)
-`branch delete <name> local|remote` — scope
-`branch delete <name> force` — skip merge check""".format(default=DEFAULT_ENGINE)
+HELP_TEXT_2 = """**Branches:**
+`branches` — list branches (use `#N` in commands)
+`branch delete <name|#N> [local|remote] [force]`
+`switch <branch|#N>` — switch branch (in active session)
 
-HELP_TEXT_2 = """**Recovery:**
-`recover` — list orphaned feature branches
-`recover <id>` — resume by short ID or full name
+**Recovery:**
+`recover` — list orphaned branches · `recover <id>` — resume
 `recover drop <id>` — delete orphaned branch
 
 **Multi-repo:**
-`repos` — list all configured git projects
-`cwd` / `cwd <n>` — show or switch active repo
-`repo <n> status|diff|commit|push|branches`
-
-**Info:**
-`status` · `branches` · `pull` · `pull main` · `restart`
+`repos` · `cwd` / `cwd <n>` — show or switch active repo
+`repo <n> status|diff|commit [msg]|push|branches`
 
 **Config:**
-`model claude <name>` — e.g. opus, sonnet, haiku
-`model codex <name>` · `engine`
+`claude model <name>` — e.g. opus, sonnet, haiku
+`codex model <name>` — e.g. gpt-5.2-codex · `engine`
 
-**Login:**
-`login claude` · `login codex` · `login both`"""
+**Info:** `status` · `branches` · `pull [main]` · `help`
+
+**Login:** `claude login` · `codex login` · `login both`
+**System:** `restart`"""
 
 HELP_PIN_TITLE_1 = "Help (1/2)"
 HELP_PIN_TITLE_2 = "Help (2/2)"
@@ -966,23 +961,20 @@ async def on_message(message: discord.Message):
         return
 
     # ── Login commands ────────────────────────────────────────────────────
-    if lower.startswith("login"):
+    # Accepts: "claude login", "cc login", "codex login", "cx login", "login both"
+    _is_claude_login = lower in ("claude login", "cc login")
+    _is_codex_login  = lower in ("codex login", "cx login", "openai login")
+    _is_both_login   = lower == "login both"
+    if _is_claude_login or _is_codex_login or _is_both_login:
         if _login_lock.get(ch.id):
             await ch.send("⏳ A login is already in progress in this channel.")
             return
-
-        arg = lower[5:].strip()
         _login_lock[ch.id] = True
         try:
-            if arg in ("codex", "cx", "openai"):
-                await login_codex(ch)
-            elif arg in ("claude", "cc", ""):
+            if _is_claude_login or _is_both_login:
                 await login_claude(ch)
-            elif arg == "both":
-                await login_claude(ch)
+            if _is_codex_login or _is_both_login:
                 await login_codex(ch)
-            else:
-                await ch.send("Usage: `login claude`, `login codex`, or `login both`")
         finally:
             _login_lock.pop(ch.id, None)
         return
@@ -1240,24 +1232,24 @@ async def on_message(message: discord.Message):
         return
 
     # ── Model change ─────────────────────────────────────────────────────
-    if lower.startswith("model "):
-        parts = lower[6:].strip().split(None, 1)
-        if len(parts) != 2:
-            await ch.send(
-                f"Usage: `model claude <name>` or `model codex <name>`\n"
-                f"Current — Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`"
-            )
+    # Accepts: "claude model <name>", "cc model <name>", "codex model <name>", "cx model <name>"
+    _model_prefixes = {
+        "claude model ": "claude", "cc model ": "claude",
+        "codex model ": "codex",   "cx model ": "codex",
+    }
+    for _pfx, _engine in _model_prefixes.items():
+        if lower.startswith(_pfx):
+            new_model = content[len(_pfx):].strip()
+            if not new_model:
+                await ch.send(f"Usage: `{_pfx.strip()} <name>`\nCurrent — Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`")
+                return
+            if _engine == "claude":
+                CLAUDE_MODEL = new_model
+                await ch.send(f"✅ Claude model set to `{CLAUDE_MODEL}`")
+            else:
+                CODEX_MODEL = new_model
+                await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
             return
-        target, new_model = parts[0], parts[1]
-        if target in ("claude", "cc"):
-            CLAUDE_MODEL = new_model
-            await ch.send(f"✅ Claude model set to `{CLAUDE_MODEL}`")
-        elif target in ("codex", "cx"):
-            CODEX_MODEL = new_model
-            await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
-        else:
-            await ch.send("Use `model claude <name>` or `model codex <name>`")
-        return
 
     # ── Recover orphaned branches ────────────────────────────────────────
     if lower == "recover":
