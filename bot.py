@@ -48,7 +48,7 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 ).split()
 
 # Codex CLI
-CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.2-codex")
+CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.3-codex")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 
@@ -648,7 +648,7 @@ HELP_TEXT_2 = """**Branches:**
 
 **Config:**
 `claude model <name>` — e.g. opus, sonnet, haiku
-`codex model <name>` — e.g. gpt-5.2-codex · `engine`
+`codex model <name>` — e.g. gpt-5.3-codex · `engine`
 
 **Info:** `status` · `branches` · `pull [main]` · `help`
 
