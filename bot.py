@@ -14,6 +14,7 @@ Requirements:
 """
 
 import asyncio
+import json
 import os
 import pathlib
 import re
@@ -70,6 +71,12 @@ def _load_git_projects() -> list[tuple[str, str]]:
     return projects
 
 GIT_PROJECTS: list[tuple[str, str]] = _load_git_projects()
+
+_BASE_DIR = pathlib.Path(__file__).resolve().parent
+_STATE_ENV = os.getenv("BOT_STATE_FILE", "")
+STATE_FILE = pathlib.Path(_STATE_ENV) if _STATE_ENV else (_BASE_DIR / ".bot_state.json")
+if not STATE_FILE.is_absolute():
+    STATE_FILE = _BASE_DIR / STATE_FILE
 
 # Track login processes so we don't run two at once
 _login_lock: dict[int, bool] = {}  # channel_id → True while login in progress
@@ -189,6 +196,64 @@ def truncate(text: str, limit: int = MAX_DIFF_CHARS) -> str:
 
 def current_branch(path: str | None = None) -> str:
     return run_git(["git", "branch", "--show-current"], path).stdout.strip()
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
+    except OSError:
+        pass
+
+
+def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
+    data = _load_state()
+    channels = data.setdefault("channels", {})
+    if not branch:
+        try:
+            branch = current_branch(cwd) or "?"
+        except (FileNotFoundError, OSError):
+            branch = "?"
+    channels[str(ch_id)] = {
+        "cwd": cwd,
+        "branch": branch,
+        "updated": int(time.time()),
+    }
+    data["last_active_channel"] = ch_id
+    _save_state(data)
+
+
+def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
+    data = _load_state()
+    channels = data.get("channels", {}) or {}
+    for ch_id_str, info in channels.items():
+        if isinstance(info, dict):
+            cwd = info.get("cwd")
+            if cwd:
+                try:
+                    channel_cwd[int(ch_id_str)] = cwd
+                except ValueError:
+                    continue
+    last_id = data.get("last_active_channel")
+    if last_id is None:
+        return None, None, None, None
+    info = channels.get(str(last_id)) or {}
+    cwd = info.get("cwd")
+    branch = info.get("branch")
+    checkout_error = None
+    if cwd and branch and pathlib.Path(cwd).exists():
+        res = run_git(["git", "checkout", branch], cwd)
+        if res.returncode != 0:
+            checkout_error = (res.stderr or res.stdout or "").strip() or "checkout failed"
+    return last_id, cwd, branch, checkout_error
 
 
 def has_gh_cli() -> bool:
@@ -810,6 +875,7 @@ async def on_ready():
                 except Exception:
                     pass
     await _send_restart_confirmation()
+    await _send_restore_notice()
 
 
 async def _send_restart_confirmation():
@@ -823,6 +889,22 @@ async def _send_restart_confirmation():
                 await ch.send("✅ Bot restarted successfully.")
         except Exception:
             pass
+
+
+async def _send_restore_notice():
+    """Notify last active channel with restored cwd/branch on startup."""
+    if not STATE_FILE.exists():
+        return
+    ch_id, cwd, branch, checkout_error = restore_state()
+    if not ch_id or not cwd or not branch:
+        return
+    ch = client.get_channel(ch_id)
+    if not ch:
+        return
+    msg = f"📍 Restored repo: `{cwd}`\n🌿 Restored branch: `{branch}`"
+    if checkout_error:
+        msg += f"\n⚠️ Could not checkout branch: `{checkout_error}`"
+    await ch.send(msg)
 
 
 @client.event
@@ -850,6 +932,7 @@ async def on_message(message: discord.Message):
     session = active_sessions.get(ch.id)
     # Resolve active cwd: prefer session's cwd, then channel's, then default
     cwd = (session or {}).get("cwd") or channel_cwd.get(ch.id) or REPO_PATH
+    record_state(ch.id, cwd)
 
     # ── Stop current run ────────────────────────────────────────────────
     if lower == "stop":
@@ -896,6 +979,7 @@ async def on_message(message: discord.Message):
                     await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
                     merge_result = await merge_branch(session["branch"], DEV_BRANCH, cwd)
                     await ch.send(merge_result)
+                    record_state(ch.id, cwd, DEV_BRANCH)
                     await ch.send("`pr main` to create a PR to main")
                     del active_sessions[ch.id]
                 else:
@@ -944,6 +1028,7 @@ async def on_message(message: discord.Message):
         await ch.send(f"⏳ Merging into `{target}`...")
         merge_result = await merge_branch(session["branch"], target, cwd)
         await ch.send(merge_result)
+        record_state(ch.id, cwd, target)
         del active_sessions[ch.id]
         return
 
@@ -1024,6 +1109,7 @@ async def on_message(message: discord.Message):
             return
         await ch.send(f"⏳ Merging `{src}` → `{tgt}`...")
         await ch.send(await merge_branch(src, tgt, cwd))
+        record_state(ch.id, cwd, tgt)
         return
 
     # ── PR commands ───────────────────────────────────────────────────────
@@ -1202,6 +1288,7 @@ async def on_message(message: discord.Message):
             session["branch"] = new_branch
         channel_cwd[ch.id] = path
         new_branch = current_branch(path)
+        record_state(ch.id, path, new_branch)
         await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
         return
 
@@ -1224,6 +1311,7 @@ async def on_message(message: discord.Message):
             run_git(["git", "checkout", branch_name], cwd)
             await ch.send(f"🌿 Switched to `{branch_name}`")
         session["branch"] = branch_name
+        record_state(ch.id, cwd, branch_name)
         stat = get_diff_stat(cwd)
         await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
         return
@@ -1464,6 +1552,7 @@ async def on_message(message: discord.Message):
     except Exception as e:
         await ch.send(f"❌ Branch creation failed: `{e}`")
         return
+    record_state(ch.id, cwd, branch)
 
     stop_event = asyncio.Event()
     stop_events[ch.id] = stop_event
@@ -1492,6 +1581,7 @@ async def on_message(message: discord.Message):
     if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
         run_git(["git", "checkout", _base_branch(cwd)], cwd)
         run_git(["git", "branch", "-D", branch], cwd)
+        record_state(ch.id, cwd, _base_branch(cwd))
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
         await ch.send("ℹ️ No files changed — no session started.")
         return
