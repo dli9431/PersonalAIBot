@@ -656,13 +656,13 @@ async def _run_with_live_output(
 
 
 async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
-    """Run Claude Code. If resume=True, uses --resume to continue last session."""
+    """Run Claude Code. If resume=True, uses --continue to continue last session."""
     if images:
         img_lines = "\n".join(f"- {p}" for p in images)
         task = f"Examine the image(s) at the following path(s) using the Read tool:\n{img_lines}\n\n{task}"
     cmd = ["claude"]
     if resume:
-        cmd.extend(["--resume", "-p", task])
+        cmd.extend(["--continue", "-p", task])
     else:
         cmd.extend(["-p", task])
 
