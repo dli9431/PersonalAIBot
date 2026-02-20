@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.request
 
 import discord
 from dotenv import load_dotenv
@@ -491,6 +492,45 @@ def get_diff_stat(path: str | None = None) -> str:
     return ", ".join(lines) or "no changes"
 
 
+# ── Model discovery ───────────────────────────────────────────────────────────
+
+def get_codex_models() -> list[str]:
+    """Return available Codex model slugs from the CLI's local cache file."""
+    cache = pathlib.Path.home() / ".codex" / "models_cache.json"
+    try:
+        with open(cache) as f:
+            data = json.load(f)
+        return [
+            m["slug"] for m in data.get("models", [])
+            if m.get("visibility") != "hidden"
+        ]
+    except Exception:
+        return ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.2", "gpt-5.1-codex-mini"]
+
+
+async def get_claude_models() -> list[str]:
+    """Return available Claude models from the Anthropic API, or default aliases."""
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if api_key:
+        def _fetch():
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/models",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read())
+        try:
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, _fetch)
+            return [m["id"] for m in data.get("data", [])]
+        except Exception:
+            pass
+    return ["opus", "sonnet", "haiku"]
+
+
 # ── Login helpers ─────────────────────────────────────────────────────────────
 
 async def login_codex(ch: discord.TextChannel) -> None:
@@ -598,6 +638,7 @@ async def _run_with_live_output(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=10 * 1024 * 1024,  # 10MB – prevents "chunk longer than limit" on large output lines
     )
     running_procs[ch.id] = proc
 
@@ -689,6 +730,7 @@ async def _run_claude_streaming(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=10 * 1024 * 1024,  # 10MB – prevents "chunk longer than limit" on large JSON lines
     )
     running_procs[ch.id] = proc
 
@@ -1714,12 +1756,16 @@ async def on_message(message: discord.Message):
         return
 
     if lower == "engine":
+        claude_models = await get_claude_models()
+        codex_models = get_codex_models()
+        claude_list = " · ".join(f"`{m}`" for m in claude_models)
+        codex_list = " · ".join(f"`{m}`" for m in codex_models)
         await ch.send(
             f"Default: **{DEFAULT_ENGINE}**\n"
             f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`\n\n"
             f"**Available models:**\n"
-            f"Claude: `opus` · `sonnet` · `haiku`\n"
-            f"Codex: `gpt-5.3-codex` · `gpt-5.2-codex` · `gpt-5.1-codex-max` · `gpt-5.2` · `gpt-5.1-codex-mini`"
+            f"Claude: {claude_list}\n"
+            f"Codex: {codex_list}"
         )
         return
 
