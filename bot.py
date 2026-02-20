@@ -994,10 +994,11 @@ async def on_ready():
             print(f"     ⚠️  [{label}] not a git repo: {path}")
         else:
             branch = current_branch(path)
-            # Claude: -p mode skips the workspace trust dialog (always ok)
+            # Claude: trust is stored in .claude/settings.local.json inside the project dir
             # Codex: trust_level="trusted" must be set in ~/.codex/config.toml
-            codex_tag = "trusted" if path in codex_trusted else "⚠️ NOT TRUSTED"
-            print(f"     ✓  [{label}] on '{branch}' — claude: ok  codex: {codex_tag}")
+            claude_tag = "trusted" if (pathlib.Path(path) / ".claude" / "settings.local.json").exists() else "⚠️ NOT TRUSTED"
+            codex_tag  = "trusted" if path in codex_trusted else "⚠️ NOT TRUSTED"
+            print(f"     ✓  [{label}] on '{branch}' — claude: {claude_tag}  codex: {codex_tag}")
             print(f"          {path}")
     if not ssh_ok:
         print(f"\n⚠️  Cannot connect to GitHub via SSH.")
@@ -1007,9 +1008,14 @@ async def on_ready():
         print(f"\n⚠️  Claude CLI unavailable: {claude_status}")
     if not codex_ok:
         print(f"\n⚠️  Codex CLI unavailable: {codex_status}")
-    untrusted = [path for _, path in GIT_PROJECTS if path not in codex_trusted]
-    if untrusted and codex_ok:
-        print(f"\n⚠️  Codex is NOT trusted in {len(untrusted)} project dir(s).")
+    claude_untrusted = [path for _, path in GIT_PROJECTS
+                        if not (pathlib.Path(path) / ".claude" / "settings.local.json").exists()]
+    if claude_untrusted and claude_ok:
+        print(f"\n⚠️  Claude is NOT trusted in {len(claude_untrusted)} project dir(s).")
+        print(f"   Fix: run `claude` once interactively in each dir and approve trust.")
+    codex_untrusted = [path for _, path in GIT_PROJECTS if path not in codex_trusted]
+    if codex_untrusted and codex_ok:
+        print(f"\n⚠️  Codex is NOT trusted in {len(codex_untrusted)} project dir(s).")
         print(f"   Codex will hang waiting for interactive input in those dirs.")
         print(f"   Fix: run `codex` once interactively in each dir and approve trust.")
     print(f"   Slash commands synced")
