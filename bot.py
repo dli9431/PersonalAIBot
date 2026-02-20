@@ -6,7 +6,7 @@ Supports iterative sessions: send a task, review changes, send follow-ups,
 and only commit when you're satisfied. Uses --resume (Claude Code) and
 exec resume --last (Codex) for multi-turn context.
 
-Designed to run inside WSL2 on Windows.
+Designed to run on Linux (including WSL2).
 
 Requirements:
     pip install discord.py python-dotenv
