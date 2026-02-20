@@ -1038,6 +1038,7 @@ HELP_TEXT_2 = """**Branches:**
 `repo <n> status|diff|commit [msg]|push|branches`
 
 **Config:**
+`claude models` · `codex models` — list available models
 `claude model <name>` — e.g. opus, sonnet, haiku
 `codex model <name>` — e.g. gpt-5.3-codex · `engine`
 
@@ -1767,6 +1768,19 @@ async def on_message(message: discord.Message):
             f"Claude: {claude_list}\n"
             f"Codex: {codex_list}"
         )
+        return
+
+    # ── Model listing ────────────────────────────────────────────────────
+    # Accepts: "claude models", "cc models", "codex models", "cx models"
+    if lower in ("claude models", "cc models"):
+        models = await get_claude_models()
+        listing = "\n".join(f"{'▶ ' if m == CLAUDE_MODEL else '  '}`{m}`" for m in models)
+        await ch.send(f"**Claude models** (current: `{CLAUDE_MODEL}`):\n{listing}\n\nSwitch with `claude model <name>`")
+        return
+    if lower in ("codex models", "cx models"):
+        models = get_codex_models()
+        listing = "\n".join(f"{'▶ ' if m == CODEX_MODEL else '  '}`{m}`" for m in models)
+        await ch.send(f"**Codex models** (current: `{CODEX_MODEL}`):\n{listing}\n\nSwitch with `codex model <name>`")
         return
 
     # ── Model change ─────────────────────────────────────────────────────
