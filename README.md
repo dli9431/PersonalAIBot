@@ -229,7 +229,9 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `engine` | Show current engine config |
+| `engine` | Show current engine config and all available models |
+| `claude models` / `cc models` | List available Claude models |
+| `codex models` / `cx models` | List available Codex models |
 | `claude model <name>` | Switch Claude model (e.g. `opus`, `sonnet`, `haiku`) |
 | `codex model <name>` | Switch Codex model |
 | `status` | Current branch and working tree |
