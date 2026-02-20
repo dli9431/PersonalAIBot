@@ -349,7 +349,7 @@ def check_claude_cli() -> tuple[bool, str]:
         version = (r.stdout or r.stderr).strip().splitlines()[0]
         if os.environ.get("ANTHROPIC_API_KEY"):
             return True, f"{version} (API key)"
-        if (pathlib.Path.home() / ".claude" / "credentials.json").exists():
+        if (pathlib.Path.home() / ".claude" / ".credentials.json").exists():
             return True, f"{version} (OAuth)"
         return True, f"{version} (⚠️  no auth — run `claude login`)"
     except (FileNotFoundError, subprocess.TimeoutExpired):
