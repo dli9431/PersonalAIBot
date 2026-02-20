@@ -60,6 +60,6 @@ No build step, test suite, or linter is configured.
 **Git:** `merge <target>`, `merge src>tgt`, `merge src into tgt`, `pr <target>`, `pull [branch]`
 **Multi-repo:** `repos`, `repo <n> status|diff|commit [msg]|push|branches`
 **Recovery:** `recover`, `recover <id>`, `recover drop <id>`
-**Config:** `claude model <name>`, `cc model <name>`, `codex model <name>`, `cx model <name>`, `engine`
+**Config:** `claude models`, `codex models` — list available; `claude model <name>`, `cc model <name>`, `codex model <name>`, `cx model <name>`, `engine`
 **Login:** `claude login`, `codex login`, `openai login`, `login both`
 **System:** `status`, `help`, `restart`
