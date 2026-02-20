@@ -494,22 +494,26 @@ def get_diff_stat(path: str | None = None) -> str:
 
 # ── Model discovery ───────────────────────────────────────────────────────────
 
-def get_codex_models() -> list[str]:
-    """Return available Codex model slugs from the CLI's local cache file."""
+def get_codex_models() -> list[tuple[str, int | None]]:
+    """Return available Codex models as (slug, context_window) tuples from the CLI's local cache."""
     cache = pathlib.Path.home() / ".codex" / "models_cache.json"
     try:
         with open(cache) as f:
             data = json.load(f)
         return [
-            m["slug"] for m in data.get("models", [])
+            (m["slug"], m.get("context_window"))
+            for m in data.get("models", [])
             if m.get("visibility") != "hidden"
         ]
     except Exception:
-        return ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.2", "gpt-5.1-codex-mini"]
+        return [
+            ("gpt-5.3-codex", None), ("gpt-5.2-codex", None),
+            ("gpt-5.1-codex-max", None), ("gpt-5.2", None), ("gpt-5.1-codex-mini", None),
+        ]
 
 
-async def get_claude_models() -> list[str]:
-    """Return available Claude models from the Anthropic API, or default aliases."""
+async def get_claude_models() -> list[tuple[str, str]]:
+    """Return available Claude models as (id, display_name) tuples from the Anthropic API."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if api_key:
         def _fetch():
@@ -525,10 +529,10 @@ async def get_claude_models() -> list[str]:
         try:
             loop = asyncio.get_event_loop()
             data = await loop.run_in_executor(None, _fetch)
-            return [m["id"] for m in data.get("data", [])]
+            return [(m["id"], m.get("display_name", m["id"])) for m in data.get("data", [])]
         except Exception:
             pass
-    return ["opus", "sonnet", "haiku"]
+    return [("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "haiku")]
 
 
 # ── Login helpers ─────────────────────────────────────────────────────────────
@@ -1759,8 +1763,8 @@ async def on_message(message: discord.Message):
     if lower == "engine":
         claude_models = await get_claude_models()
         codex_models = get_codex_models()
-        claude_list = " · ".join(f"`{m}`" for m in claude_models)
-        codex_list = " · ".join(f"`{m}`" for m in codex_models)
+        claude_list = " · ".join(f"`{mid}`" for mid, _ in claude_models)
+        codex_list = " · ".join(f"`{slug}`" for slug, _ in codex_models)
         await ch.send(
             f"Default: **{DEFAULT_ENGINE}**\n"
             f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`\n\n"
@@ -1774,12 +1778,23 @@ async def on_message(message: discord.Message):
     # Accepts: "claude models", "cc models", "codex models", "cx models"
     if lower in ("claude models", "cc models"):
         models = await get_claude_models()
-        listing = "\n".join(f"{'▶ ' if m == CLAUDE_MODEL else '  '}`{m}`" for m in models)
+        listing = "\n".join(
+            f"{'▶ ' if mid == CLAUDE_MODEL else '  '}`{mid}`"
+            + (f" ({display_name})" if display_name != mid else "")
+            for mid, display_name in models
+        )
         await ch.send(f"**Claude models** (current: `{CLAUDE_MODEL}`):\n{listing}\n\nSwitch with `claude model <name>`")
         return
     if lower in ("codex models", "cx models"):
         models = get_codex_models()
-        listing = "\n".join(f"{'▶ ' if m == CODEX_MODEL else '  '}`{m}`" for m in models)
+        def _ctx_label(ctx: int | None) -> str:
+            if ctx is None:
+                return ""
+            return f" ({ctx // 1000}K ctx)"
+        listing = "\n".join(
+            f"{'▶ ' if slug == CODEX_MODEL else '  '}`{slug}`{_ctx_label(ctx)}"
+            for slug, ctx in models
+        )
         await ch.send(f"**Codex models** (current: `{CODEX_MODEL}`):\n{listing}\n\nSwitch with `codex model <name>`")
         return
 
