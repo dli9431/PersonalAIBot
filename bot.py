@@ -674,6 +674,102 @@ async def _run_with_live_output(
     return output
 
 
+async def _run_claude_streaming(
+    cmd: list[str],
+    ch: discord.TextChannel,
+    label: str,
+    cwd: str | None = None,
+) -> str:
+    """Run Claude Code with stream-json output, live-updating Discord as events arrive."""
+    status_msg = await ch.send(f"⚙️ {label} started...")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd or REPO_PATH,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    running_procs[ch.id] = proc
+
+    accumulated_text: list[str] = []
+    tool_activity: list[str] = []
+    final_result: str | None = None
+    stderr_chunks: list[bytes] = []
+    start = time.time()
+    last_edit_time = 0.0
+    last_content = ""
+
+    async def read_stderr() -> None:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+
+    async def stream_stdout() -> None:
+        nonlocal final_result, last_edit_time, last_content
+        async for raw_line in proc.stdout:
+            line_str = raw_line.decode(errors="replace").strip()
+            if not line_str:
+                continue
+            try:
+                event = json.loads(line_str)
+            except json.JSONDecodeError:
+                accumulated_text.append(line_str + "\n")
+                continue
+
+            event_type = event.get("type")
+            if event_type == "assistant":
+                for item in event.get("message", {}).get("content", []):
+                    if item.get("type") == "text":
+                        accumulated_text.append(item["text"])
+                    elif item.get("type") == "tool_use":
+                        tool_activity.append(item["name"])
+            elif event_type == "result":
+                final_result = event.get("result", "")
+
+            now = time.time()
+            if now - last_edit_time >= STATUS_REFRESH:
+                elapsed = int(now - start)
+                display = "".join(accumulated_text)
+                tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
+                tail = strip_ansi(tool_line + display).strip()
+                if len(tail) > 1400:
+                    tail = tail[-1400:]
+                new_content = f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(starting...)'}\n```"
+                if new_content != last_content:
+                    try:
+                        await status_msg.edit(content=new_content)
+                        last_content = new_content
+                        last_edit_time = now
+                    except discord.HTTPException:
+                        pass
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
+            timeout=ENGINE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT)
+    finally:
+        running_procs.pop(ch.id, None)
+        elapsed = int(time.time() - start)
+        try:
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)")
+        except discord.HTTPException:
+            pass
+
+    stderr = b"".join(stderr_chunks).decode(errors="replace")
+    output = final_result or "".join(accumulated_text) or "(no output)"
+    if proc.returncode != 0 and stderr:
+        tail_lines = stderr.strip().split("\n")[-5:]
+        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail_lines)
+    return output
+
+
 async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
     """Run Claude Code. If resume=True, uses --continue to continue last session."""
     if images:
@@ -687,7 +783,7 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
 
     cmd.extend([
         "--model", CLAUDE_MODEL,
-        "--output-format", "text",
+        "--output-format", "stream-json",
         "--max-turns", "10",
     ])
     if CLAUDE_ALLOWED_TOOLS:
@@ -697,7 +793,7 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
         cmd.append("--disallowedTools")
         cmd.extend(CLAUDE_DENIED_TOOLS)
 
-    return await _run_with_live_output(cmd, ch, "Claude Code", cwd=cwd)
+    return await _run_claude_streaming(cmd, ch, "Claude Code", cwd=cwd)
 
 
 async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
