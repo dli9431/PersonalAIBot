@@ -532,7 +532,11 @@ async def get_claude_models() -> list[tuple[str, str]]:
             return [(m["id"], m.get("display_name", m["id"])) for m in data.get("data", [])]
         except Exception:
             pass
-    return [("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "haiku")]
+    return [
+        ("opus", "Claude Opus 4.6"),
+        ("sonnet", "Claude Sonnet 4.6"),
+        ("haiku", "Claude Haiku 4.5"),
+    ]
 
 
 # ── Login helpers ─────────────────────────────────────────────────────────────
