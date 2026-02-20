@@ -15,7 +15,7 @@ and merge — all from Discord.
 
 ## Quick Setup
 
-### 1. Prerequisites (WSL2)
+### 1. Prerequisites (Linux / WSL2)
 
 ```bash
 # Node.js via nvm
@@ -112,6 +112,7 @@ claude: write tests for the auth module
 codex: refactor the database queries
 cc: fix the CSS on the navbar
 cx: add error handling to the API routes
+openai: add a loading spinner to the form
 ```
 
 The bot creates a feature branch, runs the engine, and streams its output.
