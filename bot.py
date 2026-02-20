@@ -783,6 +783,7 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
 
     cmd.extend([
         "--model", CLAUDE_MODEL,
+        "--verbose",
         "--output-format", "stream-json",
         "--max-turns", "10",
     ])
