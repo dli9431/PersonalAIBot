@@ -1,8 +1,8 @@
 # Discord → Claude Code / Codex CLI → Git Bridge
 
 Self-hosted Discord bot: send coding tasks from your phone, run them through
-Claude Code or Codex CLI on your local machine (WSL2), review the diff, push,
-and merge — all from Discord.
+Claude Code or Codex CLI on your local machine (Linux, or WSL on Windows),
+review the diff, push, and merge — all from Discord.
 
 > **Note:** This project replicates one specific workflow from GitHub Copilot —
 > the agent chat mode where you describe a task and it makes code changes for you.
@@ -290,7 +290,7 @@ bash /path/to/PersonalAIBot/start.sh
 # tmux attach -t bot  to return
 ```
 
-### Keep WSL alive after closing terminal
+### Keep WSL alive after closing terminal (Windows only)
 
 Create `%USERPROFILE%\.wslconfig` on Windows:
 
@@ -337,7 +337,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 - [ ] All git work on feature branches, never main directly
 - [ ] Review the diff before saying `yes`
 - [ ] SSH keys for git auth (not HTTPS with stored password)
-- [ ] Repos under WSL filesystem (`/home/...`), not `/mnt/c/`
+- [ ] (WSL) Repos under WSL filesystem (`/home/...`), not `/mnt/c/`
 
 ---
 
