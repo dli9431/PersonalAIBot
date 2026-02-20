@@ -376,6 +376,25 @@ def check_codex_cli() -> tuple[bool, str]:
         return False, "not installed — run: npm install -g @openai/codex"
 
 
+def _normalize_path(path: str) -> str:
+    p = pathlib.Path(path).expanduser()
+    try:
+        p = p.resolve()
+    except Exception:
+        p = p.absolute()
+    return str(p)
+
+
+def _is_claude_trusted(path: str) -> bool:
+    """Return True if Claude Code has marked this repo as trusted."""
+    p = pathlib.Path(path)
+    if (p / ".claude" / "settings.local.json").exists():
+        return True
+    if (p / ".claude" / "settings.json").exists():
+        return True
+    return False
+
+
 def _load_codex_trusted_dirs() -> set[str]:
     """Return the set of directory paths that Codex has marked as trusted."""
     config_path = pathlib.Path.home() / ".codex" / "config.toml"
@@ -385,9 +404,9 @@ def _load_codex_trusted_dirs() -> set[str]:
         with open(config_path, "rb") as f:
             config = tomllib.load(f)
         return {
-            path
+            _normalize_path(path)
             for path, settings in config.get("projects", {}).items()
-            if settings.get("trust_level") == "trusted"
+            if isinstance(path, str) and settings.get("trust_level") == "trusted"
         }
     except Exception:
         return set()
@@ -999,8 +1018,8 @@ async def on_ready():
             branch = current_branch(path)
             # Claude: trust is stored in .claude/settings.local.json inside the project dir
             # Codex: trust_level="trusted" must be set in ~/.codex/config.toml
-            claude_tag = "trusted" if (pathlib.Path(path) / ".claude" / "settings.local.json").exists() else "⚠️ NOT TRUSTED"
-            codex_tag  = "trusted" if path in codex_trusted else "⚠️ NOT TRUSTED"
+            claude_tag = "trusted" if _is_claude_trusted(path) else "⚠️ NOT TRUSTED"
+            codex_tag  = "trusted" if _normalize_path(path) in codex_trusted else "⚠️ NOT TRUSTED"
             print(f"     ✓  [{label}] on '{branch}' — claude: {claude_tag}  codex: {codex_tag}")
             print(f"          {path}")
     if not ssh_ok:
@@ -1012,11 +1031,11 @@ async def on_ready():
     if not codex_ok:
         print(f"\n⚠️  Codex CLI unavailable: {codex_status}")
     claude_untrusted = [path for _, path in GIT_PROJECTS
-                        if not (pathlib.Path(path) / ".claude" / "settings.local.json").exists()]
+                        if not _is_claude_trusted(path)]
     if claude_untrusted and claude_ok:
         print(f"\n⚠️  Claude is NOT trusted in {len(claude_untrusted)} project dir(s).")
         print(f"   Fix: run `claude` once interactively in each dir and approve trust.")
-    codex_untrusted = [path for _, path in GIT_PROJECTS if path not in codex_trusted]
+    codex_untrusted = [path for _, path in GIT_PROJECTS if _normalize_path(path) not in codex_trusted]
     if codex_untrusted and codex_ok:
         print(f"\n⚠️  Codex is NOT trusted in {len(codex_untrusted)} project dir(s).")
         print(f"   Codex will hang waiting for interactive input in those dirs.")
