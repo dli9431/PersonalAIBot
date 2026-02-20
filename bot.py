@@ -386,13 +386,10 @@ def _normalize_path(path: str) -> str:
 
 
 def _is_claude_trusted(path: str) -> bool:
-    """Return True if Claude Code has marked this repo as trusted."""
-    p = pathlib.Path(path)
-    if (p / ".claude" / "settings.local.json").exists():
-        return True
-    if (p / ".claude" / "settings.json").exists():
-        return True
-    return False
+    """Return True if Claude Code can run non-interactively in this directory.
+    In -p (print) mode, Claude Code v2.x does not require a per-project trust
+    file — it only needs valid global auth credentials."""
+    return (pathlib.Path.home() / ".claude" / ".credentials.json").exists()
 
 
 def _load_codex_trusted_dirs() -> set[str]:
