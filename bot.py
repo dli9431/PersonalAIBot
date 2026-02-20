@@ -483,6 +483,7 @@ async def login_codex(ch: discord.TextChannel) -> None:
 
     proc = await asyncio.create_subprocess_exec(
         "codex", "login", "--device-auth",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -525,6 +526,7 @@ async def login_claude(ch: discord.TextChannel) -> None:
 
     proc = await asyncio.create_subprocess_exec(
         "claude", "login",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -577,6 +579,7 @@ async def _run_with_live_output(
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd or REPO_PATH,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
