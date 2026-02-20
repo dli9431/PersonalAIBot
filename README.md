@@ -15,7 +15,9 @@ review the diff, push, and merge — all from Discord.
 
 ## Quick Setup
 
-### 1. Prerequisites (Linux / WSL2)
+### 1. Prerequisites
+
+#### Native Linux
 
 ```bash
 # Node.js via nvm
@@ -31,6 +33,11 @@ codex         # authenticate (browser), then /exit
 sudo apt update && sudo apt install gh
 gh auth login  # GitHub.com → SSH → web browser
 ```
+
+#### WSL2 (Windows)
+
+Same steps as above, run inside your WSL2 terminal. Keep your repos under the WSL filesystem (`/home/...`), not `/mnt/c/`.
+
 
 ### 2. Discord Bot
 
