@@ -84,6 +84,7 @@ PROTECTED_BRANCHES=main,dev
 # Engine defaults
 DEFAULT_ENGINE=claude    # or codex
 ENGINE_TIMEOUT=300
+CONTEXT_MAX_CHARS=4000   # max chars saved for timeout resume context
 
 # Claude Code settings
 CLAUDE_MODEL=sonnet

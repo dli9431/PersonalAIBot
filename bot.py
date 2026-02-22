@@ -372,6 +372,15 @@ def load_resume_context(ch_id: int) -> dict | None:
     return None
 
 
+def clear_resume_context(ch_id: int) -> None:
+    data = _load_state()
+    contexts = data.get("resume_contexts") or {}
+    if str(ch_id) in contexts:
+        del contexts[str(ch_id)]
+        data["resume_contexts"] = contexts
+        _save_state(data)
+
+
 def build_resume_prompt(
     task: str,
     ch_id: int,
@@ -984,6 +993,7 @@ async def run_engine(
         output = await runner(task, ch, resume, images, cwd=cwd)
         if stop_event and stop_event.is_set():
             return "(stopped)"
+        clear_resume_context(ch.id)
         return output
     except subprocess.TimeoutExpired as e:
         if stop_event and stop_event.is_set():
