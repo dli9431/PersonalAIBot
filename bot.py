@@ -897,6 +897,31 @@ async def get_claude_models() -> list[tuple[str, str]]:
     ]
 
 
+def resolve_model_selector(
+    selector: str,
+    models: list[tuple[str, object]],
+) -> tuple[str | None, str | None]:
+    """
+    Resolve model by 1-based index or exact model id.
+    Returns (resolved_model, error_message).
+    """
+    token = selector.strip()
+    if not token:
+        return None, "Provide a model name or number."
+    if token.isdigit():
+        if not models:
+            return None, "No models available."
+        index = int(token)
+        if index < 1 or index > len(models):
+            return None, f"Model number must be between 1 and {len(models)}."
+        return models[index - 1][0], None
+    for model_id, _ in models:
+        if model_id.lower() == token.lower():
+            return model_id, None
+    # Keep free-form names working for newly released models.
+    return token, None
+
+
 # ── Login helpers ─────────────────────────────────────────────────────────────
 
 async def login_codex(ch: discord.TextChannel) -> None:
@@ -1424,10 +1449,11 @@ HELP_TEXT_2 = """**Branches:**
 `repo <n> status|diff|commit [msg]|push|branches`
 
 **Config:**
-`claude models` · `codex models` — list available models
-`claude model <name>` — e.g. opus, sonnet, haiku
-`codex model <name>` — e.g. gpt-5.3-codex
-`model <name>` — set model for default engine · `engine`
+`claude models` · `codex models` — list available models (numbered)
+`claude model <n|name>` — e.g. `1` / `opus` / `sonnet`
+`codex model <n|name>` — e.g. `1` / `gpt-5.3-codex`
+`engine claude model <n|name>` · `engine codex model <n|name>`
+`model <n|name>` — set model for default engine · `engine`
 
 **Info:** `status` · `branches` · `pull [main]` · `help`
 
@@ -1613,7 +1639,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message: discord.Message):
-    global CLAUDE_MODEL, CODEX_MODEL, _restart_on_close
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, _restart_on_close
     if message.author.bot or not is_authorised(message):
         return
 
@@ -2328,6 +2354,49 @@ async def on_message(message: discord.Message):
         await ch.send("\n".join(msgs))
         return
 
+    engine_model_match = re.match(
+        r"^engine\s+(claude|cc|codex|cx|openai)\s+model(?:\s+(.+))?$",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if engine_model_match:
+        engine_token = engine_model_match.group(1).lower()
+        selector = (engine_model_match.group(2) or "").strip()
+        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        if not selector:
+            await ch.send(
+                "Usage: `engine claude model <n|name>` or `engine codex model <n|name>`"
+            )
+            return
+        if target_engine == "claude":
+            models = await get_claude_models()
+            selected_model, err = resolve_model_selector(selector, models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            DEFAULT_ENGINE = "claude"
+            CLAUDE_MODEL = selected_model or CLAUDE_MODEL
+            await ch.send(
+                f"✅ Default engine set to **claude** — model `{CLAUDE_MODEL}`"
+            )
+            return
+        models = get_codex_models()
+        selected_model, err = resolve_model_selector(selector, models)
+        if err:
+            await ch.send(f"❌ {err}")
+            return
+        DEFAULT_ENGINE = "codex"
+        CODEX_MODEL = selected_model or CODEX_MODEL
+        await ch.send(
+            f"✅ Default engine set to **codex** — model `{CODEX_MODEL}`"
+        )
+        return
+    if lower.startswith("engine "):
+        await ch.send(
+            "Usage: `engine`, `engine claude model <n|name>`, or `engine codex model <n|name>`"
+        )
+        return
+
     if lower == "engine":
         claude_models = await get_claude_models()
         codex_models = get_codex_models()
@@ -2347,11 +2416,14 @@ async def on_message(message: discord.Message):
     if lower in ("claude models", "cc models"):
         models = await get_claude_models()
         listing = "\n".join(
-            f"{'▶ ' if mid == CLAUDE_MODEL else '  '}`{mid}`"
+            f"{idx}. {'▶ ' if mid == CLAUDE_MODEL else ''}`{mid}`"
             + (f" ({display_name})" if display_name != mid else "")
-            for mid, display_name in models
+            for idx, (mid, display_name) in enumerate(models, start=1)
         )
-        await ch.send(f"**Claude models** (current: `{CLAUDE_MODEL}`):\n{listing}\n\nSwitch with `claude model <name>`")
+        await ch.send(
+            f"**Claude models** (current: `{CLAUDE_MODEL}`):\n{listing}\n\n"
+            "Switch with `claude model <n|name>` or `engine claude model <n|name>`"
+        )
         return
     if lower in ("codex models", "cx models"):
         models = get_codex_models()
@@ -2360,34 +2432,47 @@ async def on_message(message: discord.Message):
                 return ""
             return f" ({ctx // 1000}K ctx)"
         listing = "\n".join(
-            f"{'▶ ' if slug == CODEX_MODEL else '  '}`{slug}`{_ctx_label(ctx)}"
-            for slug, ctx in models
+            f"{idx}. {'▶ ' if slug == CODEX_MODEL else ''}`{slug}`{_ctx_label(ctx)}"
+            for idx, (slug, ctx) in enumerate(models, start=1)
         )
-        await ch.send(f"**Codex models** (current: `{CODEX_MODEL}`):\n{listing}\n\nSwitch with `codex model <name>`")
+        await ch.send(
+            f"**Codex models** (current: `{CODEX_MODEL}`):\n{listing}\n\n"
+            "Switch with `codex model <n|name>` or `engine codex model <n|name>`"
+        )
         return
 
     # ── Model change ─────────────────────────────────────────────────────
-    # Accepts: "claude model <name>", "cc model <name>", "codex model <name>", "cx model <name>"
+    # Accepts: "claude model <n|name>", "cc model <n|name>", "codex model <n|name>", "cx model <n|name>"
     _model_prefixes = {
         "claude model ": "claude", "cc model ": "claude",
         "codex model ": "codex",   "cx model ": "codex",
     }
     for _pfx, _engine in _model_prefixes.items():
         if lower.startswith(_pfx):
-            new_model = content[len(_pfx):].strip()
-            if not new_model:
-                await ch.send(f"Usage: `{_pfx.strip()} <name>`\nCurrent — Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`")
+            selector = content[len(_pfx):].strip()
+            if not selector:
+                await ch.send(f"Usage: `{_pfx.strip()} <n|name>`\nCurrent — Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`")
                 return
             if _engine == "claude":
-                CLAUDE_MODEL = new_model
+                models = await get_claude_models()
+                selected_model, err = resolve_model_selector(selector, models)
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                CLAUDE_MODEL = selected_model or CLAUDE_MODEL
                 await ch.send(f"✅ Claude model set to `{CLAUDE_MODEL}`")
             else:
-                CODEX_MODEL = new_model
+                models = get_codex_models()
+                selected_model, err = resolve_model_selector(selector, models)
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                CODEX_MODEL = selected_model or CODEX_MODEL
                 await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
             return
 
     # ── Default model change ────────────────────────────────────────────
-    # Accepts: "model <name>", "default model <name>"
+    # Accepts: "model <n|name>", "default model <n|name>"
     if lower == "model" or lower.startswith("model ") or lower == "default model" or lower.startswith("default model "):
         if lower.startswith("default model"):
             prefix = "default model"
@@ -2404,25 +2489,37 @@ async def on_message(message: discord.Message):
                 current = None
             if current:
                 await ch.send(
-                    f"Usage: `{prefix} <name>`\n"
+                    f"Usage: `{prefix} <n|name>`\n"
                     f"Default engine: `{DEFAULT_ENGINE}` · Current model: `{current}`\n"
-                    f"Use `claude model` / `codex model` to set explicitly."
+                    f"Use `claude model <n|name>` / `codex model <n|name>` to set explicitly."
                 )
             else:
                 await ch.send(
-                    f"Usage: `{prefix} <name>`\n"
-                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model` or `codex model`."
+                    f"Usage: `{prefix} <n|name>`\n"
+                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model <n|name>` or `codex model <n|name>`."
                 )
             return
         if default_engine == "claude":
-            CLAUDE_MODEL = new_model
+            models = await get_claude_models()
+            selected_model, err = resolve_model_selector(new_model, models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            CLAUDE_MODEL = selected_model or CLAUDE_MODEL
             await ch.send(f"✅ Default engine is **claude** — model set to `{CLAUDE_MODEL}`")
             return
         if default_engine == "codex":
-            CODEX_MODEL = new_model
+            models = get_codex_models()
+            selected_model, err = resolve_model_selector(new_model, models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            CODEX_MODEL = selected_model or CODEX_MODEL
             await ch.send(f"✅ Default engine is **codex** — model set to `{CODEX_MODEL}`")
             return
-        await ch.send(f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model` or `codex model`.")
+        await ch.send(
+            f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model <n|name>` or `codex model <n|name>`."
+        )
         return
 
     # ── Recover orphaned branches ────────────────────────────────────────
