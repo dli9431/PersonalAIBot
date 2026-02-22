@@ -574,10 +574,113 @@ async def download_attachments(message: discord.Message) -> list[str]:
     return paths
 
 
+def _branch_exists(branch: str | None, path: str | None = None) -> bool:
+    if not branch:
+        return False
+    return run_git(["git", "rev-parse", "--verify", branch], path).returncode == 0
+
+
+def _remote_branch_exists(branch: str | None, path: str | None = None) -> bool:
+    if not branch:
+        return False
+    return run_git(
+        ["git", "show-ref", "--verify", f"refs/remotes/origin/{branch}"], path
+    ).returncode == 0
+
+
+def _origin_head_branch(path: str | None = None) -> str | None:
+    result = run_git(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], path
+    )
+    if result.returncode != 0:
+        return None
+    ref = result.stdout.strip()
+    if ref.startswith("origin/"):
+        return ref.split("/", 1)[1] or None
+    return None
+
+
+def _is_feature_branch(name: str | None) -> bool:
+    if not name or not BRANCH_PREFIX:
+        return False
+    return name.startswith(f"{BRANCH_PREFIX}/")
+
+
+def _candidate_base_branches(path: str | None = None) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str | None) -> None:
+        if not name or name in seen:
+            return
+        seen.add(name)
+        candidates.append(name)
+
+    add(DEV_BRANCH)
+    add(MAIN_BRANCH)
+    add(_origin_head_branch(path))
+    add("master")
+    add("trunk")
+    add("develop")
+    cur = current_branch(path)
+    if cur and cur != "HEAD":
+        add(cur)
+    for b in get_branch_list(path):
+        add(b)
+    return candidates
+
+
+def _resolve_base_ref(path: str | None = None) -> str:
+    """Return a base ref for diffs/compare (local if possible, else origin/...)."""
+    candidates = _candidate_base_branches(path)
+    for name in candidates:
+        if _branch_exists(name, path) and not _is_feature_branch(name):
+            return name
+    for name in candidates:
+        if _remote_branch_exists(name, path) and not _is_feature_branch(name):
+            return f"origin/{name}"
+    for name in candidates:
+        if _branch_exists(name, path):
+            return name
+    for name in candidates:
+        if _remote_branch_exists(name, path):
+            return f"origin/{name}"
+    return "HEAD"
+
+
+def _ensure_local_branch(branch: str, path: str | None = None) -> bool:
+    if _branch_exists(branch, path):
+        return True
+    if _remote_branch_exists(branch, path):
+        result = run_git(["git", "branch", "--track", branch, f"origin/{branch}"], path)
+        if result.returncode == 0:
+            return True
+        if "already exists" in (result.stderr or "").lower():
+            return True
+    return False
+
+
+def _resolve_checkout_branch(path: str | None = None, avoid: str | None = None) -> str | None:
+    """Return a local branch name suitable for checkout, creating tracking if needed."""
+    candidates = _candidate_base_branches(path)
+    for name in candidates:
+        if avoid and name == avoid:
+            continue
+        if _is_feature_branch(name):
+            continue
+        if _ensure_local_branch(name, path):
+            return name
+    for name in candidates:
+        if avoid and name == avoid:
+            continue
+        if _ensure_local_branch(name, path):
+            return name
+    return None
+
+
 def _base_branch(path: str | None = None) -> str:
-    """Return the base branch to diff against (dev if it exists, else main)."""
-    check = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], path)
-    return DEV_BRANCH if check.returncode == 0 else MAIN_BRANCH
+    """Return the base ref to diff against (dev/main if present, else default)."""
+    return _resolve_base_ref(path)
 
 
 def get_diff(path: str | None = None) -> str:
@@ -1068,13 +1171,14 @@ async def run_engine(
 
 def create_branch(task: str, engine: str, path: str | None = None) -> str:
     branch = f"{BRANCH_PREFIX}/{engine}/{slugify(task)}-{int(time.time()) % 100000}"
-    # Branch from dev if it exists, otherwise main — keeps new branches
-    # up to date with previously merged work and avoids conflicts.
-    base = DEV_BRANCH
-    check = run_git(["git", "rev-parse", "--verify", base], path)
-    if check.returncode != 0:
-        base = MAIN_BRANCH
-    run_git(["git", "checkout", base], path)
+    # Branch from dev/main if available; otherwise use the default branch.
+    base = _resolve_checkout_branch(path)
+    if not base:
+        raise RuntimeError("No base branch found (missing dev/main and no local branches).")
+    checkout = run_git(["git", "checkout", base], path)
+    if checkout.returncode != 0:
+        err = (checkout.stderr or checkout.stdout or "").strip() or "checkout failed"
+        raise RuntimeError(f"Base checkout failed for `{base}`: {err}")
     run_git(["git", "pull", "--ff-only"], path)
     run_git(["git", "checkout", "-b", branch], path)
     return branch
@@ -1100,13 +1204,18 @@ async def commit_and_push(branch: str, description: str, path: str | None = None
     return f"❌ Push failed:\n```\n{push.stderr[-500:]}\n```"
 
 
-async def discard_changes(branch: str, path: str | None = None) -> None:
+async def discard_changes(branch: str, path: str | None = None) -> str | None:
     run_git(["git", "checkout", "."], path)
     run_git(["git", "clean", "-fd"], path)
-    run_git(["git", "checkout", DEV_BRANCH], path)
+    target = _resolve_checkout_branch(path, avoid=branch)
+    if target:
+        run_git(["git", "checkout", target], path)
+    current = current_branch(path)
     if is_protected_branch(branch):
-        return
-    run_git(["git", "branch", "-D", branch], path)
+        return current or target
+    if current and current != branch:
+        run_git(["git", "branch", "-D", branch], path)
+    return current or target
 
 
 # ── Merge / PR ────────────────────────────────────────────────────────────────
@@ -1470,7 +1579,10 @@ async def on_message(message: discord.Message):
                         f"⚠️ No `{DEV_BRANCH}` branch found. Which branch should `{session['branch']}` merge into?\n{listing}\nReply with the branch name, or `skip` to skip merging."
                     )
             else:
-                run_git(["git", "checkout", DEV_BRANCH], cwd)
+                fallback = _resolve_checkout_branch(cwd, avoid=session["branch"])
+                if fallback:
+                    run_git(["git", "checkout", fallback], cwd)
+                    record_state(ch.id, cwd, fallback)
                 del active_sessions[ch.id]
             return
         # If no session but maybe old-style pending
@@ -1513,9 +1625,14 @@ async def on_message(message: discord.Message):
     # ── Session: discard ──────────────────────────────────────────────────
     if lower in ("no", "reject", "discard", "nah"):
         if session and session.get("phase") == "review":
-            await discard_changes(session["branch"], cwd)
+            base = await discard_changes(session["branch"], cwd)
             del active_sessions[ch.id]
-            await ch.send(f"🗑️ Discarded, back on `{DEV_BRANCH}`.")
+            if base and base != session["branch"]:
+                await ch.send(f"🗑️ Discarded, back on `{base}`.")
+            elif base:
+                await ch.send(f"🗑️ Discarded. Still on `{base}` (no base branch found).")
+            else:
+                await ch.send("🗑️ Discarded changes. No base branch found to switch to.")
             return
         await ch.send("No session awaiting approval. Use `abort` to end an active session.")
         return
@@ -1523,9 +1640,14 @@ async def on_message(message: discord.Message):
     # ── Session: abort (discard immediately) ──────────────────────────────
     if lower == "abort":
         if session:
-            await discard_changes(session["branch"], cwd)
+            base = await discard_changes(session["branch"], cwd)
             del active_sessions[ch.id]
-            await ch.send(f"🗑️ Session aborted, back on `{DEV_BRANCH}`.")
+            if base and base != session["branch"]:
+                await ch.send(f"🗑️ Session aborted, back on `{base}`.")
+            elif base:
+                await ch.send(f"🗑️ Session aborted. Still on `{base}` (no base branch found).")
+            else:
+                await ch.send("🗑️ Session aborted. No base branch found to switch to.")
         else:
             await ch.send("No active session.")
         return
@@ -1672,7 +1794,13 @@ async def on_message(message: discord.Message):
 
     if lower.startswith("pull"):
         arg = lower[4:].strip()
-        branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg, arg) if arg else DEV_BRANCH
+        if arg:
+            branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg, arg)
+        else:
+            branch = _resolve_checkout_branch(cwd) or current_branch(cwd) or DEV_BRANCH
+        if not branch:
+            await ch.send("❌ No base branch found to pull.")
+            return
         await ch.send(f"⏳ Pulling `{branch}` from remote...")
         fetch = run_git(["git", "fetch", "origin", branch], cwd)
         if fetch.returncode != 0:
@@ -2164,11 +2292,18 @@ async def on_message(message: discord.Message):
 
     # If no files changed, clean up the branch and skip starting a session
     if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
-        run_git(["git", "checkout", _base_branch(cwd)], cwd)
-        run_git(["git", "branch", "-D", branch], cwd)
-        record_state(ch.id, cwd, _base_branch(cwd))
+        base = _resolve_checkout_branch(cwd, avoid=branch)
+        if base:
+            run_git(["git", "checkout", base], cwd)
+            run_git(["git", "branch", "-D", branch], cwd)
+            record_state(ch.id, cwd, base)
+        else:
+            record_state(ch.id, cwd, current_branch(cwd) or branch)
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
-        await ch.send("ℹ️ No files changed — no session started.")
+        msg = "ℹ️ No files changed — no session started."
+        if not base:
+            msg += " (Branch left checked out; no base branch found.)"
+        await ch.send(msg)
         return
 
     # Create session
