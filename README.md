@@ -236,6 +236,7 @@ pr main               → open a GitHub PR targeting main
 | `codex models` / `cx models` | List available Codex models |
 | `claude model <name>` | Switch Claude model (e.g. `opus`, `sonnet`, `haiku`) |
 | `codex model <name>` | Switch Codex model |
+| `model <name>` | Set model for the default engine |
 | `status` | Current branch and working tree |
 | `help` | Show command reference (pinned) |
 

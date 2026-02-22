@@ -42,7 +42,7 @@ MAX_DIFF_CHARS = 1800
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
-# Claude Code (mutable at runtime via Discord `model` command)
+# Claude Code (mutable at runtime via Discord `claude model` / `model` commands)
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "sonnet")
 CLAUDE_ALLOWED_TOOLS = os.getenv("CLAUDE_ALLOWED_TOOLS",
     "Read Edit Write Grep Glob LS Bash(git\\ diff) Bash(git\\ status)"
@@ -1309,7 +1309,8 @@ HELP_TEXT_2 = """**Branches:**
 **Config:**
 `claude models` · `codex models` — list available models
 `claude model <name>` — e.g. opus, sonnet, haiku
-`codex model <name>` — e.g. gpt-5.3-codex · `engine`
+`codex model <name>` — e.g. gpt-5.3-codex
+`model <name>` — set model for default engine · `engine`
 
 **Info:** `status` · `branches` · `pull [main]` · `help`
 
@@ -2125,6 +2126,45 @@ async def on_message(message: discord.Message):
                 CODEX_MODEL = new_model
                 await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
             return
+
+    # ── Default model change ────────────────────────────────────────────
+    # Accepts: "model <name>", "default model <name>"
+    if lower == "model" or lower.startswith("model ") or lower == "default model" or lower.startswith("default model "):
+        if lower.startswith("default model"):
+            prefix = "default model"
+        else:
+            prefix = "model"
+        new_model = content[len(prefix):].strip()
+        default_engine = (DEFAULT_ENGINE or "").strip().lower()
+        if not new_model:
+            if default_engine == "claude":
+                current = CLAUDE_MODEL
+            elif default_engine == "codex":
+                current = CODEX_MODEL
+            else:
+                current = None
+            if current:
+                await ch.send(
+                    f"Usage: `{prefix} <name>`\n"
+                    f"Default engine: `{DEFAULT_ENGINE}` · Current model: `{current}`\n"
+                    f"Use `claude model` / `codex model` to set explicitly."
+                )
+            else:
+                await ch.send(
+                    f"Usage: `{prefix} <name>`\n"
+                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model` or `codex model`."
+                )
+            return
+        if default_engine == "claude":
+            CLAUDE_MODEL = new_model
+            await ch.send(f"✅ Default engine is **claude** — model set to `{CLAUDE_MODEL}`")
+            return
+        if default_engine == "codex":
+            CODEX_MODEL = new_model
+            await ch.send(f"✅ Default engine is **codex** — model set to `{CODEX_MODEL}`")
+            return
+        await ch.send(f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model` or `codex model`.")
+        return
 
     # ── Recover orphaned branches ────────────────────────────────────────
     if lower == "recover":
