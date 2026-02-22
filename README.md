@@ -84,6 +84,7 @@ PROTECTED_BRANCHES=main,dev
 # Engine defaults
 DEFAULT_ENGINE=claude    # or codex
 ENGINE_TIMEOUT=300
+CONTEXT_MAX_CHARS=4000   # max chars saved for timeout resume context
 
 # Claude Code settings
 CLAUDE_MODEL=sonnet
@@ -127,6 +128,7 @@ The bot creates a feature branch, runs the engine, and streams its output.
 ### Iterate
 
 Send follow-up messages freely — the engine keeps session context via `--resume`.
+If a run times out, the bot saves a short context snapshot and injects it on resume. Clear it with `context clear` if needed.
 
 ```
 also add client-side validation
