@@ -1480,7 +1480,7 @@ HELP_TEXT_2 = """**Branches:**
 `claude models` · `codex models` — list available models (numbered)
 `claude model <n|name>` — e.g. `1` / `opus` / `sonnet`
 `codex model <n|name>` — e.g. `1` / `gpt-5.3-codex`
-`engine claude model <n|name>` · `engine codex model <n|name>`
+`engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>`
 `model <n|name>` — set model for default engine · `engine`
 
 **Info:** `status` · `branches` · `pull [main]` · `help`
@@ -2421,9 +2421,25 @@ async def on_message(message: discord.Message):
             f"✅ Default engine set to **codex** — model `{CODEX_MODEL}`"
         )
         return
+    engine_only_match = re.match(
+        r"^engine\s+(claude|cc|codex|cx|openai)$",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if engine_only_match:
+        engine_token = engine_only_match.group(1).lower()
+        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        DEFAULT_ENGINE = target_engine
+        _save_runtime_config()
+        model = CLAUDE_MODEL if target_engine == "claude" else CODEX_MODEL
+        await ch.send(
+            f"✅ Default engine set to **{target_engine}** — current model `{model}`"
+        )
+        return
     if lower.startswith("engine "):
         await ch.send(
-            "Usage: `engine`, `engine claude model <n|name>`, or `engine codex model <n|name>`"
+            "Usage: `engine`, `engine claude`, `engine codex`, "
+            "`engine claude model <n|name>`, or `engine codex model <n|name>`"
         )
         return
 

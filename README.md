@@ -245,6 +245,7 @@ pr main               → open a GitHub PR targeting main
 | Command | Description |
 |---------|-------------|
 | `engine` | Show current engine config and all available models |
+| `engine claude` / `engine codex` | Set default engine only (keeps current model for that engine) |
 | `claude models` / `cc models` | List available Claude models (numbered) |
 | `codex models` / `cx models` | List available Codex models (numbered) |
 | `claude model <n\|name>` | Switch Claude model by number or name (e.g. `1`, `opus`, `sonnet`) |
