@@ -1794,7 +1794,13 @@ async def on_message(message: discord.Message):
 
     if lower.startswith("pull"):
         arg = lower[4:].strip()
-        branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg, arg) if arg else DEV_BRANCH
+        if arg:
+            branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg, arg)
+        else:
+            branch = _resolve_checkout_branch(cwd) or current_branch(cwd) or DEV_BRANCH
+        if not branch:
+            await ch.send("❌ No base branch found to pull.")
+            return
         await ch.send(f"⏳ Pulling `{branch}` from remote...")
         fetch = run_git(["git", "fetch", "origin", branch], cwd)
         if fetch.returncode != 0:
