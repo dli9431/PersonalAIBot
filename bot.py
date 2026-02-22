@@ -401,18 +401,39 @@ def build_resume_prompt(
         if ctx.get("branch") and current and ctx.get("branch") != current:
             return task
 
+    saved_diff = (ctx.get("diff_stat") or "").strip()
+    current_diff = ""
+    status_lines: list[str] = []
+    status_known = False
+    if cwd and pathlib.Path(cwd).exists():
+        current_diff = get_diff_stat(cwd)
+        status_lines = get_status_porcelain(cwd)
+        status_known = True
+
     lines = [
         "You are resuming after a timeout. The engine may have lost context.",
         "Use the saved context below to continue accurately.",
         f"Original task: {ctx.get('task', '').strip()}",
         f"Repo: {ctx.get('cwd', '').strip()}",
         f"Branch: {ctx.get('branch', '').strip()}",
-        f"Diff: {ctx.get('diff_stat', '').strip()}",
+        f"Saved diff at timeout: {saved_diff}" if saved_diff else "",
+        f"Current diff now: {current_diff}" if current_diff else "",
     ]
+    if status_known:
+        if status_lines:
+            max_lines = 12
+            lines.append("Current repo status (git status --porcelain):")
+            lines.extend(status_lines[:max_lines])
+            if len(status_lines) > max_lines:
+                lines.append(f"... ({len(status_lines) - max_lines} more)")
+        else:
+            lines.append("Current repo status: clean (no changes detected)")
     output_tail = ctx.get("output_tail") or ""
     if output_tail.strip():
-        lines.append("Last output (tail):")
+        lines.append("Last output (tail; may not reflect applied changes):")
         lines.append(output_tail.strip())
+    lines.append("Important: timeout output can claim changes that did not persist. "
+                 "Treat the repo status above as the source of truth.")
     lines.append("Current request:")
     lines.append(task.strip())
     return "\n".join(line for line in lines if line)
@@ -571,6 +592,14 @@ def get_diff(path: str | None = None) -> str:
     if untracked:
         combined += f"\n\nNew files:\n{untracked}"
     return combined.strip() or "(no changes detected)"
+
+
+def get_status_porcelain(path: str | None = None) -> list[str]:
+    """Return git status --porcelain lines (empty if clean)."""
+    raw = run_git(["git", "status", "--porcelain"], path).stdout.strip()
+    if not raw:
+        return []
+    return [line for line in raw.split("\n") if line.strip()]
 
 
 def get_diff_stat(path: str | None = None) -> str:
@@ -1012,6 +1041,7 @@ async def run_engine(
                 output = await runner(resume_task, ch, resume=True, cwd=cwd)
                 if stop_event and stop_event.is_set():
                     return "(stopped)"
+                clear_resume_context(ch.id)
                 return output
             except subprocess.TimeoutExpired as e2:
                 save_resume_context(ch.id, cwd, engine, raw_task, getattr(e2, "output", None), reason="timeout")
