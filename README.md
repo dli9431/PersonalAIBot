@@ -255,6 +255,8 @@ pr main               → open a GitHub PR targeting main
 | `status` | Current branch and working tree |
 | `help` | Show command reference (pinned) |
 
+Engine/model selections are persisted in `.bot_state.json` and restored on restart.
+
 ### Login & System
 
 | Command | Description |

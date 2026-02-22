@@ -266,6 +266,33 @@ def _set_protected_branches(branches: list[str], save: bool = True) -> None:
         _save_state(state)
 
 
+def _save_runtime_config() -> None:
+    data = _load_state()
+    data["runtime_config"] = {
+        "default_engine": "codex" if (DEFAULT_ENGINE or "").strip().lower() == "codex" else "claude",
+        "claude_model": CLAUDE_MODEL,
+        "codex_model": CODEX_MODEL,
+    }
+    _save_state(data)
+
+
+def _load_runtime_config() -> None:
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL
+    data = _load_state()
+    config = data.get("runtime_config")
+    if not isinstance(config, dict):
+        return
+    default_engine = config.get("default_engine")
+    if isinstance(default_engine, str) and default_engine.strip():
+        DEFAULT_ENGINE = "codex" if default_engine.strip().lower() == "codex" else "claude"
+    claude_model = config.get("claude_model")
+    if isinstance(claude_model, str) and claude_model.strip():
+        CLAUDE_MODEL = claude_model.strip()
+    codex_model = config.get("codex_model")
+    if isinstance(codex_model, str) and codex_model.strip():
+        CODEX_MODEL = codex_model.strip()
+
+
 def _init_protected_branches() -> None:
     state = _load_state()
     branches = state.get("protected_branches") or _default_protected_branches()
@@ -277,6 +304,7 @@ def is_protected_branch(branch: str) -> bool:
 
 
 _init_protected_branches()
+_load_runtime_config()
 
 
 def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
@@ -2376,6 +2404,7 @@ async def on_message(message: discord.Message):
                 return
             DEFAULT_ENGINE = "claude"
             CLAUDE_MODEL = selected_model or CLAUDE_MODEL
+            _save_runtime_config()
             await ch.send(
                 f"✅ Default engine set to **claude** — model `{CLAUDE_MODEL}`"
             )
@@ -2387,6 +2416,7 @@ async def on_message(message: discord.Message):
             return
         DEFAULT_ENGINE = "codex"
         CODEX_MODEL = selected_model or CODEX_MODEL
+        _save_runtime_config()
         await ch.send(
             f"✅ Default engine set to **codex** — model `{CODEX_MODEL}`"
         )
@@ -2460,6 +2490,7 @@ async def on_message(message: discord.Message):
                     await ch.send(f"❌ {err}")
                     return
                 CLAUDE_MODEL = selected_model or CLAUDE_MODEL
+                _save_runtime_config()
                 await ch.send(f"✅ Claude model set to `{CLAUDE_MODEL}`")
             else:
                 models = get_codex_models()
@@ -2468,6 +2499,7 @@ async def on_message(message: discord.Message):
                     await ch.send(f"❌ {err}")
                     return
                 CODEX_MODEL = selected_model or CODEX_MODEL
+                _save_runtime_config()
                 await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
             return
 
@@ -2506,6 +2538,7 @@ async def on_message(message: discord.Message):
                 await ch.send(f"❌ {err}")
                 return
             CLAUDE_MODEL = selected_model or CLAUDE_MODEL
+            _save_runtime_config()
             await ch.send(f"✅ Default engine is **claude** — model set to `{CLAUDE_MODEL}`")
             return
         if default_engine == "codex":
@@ -2515,6 +2548,7 @@ async def on_message(message: discord.Message):
                 await ch.send(f"❌ {err}")
                 return
             CODEX_MODEL = selected_model or CODEX_MODEL
+            _save_runtime_config()
             await ch.send(f"✅ Default engine is **codex** — model set to `{CODEX_MODEL}`")
             return
         await ch.send(
