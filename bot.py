@@ -372,13 +372,15 @@ def load_resume_context(ch_id: int) -> dict | None:
     return None
 
 
-def clear_resume_context(ch_id: int) -> None:
+def clear_resume_context(ch_id: int) -> bool:
     data = _load_state()
     contexts = data.get("resume_contexts") or {}
     if str(ch_id) in contexts:
         del contexts[str(ch_id)]
         data["resume_contexts"] = contexts
         _save_state(data)
+        return True
+    return False
 
 
 def build_resume_prompt(
@@ -1127,6 +1129,7 @@ Type follow-ups freely — engine keeps context
 `branch switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — peek at changes · `undo` — revert last run
+`context clear` — forget saved timeout context
 
 **Ending a session:**
 `done` — full diff + push prompt
@@ -1596,6 +1599,14 @@ async def on_message(message: discord.Message):
                          f"{session['turns']} turn(s)")
         await ch.send(f"📍 `{cwd}`\n🌿 `{br}`{sess_info}\n"
                        f"```\n{st or '(clean)'}\n```")
+        return
+
+    if lower in ("context clear", "resume clear", "clear context"):
+        cleared = clear_resume_context(ch.id)
+        if cleared:
+            await ch.send("🧹 Cleared saved resume context for this channel.")
+        else:
+            await ch.send("No saved resume context to clear.")
         return
 
     if lower == "branches":
