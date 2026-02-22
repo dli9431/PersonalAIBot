@@ -56,6 +56,7 @@ CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.3-codex")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
+PLAN_CONTEXT_MAX_CHARS = int(os.getenv("PLAN_CONTEXT_MAX_CHARS", "12000"))
 
 # Additional git repos the bot can commit/push to.
 # Format: comma-separated paths (absolute, or relative to REPO_PATH).
@@ -383,6 +384,108 @@ def clear_resume_context(ch_id: int) -> bool:
     return False
 
 
+def _safe_current_branch(path: str | None) -> str:
+    if not path or not pathlib.Path(path).exists():
+        return "?"
+    try:
+        return current_branch(path) or "?"
+    except Exception:
+        return "?"
+
+
+def save_plan_context(
+    ch_id: int,
+    cwd: str | None,
+    engine: str,
+    request: str,
+    plan_output: object | None,
+) -> None:
+    data = _load_state()
+    contexts = data.setdefault("plan_contexts", {})
+    entry = {
+        "ts": int(time.time()),
+        "engine": engine,
+        "model": get_model_for_engine(engine),
+        "cwd": cwd or "",
+        "branch": _safe_current_branch(cwd),
+        "request": request.strip(),
+        "plan": _tail_text(_coerce_text(plan_output), max_chars=PLAN_CONTEXT_MAX_CHARS),
+    }
+    contexts[str(ch_id)] = entry
+    _save_state(data)
+
+
+def load_plan_context(ch_id: int) -> dict | None:
+    data = _load_state()
+    contexts = data.get("plan_contexts") or {}
+    entry = contexts.get(str(ch_id))
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def clear_plan_context(ch_id: int) -> bool:
+    data = _load_state()
+    contexts = data.get("plan_contexts") or {}
+    if str(ch_id) in contexts:
+        del contexts[str(ch_id)]
+        data["plan_contexts"] = contexts
+        _save_state(data)
+        return True
+    return False
+
+
+def build_plan_prompt(
+    request: str,
+    ch_id: int,
+    cwd: str | None,
+    engine: str,
+) -> str:
+    previous = load_plan_context(ch_id)
+    lines = [
+        "Planning mode only.",
+        "Do not edit files, write files, or make commits.",
+        "Inspect the repository and produce an execution plan only.",
+        "Return concise markdown with sections: Goal, Steps, Files, Validation, Risks.",
+    ]
+    if previous and (not previous.get("engine") or previous.get("engine") == engine):
+        prev_cwd = (previous.get("cwd") or "").strip()
+        if not cwd or not prev_cwd or prev_cwd == cwd:
+            prev_request = (previous.get("request") or "").strip()
+            prev_plan = (previous.get("plan") or "").strip()
+            lines.append("Existing saved plan context:")
+            if prev_request:
+                lines.append(f"Previous request: {prev_request}")
+            if prev_plan:
+                lines.append("Previous plan:")
+                lines.append(prev_plan)
+            lines.append("Update and replace that plan using the new request below.")
+    lines.append("Planning request:")
+    lines.append(request.strip())
+    return "\n".join(line for line in lines if line)
+
+
+def build_do_prompt(plan_ctx: dict, request: str) -> str:
+    saved_request = (plan_ctx.get("request") or "").strip()
+    saved_plan = (plan_ctx.get("plan") or "").strip()
+    do_request = request.strip() or "Execute the saved plan now."
+    lines = [
+        "Execute the saved plan below in this repository.",
+        "Do the implementation now; do not respond with only another plan.",
+        "Run relevant checks for your changes and include a concise summary.",
+    ]
+    if saved_request:
+        lines.append("Saved planning request:")
+        lines.append(saved_request)
+    if saved_plan:
+        lines.append("Saved plan context:")
+        lines.append(saved_plan)
+    lines.append("Execution request:")
+    lines.append(do_request)
+    lines.append("If the code changed since planning, adapt while preserving intent.")
+    return "\n".join(line for line in lines if line)
+
+
 def build_resume_prompt(
     task: str,
     ch_id: int,
@@ -554,6 +657,18 @@ def parse_engine_and_task(content: str) -> tuple[str, str]:
         if lower.startswith(prefix):
             return "codex", content[len(prefix):].strip()
     return DEFAULT_ENGINE, content
+
+
+def get_default_engine() -> str:
+    return "codex" if (DEFAULT_ENGINE or "").strip().lower() == "codex" else "claude"
+
+
+def get_model_for_engine(engine: str) -> str:
+    return CODEX_MODEL if engine == "codex" else CLAUDE_MODEL
+
+
+def get_engine_label(engine: str) -> str:
+    return "Codex CLI" if engine == "codex" else "Claude Code"
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -1273,6 +1388,8 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 
 HELP_TEXT_1 = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:`
+`plan: <task>` — planning mode with default engine/model (saves plan context)
+`do: [extra instructions]` — execute saved plan context, then clear it
 
 **During a session:**
 Type follow-ups freely — engine keeps context
@@ -1780,6 +1897,148 @@ async def on_message(message: discord.Message):
         else:
             await ch.send("No saved resume context to clear.")
         return
+
+    if lower.startswith("plan:"):
+        plan_request = content.split(":", 1)[1].strip()
+        if not plan_request:
+            await ch.send("Usage: `plan: <task>`")
+            return
+
+        engine = get_default_engine()
+        label = get_engine_label(engine)
+        model = get_model_for_engine(engine)
+        planning_task = build_plan_prompt(plan_request, ch.id, cwd, engine)
+
+        await ch.send(
+            f"🧭 Planning with **{label}** (`{model}`) on `{cwd}`...\n"
+            f"> {truncate(plan_request, 200)}"
+        )
+        stop_event = asyncio.Event()
+        stop_events[ch.id] = stop_event
+        try:
+            output = await run_engine(
+                engine,
+                planning_task,
+                ch,
+                resume=False,
+                cwd=cwd,
+                stop_event=stop_event,
+            )
+        except Exception as e:
+            await ch.send(f"❌ {label} planning error: `{e}`")
+            return
+        finally:
+            stop_events.pop(ch.id, None)
+
+        if stop_event.is_set():
+            await ch.send("🛑 Planning stopped.")
+            return
+
+        save_plan_context(ch.id, cwd, engine, plan_request, output)
+        await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
+        await ch.send("💾 Saved plan context. Run `do:` to execute it.")
+        return
+
+    if lower.startswith("do:"):
+        plan_ctx = load_plan_context(ch.id)
+        if not plan_ctx:
+            await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
+            return
+
+        do_request = content.split(":", 1)[1].strip()
+        engine = get_default_engine()
+        label = get_engine_label(engine)
+        model = get_model_for_engine(engine)
+        plan_cwd = (plan_ctx.get("cwd") or "").strip() or cwd
+        exec_description = (
+            do_request
+            or (plan_ctx.get("request") or "").strip()
+            or "execute saved plan"
+        )
+        execution_task = build_do_prompt(plan_ctx, do_request)
+
+        try:
+            if not plan_cwd or not pathlib.Path(plan_cwd).exists():
+                await ch.send(f"❌ Saved plan repo not found: `{plan_cwd or '(empty)'}`")
+                return
+
+            if session:
+                await discard_changes(session["branch"], cwd)
+                del active_sessions[ch.id]
+                await ch.send("⚠️ Previous session discarded before executing saved plan.")
+                session = None
+
+            cwd = plan_cwd
+            channel_cwd[ch.id] = cwd
+            await ch.send(
+                f"🚀 Executing saved plan with **{label}** (`{model}`) on `{cwd}`...\n"
+                f"> {truncate(exec_description, 200)}"
+            )
+
+            try:
+                branch = create_branch(exec_description, engine, cwd)
+            except Exception as e:
+                await ch.send(f"❌ Branch creation failed: `{e}`")
+                return
+            record_state(ch.id, cwd, branch)
+
+            stop_event = asyncio.Event()
+            stop_events[ch.id] = stop_event
+            try:
+                output = await run_engine(
+                    engine,
+                    execution_task,
+                    ch,
+                    resume=False,
+                    cwd=cwd,
+                    stop_event=stop_event,
+                )
+            except Exception as e:
+                await ch.send(f"❌ {label} error: `{e}`")
+                await discard_changes(branch, cwd)
+                return
+            finally:
+                stop_events.pop(ch.id, None)
+
+            if stop_event.is_set():
+                await discard_changes(branch, cwd)
+                return
+
+            # If no files changed, clean up the branch and skip starting a session.
+            if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
+                base = _resolve_checkout_branch(cwd, avoid=branch)
+                if base:
+                    run_git(["git", "checkout", base], cwd)
+                    run_git(["git", "branch", "-D", branch], cwd)
+                    record_state(ch.id, cwd, base)
+                else:
+                    record_state(ch.id, cwd, current_branch(cwd) or branch)
+                await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+                msg = "ℹ️ No files changed — no session started."
+                if not base:
+                    msg += " (Branch left checked out; no base branch found.)"
+                await ch.send(msg)
+                return
+
+            active_sessions[ch.id] = {
+                "branch": branch,
+                "engine": engine,
+                "description": exec_description,
+                "turns": 1,
+                "phase": "working",
+                "cwd": cwd,
+            }
+
+            auto_commit(exec_description, 1, cwd)
+            await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+            stat = get_diff_stat(cwd)
+            await ch.send(f"📊 {stat}\n"
+                          f"Send a follow-up to keep iterating, `diff` to inspect, "
+                          f"or `done` when finished.")
+            return
+        finally:
+            if clear_plan_context(ch.id):
+                await ch.send("🧹 Cleared saved plan context.")
 
     if lower == "branches":
         branches = get_branch_list(cwd)[:15]
