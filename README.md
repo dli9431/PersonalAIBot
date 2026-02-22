@@ -176,7 +176,7 @@ pr main               → open a GitHub PR targeting main
 |---------|-------------|
 | `<task>` | Run with the default engine |
 | `claude: <task>` / `cc: <task>` | Run with Claude Code |
-| `codex: <task>` / `cx: <task>` | Run with Codex CLI |
+| `codex: <task>` / `cx: <task>` / `openai: <task>` | Run with Codex CLI |
 | `plan: <task>` | Planning mode with default engine/model; saves plan context |
 | `do: [extra instructions]` | Execute saved plan context with default engine/model, then clear it |
 
@@ -187,8 +187,9 @@ pr main               → open a GitHub PR targeting main
 | `<follow-up>` | Continue with same engine and context |
 | `diff` | Peek at current changes |
 | `undo` | Revert the last engine run |
-| `branch switch <branch\|N>` | Switch branches (auto-commit if in session) |
+| `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
+| `context clear` | Forget saved timeout/resume context |
 | `abort` | Discard all changes immediately |
 
 ### Ending a session
@@ -215,8 +216,8 @@ pr main               → open a GitHub PR targeting main
 | Command | Description |
 |---------|-------------|
 | `branches` | List recent branches (assigns `N` references) |
-| `branch switch <branch\|N>` | Switch branches (auto-commit if in session) |
-| `branch delete <name\|N> [local\|remote] [force]` | Delete a branch (checks if merged first) |
+| `switch <branch\|N>` | Switch branches (auto-commit if in session) |
+| `branch delete <name\|N> [local\|remote\|both] [force]` | Delete a branch (checks if merged first) |
 | `branch protect [list\|add\|remove\|clear\|reset]` | Manage protected branches (blocks deletion) |
 
 ### Multi-repo
