@@ -620,6 +620,18 @@ def get_diff_stat(path: str | None = None) -> str:
     return ", ".join(lines) or "no changes"
 
 
+def get_ahead_count(path: str | None = None) -> int:
+    """How many commits HEAD is ahead of the base branch."""
+    base = _base_branch(path)
+    result = run_git(["git", "rev-list", "--count", f"{base}..HEAD"], path)
+    if result.returncode != 0:
+        return 0
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
 # ── Model discovery ───────────────────────────────────────────────────────────
 
 def get_codex_models() -> list[tuple[str, int | None]]:
@@ -1417,8 +1429,15 @@ async def on_message(message: discord.Message):
         await ch.send(f"**Full diff on `{session['branch']}`:**\n"
                        f"```diff\n{truncate(diff, 1800)}\n```")
         if "(no changes detected)" in diff:
-            await ch.send("No changes to commit.")
-            return
+            base = _base_branch(cwd)
+            ahead = get_ahead_count(cwd)
+            if ahead <= 0:
+                await ch.send("No changes to commit.")
+                return
+            await ch.send(
+                f"ℹ️ Working tree clean but branch is {ahead} commit(s) ahead of `{base}`. "
+                "Continuing to review."
+            )
         session["phase"] = "review"
         dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
         merge_hint = f"merge to `{DEV_BRANCH}`" if dev_exists else "select a merge target"
