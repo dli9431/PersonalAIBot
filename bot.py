@@ -600,6 +600,12 @@ def _origin_head_branch(path: str | None = None) -> str | None:
     return None
 
 
+def _is_feature_branch(name: str | None) -> bool:
+    if not name or not BRANCH_PREFIX:
+        return False
+    return name.startswith(f"{BRANCH_PREFIX}/")
+
+
 def _candidate_base_branches(path: str | None = None) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -628,6 +634,12 @@ def _resolve_base_ref(path: str | None = None) -> str:
     """Return a base ref for diffs/compare (local if possible, else origin/...)."""
     candidates = _candidate_base_branches(path)
     for name in candidates:
+        if _branch_exists(name, path) and not _is_feature_branch(name):
+            return name
+    for name in candidates:
+        if _remote_branch_exists(name, path) and not _is_feature_branch(name):
+            return f"origin/{name}"
+    for name in candidates:
         if _branch_exists(name, path):
             return name
     for name in candidates:
@@ -650,7 +662,15 @@ def _ensure_local_branch(branch: str, path: str | None = None) -> bool:
 
 def _resolve_checkout_branch(path: str | None = None, avoid: str | None = None) -> str | None:
     """Return a local branch name suitable for checkout, creating tracking if needed."""
-    for name in _candidate_base_branches(path):
+    candidates = _candidate_base_branches(path)
+    for name in candidates:
+        if avoid and name == avoid:
+            continue
+        if _is_feature_branch(name):
+            continue
+        if _ensure_local_branch(name, path):
+            return name
+    for name in candidates:
         if avoid and name == avoid:
             continue
         if _ensure_local_branch(name, path):
