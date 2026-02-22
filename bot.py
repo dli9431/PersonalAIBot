@@ -1145,7 +1145,7 @@ HELP_TEXT_2 = """**Branches:**
 `branches` — list branches (use `N` in commands)
 `branch delete <name|N> [local|remote] [force]`
 `branch protect [list|add|remove|clear|reset]`
-`branch switch <branch|N>` — switch branch (in active session)
+`branch switch <branch|N>` — switch branch (auto-commit if in session)
 
 **Recovery:**
 `recover` — list orphaned branches · `recover <id>` — resume
@@ -1729,28 +1729,37 @@ async def on_message(message: discord.Message):
         await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
         return
 
-    # ── Switch branch mid-session ─────────────────────────────────────────
+    # ── Switch branch ─────────────────────────────────────────────────────
     if lower.startswith("branch switch ") or lower.startswith("switch "):
         prefix_len = len("branch switch ") if lower.startswith("branch switch ") else len("switch ")
         branch_ref = content[prefix_len:].strip()  # preserve case for branch name
-        if not session:
-            await ch.send("No active session. Start a task first.")
+        if not branch_ref:
+            await ch.send("Usage: `branch switch <branch|N>`")
             return
         # Resolve N references
         branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
-        # Auto-commit current work before switching
-        auto_commit(session["description"], session["turns"], cwd)
+        # Auto-commit current work before switching if we're mid-session
+        if session:
+            auto_commit(session["description"], session["turns"], cwd)
         check = run_git(["git", "rev-parse", "--verify", branch_name], cwd)
         if check.returncode != 0:
-            run_git(["git", "checkout", "-b", branch_name], cwd)
-            await ch.send(f"🌿 Created and switched to `{branch_name}`")
+            result = run_git(["git", "checkout", "-b", branch_name], cwd)
+            action = "Created and switched to"
         else:
-            run_git(["git", "checkout", branch_name], cwd)
-            await ch.send(f"🌿 Switched to `{branch_name}`")
-        session["branch"] = branch_name
-        record_state(ch.id, cwd, branch_name)
-        stat = get_diff_stat(cwd)
-        await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
+            result = run_git(["git", "checkout", branch_name], cwd)
+            action = "Switched to"
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip() or "checkout failed"
+            await ch.send(f"❌ Checkout failed:\n```\n{err}\n```")
+            return
+        await ch.send(f"🌿 {action} `{branch_name}`")
+        if session:
+            session["branch"] = branch_name
+            record_state(ch.id, cwd, branch_name)
+            stat = get_diff_stat(cwd)
+            await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
+        else:
+            record_state(ch.id, cwd, branch_name)
         return
 
     # ── Branch delete ─────────────────────────────────────────────────────
