@@ -55,6 +55,7 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.3-codex")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
+CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
 
 # Additional git repos the bot can commit/push to.
 # Format: comma-separated paths (absolute, or relative to REPO_PATH).
@@ -317,6 +318,93 @@ def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
         if res.returncode != 0:
             checkout_error = (res.stderr or res.stdout or "").strip() or "checkout failed"
     return last_id, cwd, branch, checkout_error
+
+
+def _coerce_text(value: object | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _tail_text(text: str, max_chars: int = CONTEXT_MAX_CHARS) -> str:
+    if not text:
+        return ""
+    clean = strip_ansi(text)
+    if len(clean) <= max_chars:
+        return clean
+    return clean[-max_chars:]
+
+
+def save_resume_context(
+    ch_id: int,
+    cwd: str | None,
+    engine: str,
+    task: str,
+    output: object | None,
+    reason: str = "timeout",
+) -> None:
+    if not cwd:
+        return
+    data = _load_state()
+    contexts = data.setdefault("resume_contexts", {})
+    entry = {
+        "ts": int(time.time()),
+        "engine": engine,
+        "cwd": cwd,
+        "branch": current_branch(cwd) or "?",
+        "task": task,
+        "diff_stat": get_diff_stat(cwd),
+        "output_tail": _tail_text(_coerce_text(output)),
+        "reason": reason,
+    }
+    contexts[str(ch_id)] = entry
+    _save_state(data)
+
+
+def load_resume_context(ch_id: int) -> dict | None:
+    data = _load_state()
+    contexts = data.get("resume_contexts") or {}
+    entry = contexts.get(str(ch_id))
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def build_resume_prompt(
+    task: str,
+    ch_id: int,
+    cwd: str | None,
+    engine: str,
+) -> str:
+    ctx = load_resume_context(ch_id)
+    if not ctx:
+        return task
+    if cwd and ctx.get("cwd") and ctx.get("cwd") != cwd:
+        return task
+    if ctx.get("engine") and ctx.get("engine") != engine:
+        return task
+    if cwd:
+        current = current_branch(cwd) or ""
+        if ctx.get("branch") and current and ctx.get("branch") != current:
+            return task
+
+    lines = [
+        "You are resuming after a timeout. The engine may have lost context.",
+        "Use the saved context below to continue accurately.",
+        f"Original task: {ctx.get('task', '').strip()}",
+        f"Repo: {ctx.get('cwd', '').strip()}",
+        f"Branch: {ctx.get('branch', '').strip()}",
+        f"Diff: {ctx.get('diff_stat', '').strip()}",
+    ]
+    output_tail = ctx.get("output_tail") or ""
+    if output_tail.strip():
+        lines.append("Last output (tail):")
+        lines.append(output_tail.strip())
+    lines.append("Current request:")
+    lines.append(task.strip())
+    return "\n".join(line for line in lines if line)
 
 
 def has_gh_cli() -> bool:
@@ -701,7 +789,8 @@ async def _run_with_live_output(
         await asyncio.wait_for(io_task, timeout=ENGINE_TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
-        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT)
+        partial = b"".join(stdout_chunks).decode(errors="replace")
+        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
     finally:
         done.set()
         update_task.cancel()
@@ -803,7 +892,8 @@ async def _run_claude_streaming(
         )
     except asyncio.TimeoutError:
         proc.kill()
-        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT)
+        partial = final_result or "".join(accumulated_text)
+        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
     finally:
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
@@ -886,28 +976,35 @@ async def run_engine(
     if stop_event and stop_event.is_set():
         return "(stopped)"
 
+    raw_task = task
+    if resume:
+        task = build_resume_prompt(task, ch.id, cwd, engine)
+
     try:
         output = await runner(task, ch, resume, images, cwd=cwd)
         if stop_event and stop_event.is_set():
             return "(stopped)"
         return output
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         if stop_event and stop_event.is_set():
             return "(stopped)"
+        save_resume_context(ch.id, cwd, engine, raw_task, getattr(e, "output", None), reason="timeout")
         # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
         for attempt in range(1, MAX_AUTO_CONTINUES + 1):
             if stop_event and stop_event.is_set():
                 return "(stopped)"
-            auto_commit(task, 0, cwd)  # save any partial work
-            await ch.send(f"⏳ Timed out — auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
+            auto_commit(raw_task, 0, cwd)  # save any partial work
+            await ch.send(f"⏳ Timed out — saved context and auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
             try:
-                output = await runner("continue where you left off", ch, resume=True, cwd=cwd)
+                resume_task = build_resume_prompt("continue where you left off", ch.id, cwd, engine)
+                output = await runner(resume_task, ch, resume=True, cwd=cwd)
                 if stop_event and stop_event.is_set():
                     return "(stopped)"
                 return output
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e2:
+                save_resume_context(ch.id, cwd, engine, raw_task, getattr(e2, "output", None), reason="timeout")
                 continue
-        auto_commit(task, 0, cwd)
+        auto_commit(raw_task, 0, cwd)
         await ch.send(f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
                        f"Send a follow-up to continue manually, or `done` to review what's there.")
         return "(timed out — partial work auto-committed)"
