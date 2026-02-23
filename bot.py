@@ -1439,7 +1439,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 
 # ── Discord handlers ─────────────────────────────────────────────────────────
 
-HELP_TEXT_1 = """**Starting a session:**
+HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves plan context)
 `do: [extra instructions]` — execute saved plan context, then clear it
@@ -1460,7 +1460,11 @@ Type follow-ups freely — engine keeps context
 **After pushing:**
 `merge <target>` — merge current/session/last-pushed into target
 `merge src>tgt` / `merge src into tgt` — explicit source & target
-`pr <target>` — open a pull request""".format(default=DEFAULT_ENGINE)
+`pr <target>` — open a pull request"""
+
+
+def help_text_1() -> str:
+    return HELP_TEXT_1_TEMPLATE.format(default=get_default_engine())
 
 HELP_TEXT_2 = """**Branches:**
 `branches` — list branches (use `N` in commands)
@@ -1499,6 +1503,7 @@ def _help_embed(title: str, text: str) -> discord.Embed:
 async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
     """Ensure help messages are pinned and up to date. Returns True if changed."""
     changed = False
+    current_help_1 = help_text_1()
 
     # Fetch existing pins — if forbidden, fall back to plain text
     help_by_title: dict[str, list[discord.Message]] = {
@@ -1513,7 +1518,7 @@ async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
             if title in help_by_title:
                 help_by_title[title].append(msg)
     except (AttributeError, discord.Forbidden, discord.HTTPException):
-        await channel.send(HELP_TEXT_1)
+        await channel.send(current_help_1)
         await channel.send(HELP_TEXT_2)
         return True
 
@@ -1537,7 +1542,7 @@ async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
 
     # Update or create each help message
     for pinned, title, text in [
-        (pinned_1, HELP_PIN_TITLE_1, HELP_TEXT_1),
+        (pinned_1, HELP_PIN_TITLE_1, current_help_1),
         (pinned_2, HELP_PIN_TITLE_2, HELP_TEXT_2),
     ]:
         if pinned:
@@ -2010,6 +2015,7 @@ async def on_message(message: discord.Message):
             or "execute saved plan"
         )
         execution_task = build_do_prompt(plan_ctx, do_request)
+        clear_saved_plan = False
 
         try:
             if not plan_cwd or not pathlib.Path(plan_cwd).exists():
@@ -2058,6 +2064,8 @@ async def on_message(message: discord.Message):
                 await discard_changes(branch, cwd)
                 return
 
+            clear_saved_plan = True
+
             # If no files changed, clean up the branch and skip starting a session.
             if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
                 base = _resolve_checkout_branch(cwd, avoid=branch)
@@ -2091,7 +2099,7 @@ async def on_message(message: discord.Message):
                           f"or `done` when finished.")
             return
         finally:
-            if clear_plan_context(ch.id):
+            if clear_saved_plan and clear_plan_context(ch.id):
                 await ch.send("🧹 Cleared saved plan context.")
 
     if lower == "branches":
