@@ -135,6 +135,7 @@ do:
 
 `plan:` runs in planning mode with the default engine/model and saves context to disk.
 `do:` executes the last saved plan context for this channel, then clears it.
+Use `plan show` to inspect saved plan context and `plan clear` to remove it manually.
 
 ### Iterate
 
@@ -185,11 +186,14 @@ pr main               → open a GitHub PR targeting main
 | Command | Description |
 |---------|-------------|
 | `<follow-up>` | Continue with same engine and context |
+| `stop` | Cancel the currently running engine turn |
 | `diff` | Peek at current changes |
 | `undo` | Revert the last engine run |
 | `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
 | `context clear` | Forget saved timeout/resume context |
+| `plan show` | Show saved plan context for this channel |
+| `plan clear` | Clear saved plan context without executing it |
 | `abort` | Discard all changes immediately |
 
 ### Ending a session
@@ -255,6 +259,7 @@ pr main               → open a GitHub PR targeting main
 | `engine codex model <n\|name>` | Set default engine to Codex and choose model by number or name |
 | `model <n\|name>` | Set model for the default engine by number or name |
 | `status` | Current branch and working tree |
+| `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
 
 Engine/model selections are persisted in `.bot_state.json` and restored on restart.

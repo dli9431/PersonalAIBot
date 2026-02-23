@@ -1443,6 +1443,7 @@ HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves plan context)
 `do: [extra instructions]` — execute saved plan context, then clear it
+`plan show` — show saved plan context · `plan clear` — clear saved plan context
 
 **During a session:**
 Type follow-ups freely — engine keeps context
@@ -1487,7 +1488,7 @@ HELP_TEXT_2 = """**Branches:**
 `engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>`
 `model <n|name>` — set model for default engine · `engine` — show current config
 
-**Info:** `status` · `branches` · `pull [main]` · `help`
+**Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`
 
 **Login:** `claude login` · `codex login` · `openai login` · `login both`
 **System:** `restart`"""
@@ -1727,7 +1728,10 @@ async def on_message(message: discord.Message):
         session["phase"] = "review"
         dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
         merge_hint = f"merge to `{DEV_BRANCH}`" if dev_exists else "select a merge target"
-        await ch.send(f"Reply **yes** to commit, push & {merge_hint}, or **no** to discard.")
+        await ch.send(
+            f"Reply **yes** to commit, push & {merge_hint}, "
+            f"**skip** to push without merging, or **no** to discard."
+        )
         return
 
     # ── Session: push approval ────────────────────────────────────────────
@@ -1764,6 +1768,23 @@ async def on_message(message: discord.Message):
             return
         # If no session but maybe old-style pending
         await ch.send("No session awaiting approval. Send `done` first to review changes.")
+        return
+
+    if lower == "skip" and session and session.get("phase") == "review":
+        await ch.send("⏳ Committing and pushing (skip merge)...")
+        result = await commit_and_push(session["branch"], session["description"], cwd)
+        await ch.send(result)
+        if "✅" in result:
+            last_pushed[ch.id] = session["branch"]
+            record_state(ch.id, cwd, session["branch"])
+            del active_sessions[ch.id]
+            await ch.send("⏭️ Skipped merge. Use `merge <target>` or `pr <target>` any time.")
+        else:
+            fallback = _resolve_checkout_branch(cwd, avoid=session["branch"])
+            if fallback:
+                run_git(["git", "checkout", fallback], cwd)
+                record_state(ch.id, cwd, fallback)
+            del active_sessions[ch.id]
         return
 
     # ── Session: merge target selection ───────────────────────────────────
@@ -1949,12 +1970,99 @@ async def on_message(message: discord.Message):
                        f"```\n{st or '(clean)'}\n```")
         return
 
+    if lower == "doctor":
+        ssh_ok = check_github_ssh()
+        claude_ok, claude_status = check_claude_cli()
+        codex_ok, codex_status = check_codex_cli()
+        codex_trusted = _load_codex_trusted_dirs()
+
+        await ch.send(
+            "🩺 **Diagnostics**\n"
+            f"GitHub SSH: {'✅ OK' if ssh_ok else '⚠️ FAILED'}\n"
+            f"Claude CLI: {'✅' if claude_ok else '⚠️'} {claude_status}\n"
+            f"Codex CLI: {'✅' if codex_ok else '⚠️'} {codex_status}"
+        )
+
+        project_lines = []
+        for idx, (label, path) in enumerate(GIT_PROJECTS, 1):
+            active = " · active" if path == cwd else ""
+            p = pathlib.Path(path)
+            if not p.exists():
+                project_lines.append(f"{idx}. {label}{active}: ⚠️ missing directory\n   `{path}`")
+                continue
+            if run_git(["git", "rev-parse", "--git-dir"], path).returncode != 0:
+                project_lines.append(f"{idx}. {label}{active}: ⚠️ not a git repo\n   `{path}`")
+                continue
+            branch = current_branch(path) or "?"
+            claude_tag = "trusted" if _is_claude_trusted(path) else "NOT trusted"
+            codex_tag = "trusted" if _normalize_path(path) in codex_trusted else "NOT trusted"
+            project_lines.append(
+                f"{idx}. {label}{active}: `{branch}` · Claude {claude_tag} · Codex {codex_tag}\n"
+                f"   `{path}`"
+            )
+
+        if project_lines:
+            await ch.send(truncate("**Projects:**\n" + "\n".join(project_lines), 1800))
+
+        fix_lines = []
+        if not ssh_ok:
+            fix_lines.append("GitHub SSH failed: run `ssh -T git@github.com` and load your SSH key.")
+        if not claude_ok:
+            fix_lines.append("Claude CLI unavailable: install/login Claude Code.")
+        if not codex_ok:
+            fix_lines.append("Codex CLI unavailable: install/login Codex CLI.")
+        if claude_ok:
+            claude_untrusted = [path for _, path in GIT_PROJECTS if not _is_claude_trusted(path)]
+            if claude_untrusted:
+                fix_lines.append("Claude trust: run `claude` once interactively in each untrusted project directory.")
+        if codex_ok:
+            codex_untrusted = [path for _, path in GIT_PROJECTS if _normalize_path(path) not in codex_trusted]
+            if codex_untrusted:
+                fix_lines.append("Codex trust: run `codex` once interactively in each untrusted project directory.")
+        if fix_lines:
+            await ch.send("**Suggested fixes:**\n" + "\n".join(f"• {line}" for line in fix_lines))
+        return
+
     if lower in ("context clear", "resume clear", "clear context"):
         cleared = clear_resume_context(ch.id)
         if cleared:
             await ch.send("🧹 Cleared saved resume context for this channel.")
         else:
             await ch.send("No saved resume context to clear.")
+        return
+
+    if lower == "plan show":
+        plan_ctx = load_plan_context(ch.id)
+        if not plan_ctx:
+            await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
+            return
+        ts = plan_ctx.get("ts")
+        if isinstance(ts, (int, float)):
+            saved_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        else:
+            saved_at = "unknown"
+        plan_engine = (plan_ctx.get("engine") or "?").strip() or "?"
+        plan_model = (plan_ctx.get("model") or "?").strip() or "?"
+        plan_repo = (plan_ctx.get("cwd") or "").strip() or "(none)"
+        plan_branch = (plan_ctx.get("branch") or "?").strip() or "?"
+        plan_request = (plan_ctx.get("request") or "").strip() or "(empty)"
+        plan_body = (plan_ctx.get("plan") or "").strip() or "(empty)"
+        await ch.send(
+            "🗂️ **Saved plan context**\n"
+            f"Saved: `{saved_at}`\n"
+            f"Engine: `{plan_engine}` · Model: `{plan_model}`\n"
+            f"Repo: `{plan_repo}`\n"
+            f"Branch: `{plan_branch}`\n"
+            f"Request: {truncate(plan_request, 300)}"
+        )
+        await ch.send(f"```\n{truncate(plan_body, 1800)}\n```")
+        return
+
+    if lower in ("plan clear", "clear plan"):
+        if clear_plan_context(ch.id):
+            await ch.send("🧹 Cleared saved plan context.")
+        else:
+            await ch.send("No saved plan context to clear.")
         return
 
     if lower.startswith("plan:"):
