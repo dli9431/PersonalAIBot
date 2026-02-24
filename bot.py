@@ -496,12 +496,20 @@ def build_plan_prompt(
 def build_do_prompt(plan_ctx: dict, request: str) -> str:
     saved_request = (plan_ctx.get("request") or "").strip()
     saved_plan = (plan_ctx.get("plan") or "").strip()
+    saved_repo = (plan_ctx.get("cwd") or "").strip()
+    saved_branch = (plan_ctx.get("branch") or "").strip()
+    if saved_branch == "?":
+        saved_branch = ""
     do_request = request.strip() or "Execute the saved plan now."
     lines = [
         "Execute the saved plan below in this repository.",
         "Do the implementation now; do not respond with only another plan.",
         "Run relevant checks for your changes and include a concise summary.",
     ]
+    if saved_repo:
+        lines.append(f"Saved planning repo: {saved_repo}")
+    if saved_branch:
+        lines.append(f"Saved planning branch: {saved_branch}")
     if saved_request:
         lines.append("Saved planning request:")
         lines.append(saved_request)
@@ -685,6 +693,18 @@ def parse_engine_and_task(content: str) -> tuple[str, str]:
         if lower.startswith(prefix):
             return "codex", content[len(prefix):].strip()
     return DEFAULT_ENGINE, content
+
+
+def parse_execute_plan_request(content: str) -> str | None:
+    """Return execute extra instructions, or None if not an execute-plan command."""
+    stripped = content.strip()
+    lower = stripped.lower()
+    for prefix in ("do:", "execute:"):
+        if lower.startswith(prefix):
+            return stripped.split(":", 1)[1].strip()
+    if lower in ("do", "execute"):
+        return ""
+    return None
 
 
 def get_default_engine() -> str:
@@ -1337,10 +1357,20 @@ async def run_engine(
 
 # ── Git workflow ──────────────────────────────────────────────────────────────
 
-def create_branch(task: str, engine: str, path: str | None = None) -> str:
+def create_branch(
+    task: str,
+    engine: str,
+    path: str | None = None,
+    base_branch: str | None = None,
+) -> str:
     branch = f"{BRANCH_PREFIX}/{engine}/{slugify(task)}-{int(time.time()) % 100000}"
-    # Branch from dev/main if available; otherwise use the default branch.
-    base = _resolve_checkout_branch(path)
+    # Prefer the provided base branch (for saved plan execution), else resolve fallback.
+    preferred_base = (base_branch or "").strip()
+    base = None
+    if preferred_base and _ensure_local_branch(preferred_base, path):
+        base = preferred_base
+    if not base:
+        base = _resolve_checkout_branch(path)
     if not base:
         raise RuntimeError("No base branch found (missing dev/main and no local branches).")
     checkout = run_git(["git", "checkout", base], path)
@@ -1442,7 +1472,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves plan context)
-`do: [extra instructions]` — execute saved plan context, then clear it
+`do[: extra instructions]` / `execute[: extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` — clear saved plan context
 
 **During a session:**
@@ -2103,20 +2133,25 @@ async def on_message(message: discord.Message):
 
         save_plan_context(ch.id, cwd, engine, plan_request, output)
         await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
-        await ch.send("💾 Saved plan context. Run `do:` to execute it.")
+        await ch.send("💾 Saved plan context. Run `do` or `execute` to execute it.")
         return
 
-    if lower.startswith("do:"):
+    execute_request = parse_execute_plan_request(content)
+    if execute_request is not None:
         plan_ctx = load_plan_context(ch.id)
         if not plan_ctx:
             await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
             return
 
-        do_request = content.split(":", 1)[1].strip()
+        do_request = execute_request
         engine = get_default_engine()
         label = get_engine_label(engine)
         model = get_model_for_engine(engine)
         plan_cwd = (plan_ctx.get("cwd") or "").strip() or cwd
+        plan_branch = (plan_ctx.get("branch") or "").strip()
+        if plan_branch == "?":
+            plan_branch = ""
+        plan_branch_exists = False
         exec_description = (
             do_request
             or (plan_ctx.get("request") or "").strip()
@@ -2129,6 +2164,10 @@ async def on_message(message: discord.Message):
             if not plan_cwd or not pathlib.Path(plan_cwd).exists():
                 await ch.send(f"❌ Saved plan repo not found: `{plan_cwd or '(empty)'}`")
                 return
+            plan_branch_exists = bool(
+                plan_branch
+                and (_branch_exists(plan_branch, plan_cwd) or _remote_branch_exists(plan_branch, plan_cwd))
+            )
 
             if session:
                 await discard_changes(session["branch"], cwd)
@@ -2142,9 +2181,19 @@ async def on_message(message: discord.Message):
                 f"🚀 Executing saved plan with **{label}** (`{model}`) on `{cwd}`...\n"
                 f"> {truncate(exec_description, 200)}"
             )
+            if plan_branch and not plan_branch_exists:
+                await ch.send(
+                    f"⚠️ Saved planning branch `{plan_branch}` not found. "
+                    "Using the default base branch instead."
+                )
 
             try:
-                branch = create_branch(exec_description, engine, cwd)
+                branch = create_branch(
+                    exec_description,
+                    engine,
+                    cwd,
+                    base_branch=plan_branch if plan_branch_exists else None,
+                )
             except Exception as e:
                 await ch.send(f"❌ Branch creation failed: `{e}`")
                 return
