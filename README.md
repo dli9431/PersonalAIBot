@@ -134,7 +134,8 @@ do:
 ```
 
 `plan:` runs in planning mode with the default engine/model and saves context to disk.
-`do:` executes the last saved plan context for this channel, then clears it.
+`do:` (optionally with extra instructions) executes the last saved plan context for this
+channel, then clears it.
 Use `plan show` to inspect saved plan context and `plan clear` to remove it manually.
 
 ### Iterate
