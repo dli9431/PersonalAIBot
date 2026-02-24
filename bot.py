@@ -695,18 +695,6 @@ def parse_engine_and_task(content: str) -> tuple[str, str]:
     return DEFAULT_ENGINE, content
 
 
-def parse_execute_plan_request(content: str) -> str | None:
-    """Return execute extra instructions, or None if not an execute-plan command."""
-    stripped = content.strip()
-    lower = stripped.lower()
-    for prefix in ("do:", "execute:"):
-        if lower.startswith(prefix):
-            return stripped.split(":", 1)[1].strip()
-    if lower in ("do", "execute"):
-        return ""
-    return None
-
-
 def get_default_engine() -> str:
     return "codex" if (DEFAULT_ENGINE or "").strip().lower() == "codex" else "claude"
 
@@ -1472,7 +1460,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves plan context)
-`do[: extra instructions]` / `execute[: extra instructions]` — execute saved plan context, then clear it
+`do: [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` — clear saved plan context
 
 **During a session:**
@@ -2133,17 +2121,16 @@ async def on_message(message: discord.Message):
 
         save_plan_context(ch.id, cwd, engine, plan_request, output)
         await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
-        await ch.send("💾 Saved plan context. Run `do` or `execute` to execute it.")
+        await ch.send("💾 Saved plan context. Run `do:` to execute it.")
         return
 
-    execute_request = parse_execute_plan_request(content)
-    if execute_request is not None:
+    if lower.startswith("do:"):
         plan_ctx = load_plan_context(ch.id)
         if not plan_ctx:
             await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
             return
 
-        do_request = execute_request
+        do_request = content.split(":", 1)[1].strip()
         engine = get_default_engine()
         label = get_engine_label(engine)
         model = get_model_for_engine(engine)

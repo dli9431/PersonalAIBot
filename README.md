@@ -131,12 +131,11 @@ You can also plan first, then execute:
 ```
 plan: add retry logic to the payment webhook flow
 do:
-execute:
 ```
 
 `plan:` runs in planning mode with the default engine/model and saves context to disk.
-`do` / `execute` (optionally with `: extra instructions`) executes the last saved plan context
-for this channel, then clears it.
+`do:` (optionally with extra instructions) executes the last saved plan context for this
+channel, then clears it.
 Use `plan show` to inspect saved plan context and `plan clear` to remove it manually.
 
 ### Iterate
@@ -181,7 +180,7 @@ pr main               → open a GitHub PR targeting main
 | `claude: <task>` / `cc: <task>` | Run with Claude Code |
 | `codex: <task>` / `cx: <task>` / `openai: <task>` | Run with Codex CLI |
 | `plan: <task>` | Planning mode with default engine/model; saves plan context |
-| `do[: extra instructions]` / `execute[: extra instructions]` | Execute saved plan context with default engine/model, then clear it |
+| `do: [extra instructions]` | Execute saved plan context with default engine/model, then clear it |
 
 ### During a session
 
