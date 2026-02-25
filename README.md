@@ -141,7 +141,7 @@ plan: add retry logic to the payment webhook flow
 do:
 ```
 
-`plan:` runs in planning mode with the default engine/model and saves context to disk.
+`plan:` runs in planning mode with this channel's default engine/model and saves context to disk.
 `do:` (optionally with extra instructions) executes the last saved plan context for this
 channel, then clears it.
 Use `plan show` to inspect saved plan context and `plan clear` to remove it manually.
@@ -184,17 +184,17 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `<task>` | Run with the default engine |
+| `<task>` | Run with this channel's default engine |
 | `claude: <task>` / `cc: <task>` / `claude code: <task>` | Run with Claude Code |
 | `codex: <task>` / `cx: <task>` / `openai: <task>` | Run with Codex CLI |
-| `plan: <task>` | Planning mode with default engine/model; saves plan context |
-| `do: [extra instructions]` | Execute saved plan context with default engine/model, then clear it |
+| `plan: <task>` | Planning mode with this channel's default engine/model; saves plan context |
+| `do: [extra instructions]` | Execute saved plan context with this channel's default engine/model, then clear it |
 
 ### During a session
 
 | Command | Description |
 |---------|-------------|
-| `<follow-up>` | Continue with same engine and context |
+| `<follow-up>` | Continue with the same engine and the session's model/reasoning snapshot |
 | `stop` | Cancel the currently running engine turn |
 | `diff` | Peek at current changes |
 | `undo` | Discard uncommitted working-tree changes in the active session |
@@ -258,27 +258,33 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `engine` | Show current engine/model/reasoning config and available models |
-| `engine claude` / `engine codex` | Set default engine only (keeps current model for that engine) |
+| `engine` | Show this channel's engine/model/reasoning config (plus global defaults) and available models |
+| `engine global` | Show global default engine/model/reasoning config |
+| `engine claude` / `engine codex` | Set this channel's default engine only (keeps this channel's current model for that engine) |
+| `engine global claude` / `engine global codex` | Set global default engine only |
 | `claude models` / `cc models` | List available Claude models (numbered) |
 | `codex models` / `cx models` | List available Codex models (numbered) |
-| `claude model <n\|name>` | Switch Claude model by number or name (e.g. `1`, `opus`, `sonnet`) |
-| `codex model <n\|name>` | Switch Codex model by number or name |
-| `engine claude model <n\|name>` | Set default engine to Claude and choose model by number or name |
-| `engine codex model <n\|name>` | Set default engine to Codex and choose model by number or name |
-| `claude reasoning [n\|level]` | View/set Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
-| `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
-| `engine claude reasoning <n\|level>` | Set default engine to Claude and set its reasoning effort |
-| `engine codex reasoning <n\|level>` | Set default engine to Codex and set its reasoning effort |
-| `model <n\|name>` | Set model for the default engine by number or name |
+| `claude model <n\|name>` | Set this channel's Claude model by number or name (e.g. `1`, `opus`, `sonnet`) |
+| `codex model <n\|name>` | Set this channel's Codex model by number or name |
+| `engine claude model <n\|name>` | Set this channel default engine to Claude and choose model by number or name |
+| `engine codex model <n\|name>` | Set this channel default engine to Codex and choose model by number or name |
+| `engine global claude model <n\|name>` | Set global default engine to Claude and choose model by number or name |
+| `engine global codex model <n\|name>` | Set global default engine to Codex and choose model by number or name |
+| `claude reasoning [n\|level]` | View/set this channel's Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
+| `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set this channel's Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
+| `engine claude reasoning <n\|level>` | Set this channel default engine to Claude and set reasoning effort |
+| `engine codex reasoning <n\|level>` | Set this channel default engine to Codex and set reasoning effort |
+| `engine global claude reasoning <n\|level>` | Set global default engine to Claude and set reasoning effort |
+| `engine global codex reasoning <n\|level>` | Set global default engine to Codex and set reasoning effort |
+| `model <n\|name>` | Set model for this channel's default engine by number or name |
 | `default model <n\|name>` | Alias for `model <n\|name>` |
-| `reasoning [n\|level]` | View/set reasoning effort for the default engine |
+| `reasoning [n\|level]` | View/set reasoning effort for this channel's default engine |
 | `default reasoning [n\|level]` | Alias for `reasoning [n\|level]` |
 | `status` | Current branch and working tree |
 | `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
 
-Engine/model/reasoning selections are persisted in `.bot_state.json` and restored on restart.
+Global defaults and channel-scoped engine/model/reasoning selections are persisted in `.bot_state.json` and restored on restart.
 
 ### Login & System
 
