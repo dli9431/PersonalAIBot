@@ -58,6 +58,8 @@ CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower()
 
 CLAUDE_REASONING_LEVELS = ("low", "medium", "high")
 CODEX_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
+CLAUDE_REASONING_OPTIONS = (*CLAUDE_REASONING_LEVELS, "default")
+CODEX_REASONING_OPTIONS = (*CODEX_REASONING_LEVELS, "default")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
@@ -978,7 +980,16 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
     """
     token = selector.strip().lower()
     if not token:
-        return None, "Provide a reasoning level."
+        return None, "Provide a reasoning level (name or number)."
+
+    options = CLAUDE_REASONING_OPTIONS if engine == "claude" else CODEX_REASONING_OPTIONS
+    if token.isdigit():
+        index = int(token)
+        if index < 1 or index > len(options):
+            label = "Claude" if engine == "claude" else "Codex"
+            return None, f"{label} reasoning number must be between 1 and {len(options)}."
+        token = options[index - 1]
+
     if token in ("default", "auto", "unset", "clear", "none"):
         return None, None
 
@@ -986,8 +997,8 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
         aliases = {"med": "medium"}
         token = aliases.get(token, token)
         if token not in CLAUDE_REASONING_LEVELS:
-            choices = "`, `".join(CLAUDE_REASONING_LEVELS)
-            return None, f"Claude reasoning must be one of `{choices}` or `default`."
+            choices = "`, `".join(CLAUDE_REASONING_OPTIONS)
+            return None, f"Claude reasoning must be a number `1-{len(CLAUDE_REASONING_OPTIONS)}` or one of `{choices}`."
         return token, None
 
     aliases = {
@@ -998,13 +1009,18 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
     }
     token = aliases.get(token, token)
     if token not in CODEX_REASONING_LEVELS:
-        choices = "`, `".join(CODEX_REASONING_LEVELS)
-        return None, f"Codex reasoning must be one of `{choices}` or `default`."
+        choices = "`, `".join(CODEX_REASONING_OPTIONS)
+        return None, f"Codex reasoning must be a number `1-{len(CODEX_REASONING_OPTIONS)}` or one of `{choices}`."
     return token, None
 
 
 def format_reasoning_effort(effort: str | None) -> str:
     return effort or "default"
+
+
+def format_reasoning_options_numbered(engine: str) -> str:
+    options = CLAUDE_REASONING_OPTIONS if engine == "claude" else CODEX_REASONING_OPTIONS
+    return "\n".join(f"{idx}. `{level}`" for idx, level in enumerate(options, start=1))
 
 
 # ── Login helpers ─────────────────────────────────────────────────────────────
@@ -1556,10 +1572,10 @@ HELP_TEXT_2 = """**Branches:**
 `claude model <n|name>` — e.g. `1` / `opus` / `sonnet`
 `codex model <n|name>` — e.g. `1` / `gpt-5.3-codex`
 `engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>`
-`engine claude reasoning <level>` · `engine codex reasoning <level>`
-`claude reasoning [low|medium|high|default]`
-`codex reasoning [low|medium|high|xhigh|default]`
-`reasoning [level]` — view/set reasoning for default engine · `model <n|name>` — set model for default engine
+`engine claude reasoning <n|level>` · `engine codex reasoning <n|level>`
+`claude reasoning [n|level]` — `1`=`low`, `2`=`medium`, `3`=`high`, `4`=`default`
+`codex reasoning [n|level]` — `1`=`low`, `2`=`medium`, `3`=`high`, `4`=`xhigh`, `5`=`default`
+`reasoning [n|level]` — view/set reasoning for default engine · `model <n|name>` — set model for default engine
 `engine` — show current config
 
 **Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`
@@ -2640,7 +2656,7 @@ async def on_message(message: discord.Message):
         target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
         if not selector:
             await ch.send(
-                "Usage: `engine claude reasoning <level>` or `engine codex reasoning <level>`"
+                "Usage: `engine claude reasoning <n|level>` or `engine codex reasoning <n|level>`"
             )
             return
         selected_effort, err = resolve_reasoning_selector(selector, target_engine)
@@ -2681,7 +2697,7 @@ async def on_message(message: discord.Message):
         await ch.send(
             "Usage: `engine`, `engine claude`, `engine codex`, "
             "`engine claude model <n|name>`, `engine codex model <n|name>`, "
-            "`engine claude reasoning <level>`, or `engine codex reasoning <level>`"
+            "`engine claude reasoning <n|level>`, or `engine codex reasoning <n|level>`"
         )
         return
 
@@ -2697,9 +2713,9 @@ async def on_message(message: discord.Message):
             f"**Available models:**\n"
             f"Claude: {claude_list}\n"
             f"Codex: {codex_list}\n\n"
-            f"**Reasoning levels:**\n"
-            f"Claude: `low` · `medium` · `high` · `default`\n"
-            f"Codex: `low` · `medium` · `high` · `xhigh` · `default`"
+            f"**Reasoning levels (name or number):**\n"
+            f"Claude:\n{format_reasoning_options_numbered('claude')}\n"
+            f"Codex:\n{format_reasoning_options_numbered('codex')}"
         )
         return
 
@@ -2766,8 +2782,8 @@ async def on_message(message: discord.Message):
             return
 
     # ── Reasoning change (engine-specific) ─────────────────────────────
-    # Accepts: "claude reasoning [level]", "cc reasoning [level]",
-    #          "codex reasoning [level]", "cx reasoning [level]", "openai reasoning [level]"
+    # Accepts: "claude reasoning [n|level]", "cc reasoning [n|level]",
+    #          "codex reasoning [n|level]", "cx reasoning [n|level]", "openai reasoning [n|level]"
     reasoning_match = re.match(
         r"^(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
         content,
@@ -2781,12 +2797,14 @@ async def on_message(message: discord.Message):
             if target_engine == "claude":
                 await ch.send(
                     f"Claude reasoning: `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
-                    "Set with `claude reasoning <low|medium|high|default>`"
+                    f"Levels:\n{format_reasoning_options_numbered('claude')}\n"
+                    "Set with `claude reasoning <n|level>`"
                 )
             else:
                 await ch.send(
                     f"Codex reasoning: `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n"
-                    "Set with `codex reasoning <low|medium|high|xhigh|default>`"
+                    f"Levels:\n{format_reasoning_options_numbered('codex')}\n"
+                    "Set with `codex reasoning <n|level>`"
                 )
             return
         selected_effort, err = resolve_reasoning_selector(selector, target_engine)
@@ -2857,7 +2875,7 @@ async def on_message(message: discord.Message):
         return
 
     # ── Default reasoning change ────────────────────────────────────────
-    # Accepts: "reasoning [level]", "default reasoning [level]"
+    # Accepts: "reasoning [n|level]", "default reasoning [n|level]"
     if lower == "reasoning" or lower.startswith("reasoning ") or lower == "default reasoning" or lower.startswith("default reasoning "):
         prefix = "default reasoning" if lower.startswith("default reasoning") else "reasoning"
         new_effort = content[len(prefix):].strip()
@@ -2865,20 +2883,20 @@ async def on_message(message: discord.Message):
         if not new_effort:
             if default_engine == "claude":
                 await ch.send(
-                    f"Usage: `{prefix} <level>`\n"
+                    f"Usage: `{prefix} <n|level>`\n"
                     f"Default engine: `claude` · Current reasoning: `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
-                    "Claude levels: `low`, `medium`, `high`, `default`"
+                    f"Levels:\n{format_reasoning_options_numbered('claude')}"
                 )
             elif default_engine == "codex":
                 await ch.send(
-                    f"Usage: `{prefix} <level>`\n"
+                    f"Usage: `{prefix} <n|level>`\n"
                     f"Default engine: `codex` · Current reasoning: `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n"
-                    "Codex levels: `low`, `medium`, `high`, `xhigh`, `default`"
+                    f"Levels:\n{format_reasoning_options_numbered('codex')}"
                 )
             else:
                 await ch.send(
-                    f"Usage: `{prefix} <level>`\n"
-                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <level>` or `codex reasoning <level>`."
+                    f"Usage: `{prefix} <n|level>`\n"
+                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
                 )
             return
         if default_engine == "claude":
@@ -2904,7 +2922,7 @@ async def on_message(message: discord.Message):
             )
             return
         await ch.send(
-            f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <level>` or `codex reasoning <level>`."
+            f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
         )
         return
 
