@@ -2288,7 +2288,7 @@ async def on_message(message: discord.Message):
             clear_saved_plan = True
 
             # If no files changed, clean up the branch and skip starting a session.
-            if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
+            if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
                 base = _resolve_checkout_branch(cwd, avoid=branch)
                 if base:
                     run_git(["git", "checkout", base], cwd)
@@ -3096,7 +3096,7 @@ async def on_message(message: discord.Message):
         return
 
     # If no files changed, clean up the branch and skip starting a session
-    if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip():
+    if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
         base = _resolve_checkout_branch(cwd, avoid=branch)
         if base:
             run_git(["git", "checkout", base], cwd)
