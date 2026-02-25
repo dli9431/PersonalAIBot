@@ -1136,6 +1136,7 @@ async def _run_with_live_output(
 
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
+    live_chunks: list[bytes] = []
     done = asyncio.Event()
     start = time.time()
 
@@ -1145,6 +1146,7 @@ async def _run_with_live_output(
             if not chunk:
                 break
             stdout_chunks.append(chunk)
+            live_chunks.append(chunk)
 
     async def read_stderr():
         while True:
@@ -1152,6 +1154,7 @@ async def _run_with_live_output(
             if not chunk:
                 break
             stderr_chunks.append(chunk)
+            live_chunks.append(chunk)
 
     async def live_update():
         last_text = ""
@@ -1160,7 +1163,8 @@ async def _run_with_live_output(
             if done.is_set():
                 break
             elapsed = int(time.time() - start)
-            raw = b"".join(stdout_chunks).decode(errors="replace")
+            # Live status should include both streams: Codex frequently writes progress to stderr.
+            raw = b"".join(live_chunks).decode(errors="replace")
             # Show the tail of the output that fits in a Discord message
             tail = strip_ansi(raw).strip()
             # Truncate to fit in Discord (2000 char limit minus formatting)
