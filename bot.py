@@ -1559,7 +1559,7 @@ HELP_TEXT_2 = """**Branches:**
 `engine claude reasoning <level>` · `engine codex reasoning <level>`
 `claude reasoning [low|medium|high|default]`
 `codex reasoning [low|medium|high|xhigh|default]`
-`reasoning [level]` — set reasoning for default engine · `model <n|name>` — set model for default engine
+`reasoning [level]` — view/set reasoning for default engine · `model <n|name>` — set model for default engine
 `engine` — show current config
 
 **Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`

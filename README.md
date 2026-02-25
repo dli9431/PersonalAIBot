@@ -89,8 +89,15 @@ PLAN_CONTEXT_MAX_CHARS=12000  # max chars saved for plan/do context
 
 # Claude Code settings
 CLAUDE_MODEL=sonnet
+# Optional: low | medium | high (unset = CLI default)
+CLAUDE_REASONING_EFFORT=
 CLAUDE_ALLOWED_TOOLS=Read Edit Write Grep Glob LS Bash(git\ diff) Bash(git\ status)
 CLAUDE_DENIED_TOOLS=Bash(rm\ *) Bash(sudo\ *) Bash(curl\ *) Bash(wget\ *) WebFetch
+
+# Codex CLI settings
+CODEX_MODEL=gpt-5.3-codex
+# Optional: low | medium | high | xhigh (unset = CLI default)
+CODEX_REASONING_EFFORT=
 ```
 
 > **Note:** Use absolute paths (e.g. `/home/you/code`) not `~/code` in `.env`.
@@ -250,7 +257,7 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `engine` | Show current engine config and all available models |
+| `engine` | Show current engine/model/reasoning config and available models |
 | `engine claude` / `engine codex` | Set default engine only (keeps current model for that engine) |
 | `claude models` / `cc models` | List available Claude models (numbered) |
 | `codex models` / `cx models` | List available Codex models (numbered) |
@@ -258,12 +265,17 @@ pr main               → open a GitHub PR targeting main
 | `codex model <n\|name>` | Switch Codex model by number or name |
 | `engine claude model <n\|name>` | Set default engine to Claude and choose model by number or name |
 | `engine codex model <n\|name>` | Set default engine to Codex and choose model by number or name |
+| `claude reasoning [level]` | View/set Claude reasoning effort (`low`, `medium`, `high`, or `default`) |
+| `codex reasoning [level]` | View/set Codex reasoning effort (`low`, `medium`, `high`, `xhigh`, or `default`) |
+| `engine claude reasoning <level>` | Set default engine to Claude and set its reasoning effort |
+| `engine codex reasoning <level>` | Set default engine to Codex and set its reasoning effort |
 | `model <n\|name>` | Set model for the default engine by number or name |
+| `reasoning [level]` | View/set reasoning effort for the default engine |
 | `status` | Current branch and working tree |
 | `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
 
-Engine/model selections are persisted in `.bot_state.json` and restored on restart.
+Engine/model/reasoning selections are persisted in `.bot_state.json` and restored on restart.
 
 ### Login & System
 
