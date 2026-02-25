@@ -265,12 +265,12 @@ pr main               → open a GitHub PR targeting main
 | `codex model <n\|name>` | Switch Codex model by number or name |
 | `engine claude model <n\|name>` | Set default engine to Claude and choose model by number or name |
 | `engine codex model <n\|name>` | Set default engine to Codex and choose model by number or name |
-| `claude reasoning [level]` | View/set Claude reasoning effort (`low`, `medium`, `high`, or `default`) |
-| `codex reasoning [level]` | View/set Codex reasoning effort (`low`, `medium`, `high`, `xhigh`, or `default`) |
-| `engine claude reasoning <level>` | Set default engine to Claude and set its reasoning effort |
-| `engine codex reasoning <level>` | Set default engine to Codex and set its reasoning effort |
+| `claude reasoning [n\|level]` | View/set Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
+| `codex reasoning [n\|level]` | View/set Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
+| `engine claude reasoning <n\|level>` | Set default engine to Claude and set its reasoning effort |
+| `engine codex reasoning <n\|level>` | Set default engine to Codex and set its reasoning effort |
 | `model <n\|name>` | Set model for the default engine by number or name |
-| `reasoning [level]` | View/set reasoning effort for the default engine |
+| `reasoning [n\|level]` | View/set reasoning effort for the default engine |
 | `status` | Current branch and working tree |
 | `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
