@@ -1530,22 +1530,22 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 # ── Discord handlers ─────────────────────────────────────────────────────────
 
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
-`<task>` — default engine ({default}) · `claude: <task>` / `cc:` · `codex: <task>` / `cx:` / `openai:`
+`<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves plan context)
 `do: [extra instructions]` — execute saved plan context, then clear it
-`plan show` — show saved plan context · `plan clear` — clear saved plan context
+`plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
 
 **During a session:**
 Type follow-ups freely — engine keeps context
 `stop` — cancel the current run
 `switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
-`diff` — peek at changes · `undo` — revert last run
-`context clear` — forget saved timeout context
+`diff` — peek at changes · `undo` — discard uncommitted changes
+`context clear` — forget saved timeout context (`resume clear` / `clear context`)
 
 **Ending a session:**
 `done` — full diff + push prompt
-`yes` / `push` — commit, push & merge · `no` / `discard` — discard
+`yes` / `push` — commit + push, then merge · `no` / `discard` — discard
 `abort` — discard immediately · `skip` — skip merge step
 
 **After pushing:**
@@ -1559,9 +1559,9 @@ def help_text_1() -> str:
 
 HELP_TEXT_2 = """**Branches:**
 `branches` — list branches (use `N` in commands)
-`branch delete <name|N> [local|remote|both] [force]`
+`branch delete|del <name|N> [local|remote|both] [force]`
 `branch protect [list|add|remove|clear|reset]`
-`switch <branch|N>` — switch branch (auto-commit if in session)
+`switch|branch switch <branch|N>` — switch branch (auto-commit if in session)
 
 **Recovery:**
 `recover` — list orphaned branches · `recover <id>` — resume
@@ -1579,12 +1579,13 @@ HELP_TEXT_2 = """**Branches:**
 `engine claude reasoning <n|level>` · `engine codex reasoning <n|level>`
 `claude reasoning [n|level]` — `1`=`low`, `2`=`medium`, `3`=`high`, `4`=`default`
 `codex reasoning [n|level]` — `1`=`low`, `2`=`medium`, `3`=`high`, `4`=`xhigh`, `5`=`default`
-`reasoning [n|level]` — view/set reasoning for default engine · `model <n|name>` — set model for default engine
+`reasoning|default reasoning [n|level]` — view/set default-engine reasoning
+`model|default model <n|name>` — set model for default engine
 `engine` — show current config
 
 **Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`
 
-**Login:** `claude login` · `codex login` · `openai login` · `login both`
+**Login:** `claude|cc login` · `codex|cx|openai login` · `login both`
 **System:** `restart`"""
 
 HELP_PIN_TITLE_1 = "Help (1/2)"
