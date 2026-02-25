@@ -44,6 +44,7 @@ DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
 # Claude Code (mutable at runtime via Discord `claude model` / `model` commands)
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "sonnet")
+CLAUDE_REASONING_EFFORT = os.getenv("CLAUDE_REASONING_EFFORT", "").strip().lower() or None
 CLAUDE_ALLOWED_TOOLS = os.getenv("CLAUDE_ALLOWED_TOOLS",
     "Read Edit Write Grep Glob LS Bash(git\\ diff) Bash(git\\ status)"
 ).split()
@@ -53,6 +54,10 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 
 # Codex CLI
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.3-codex")
+CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower() or None
+
+CLAUDE_REASONING_LEVELS = ("low", "medium", "high")
+CODEX_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
@@ -272,12 +277,14 @@ def _save_runtime_config() -> None:
         "default_engine": "codex" if (DEFAULT_ENGINE or "").strip().lower() == "codex" else "claude",
         "claude_model": CLAUDE_MODEL,
         "codex_model": CODEX_MODEL,
+        "claude_reasoning_effort": CLAUDE_REASONING_EFFORT,
+        "codex_reasoning_effort": CODEX_REASONING_EFFORT,
     }
     _save_state(data)
 
 
 def _load_runtime_config() -> None:
-    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT
     data = _load_state()
     config = data.get("runtime_config")
     if not isinstance(config, dict):
@@ -291,6 +298,12 @@ def _load_runtime_config() -> None:
     codex_model = config.get("codex_model")
     if isinstance(codex_model, str) and codex_model.strip():
         CODEX_MODEL = codex_model.strip()
+    if "claude_reasoning_effort" in config:
+        value = config.get("claude_reasoning_effort")
+        CLAUDE_REASONING_EFFORT = value.strip().lower() if isinstance(value, str) and value.strip() else None
+    if "codex_reasoning_effort" in config:
+        value = config.get("codex_reasoning_effort")
+        CODEX_REASONING_EFFORT = value.strip().lower() if isinstance(value, str) and value.strip() else None
 
 
 def _init_protected_branches() -> None:
@@ -958,6 +971,42 @@ def resolve_model_selector(
     return token, None
 
 
+def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, str | None]:
+    """
+    Resolve reasoning effort for an engine.
+    Returns (resolved_effort_or_none_for_default, error_message).
+    """
+    token = selector.strip().lower()
+    if not token:
+        return None, "Provide a reasoning level."
+    if token in ("default", "auto", "unset", "clear", "none"):
+        return None, None
+
+    if engine == "claude":
+        aliases = {"med": "medium"}
+        token = aliases.get(token, token)
+        if token not in CLAUDE_REASONING_LEVELS:
+            choices = "`, `".join(CLAUDE_REASONING_LEVELS)
+            return None, f"Claude reasoning must be one of `{choices}` or `default`."
+        return token, None
+
+    aliases = {
+        "med": "medium",
+        "max": "xhigh",
+        "veryhigh": "xhigh",
+        "very-high": "xhigh",
+    }
+    token = aliases.get(token, token)
+    if token not in CODEX_REASONING_LEVELS:
+        choices = "`, `".join(CODEX_REASONING_LEVELS)
+        return None, f"Codex reasoning must be one of `{choices}` or `default`."
+    return token, None
+
+
+def format_reasoning_effort(effort: str | None) -> str:
+    return effort or "default"
+
+
 # ── Login helpers ─────────────────────────────────────────────────────────────
 
 async def login_codex(ch: discord.TextChannel) -> None:
@@ -1258,6 +1307,8 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
         "--output-format", "stream-json",
         "--max-turns", "10",
     ])
+    if CLAUDE_REASONING_EFFORT:
+        cmd.extend(["--effort", CLAUDE_REASONING_EFFORT])
     if CLAUDE_ALLOWED_TOOLS:
         cmd.append("--allowedTools")
         cmd.extend(CLAUDE_ALLOWED_TOOLS)
@@ -1275,17 +1326,18 @@ async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, im
             "codex", "exec", "resume", "--last",
             "--full-auto",
             "--model", CODEX_MODEL,
-            task,
         ]
     else:
         cmd = [
             "codex", "exec",
             "--full-auto",
             "--model", CODEX_MODEL,
-            task,
         ]
+    if CODEX_REASONING_EFFORT:
+        cmd.extend(["-c", f"model_reasoning_effort=\"{CODEX_REASONING_EFFORT}\""])
     if images:
         cmd.extend(["--image", ",".join(images)])
+    cmd.append(task)
 
     return await _run_with_live_output(cmd, ch, "Codex CLI", cwd=cwd)
 
@@ -1504,7 +1556,11 @@ HELP_TEXT_2 = """**Branches:**
 `claude model <n|name>` — e.g. `1` / `opus` / `sonnet`
 `codex model <n|name>` — e.g. `1` / `gpt-5.3-codex`
 `engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>`
-`model <n|name>` — set model for default engine · `engine` — show current config
+`engine claude reasoning <level>` · `engine codex reasoning <level>`
+`claude reasoning [low|medium|high|default]`
+`codex reasoning [low|medium|high|xhigh|default]`
+`reasoning [level]` — set reasoning for default engine · `model <n|name>` — set model for default engine
+`engine` — show current config
 
 **Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`
 
@@ -1691,7 +1747,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message: discord.Message):
-    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, _restart_on_close
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT, _restart_on_close
     if message.author.bot or not is_authorised(message):
         return
 
@@ -2573,6 +2629,38 @@ async def on_message(message: discord.Message):
             f"✅ Default engine set to **codex** — model `{CODEX_MODEL}`"
         )
         return
+    engine_reasoning_match = re.match(
+        r"^engine\s+(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if engine_reasoning_match:
+        engine_token = engine_reasoning_match.group(1).lower()
+        selector = (engine_reasoning_match.group(2) or "").strip()
+        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        if not selector:
+            await ch.send(
+                "Usage: `engine claude reasoning <level>` or `engine codex reasoning <level>`"
+            )
+            return
+        selected_effort, err = resolve_reasoning_selector(selector, target_engine)
+        if err:
+            await ch.send(f"❌ {err}")
+            return
+        DEFAULT_ENGINE = target_engine
+        if target_engine == "claude":
+            CLAUDE_REASONING_EFFORT = selected_effort
+            _save_runtime_config()
+            await ch.send(
+                f"✅ Default engine set to **claude** — reasoning `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`"
+            )
+            return
+        CODEX_REASONING_EFFORT = selected_effort
+        _save_runtime_config()
+        await ch.send(
+            f"✅ Default engine set to **codex** — reasoning `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`"
+        )
+        return
     engine_only_match = re.match(
         r"^engine\s+(claude|cc|codex|cx|openai)$",
         content,
@@ -2584,14 +2672,16 @@ async def on_message(message: discord.Message):
         DEFAULT_ENGINE = target_engine
         _save_runtime_config()
         model = CLAUDE_MODEL if target_engine == "claude" else CODEX_MODEL
+        effort = CLAUDE_REASONING_EFFORT if target_engine == "claude" else CODEX_REASONING_EFFORT
         await ch.send(
-            f"✅ Default engine set to **{target_engine}** — current model `{model}`"
+            f"✅ Default engine set to **{target_engine}** — current model `{model}` · reasoning `{format_reasoning_effort(effort)}`"
         )
         return
     if lower.startswith("engine "):
         await ch.send(
             "Usage: `engine`, `engine claude`, `engine codex`, "
-            "`engine claude model <n|name>`, or `engine codex model <n|name>`"
+            "`engine claude model <n|name>`, `engine codex model <n|name>`, "
+            "`engine claude reasoning <level>`, or `engine codex reasoning <level>`"
         )
         return
 
@@ -2602,10 +2692,14 @@ async def on_message(message: discord.Message):
         codex_list = " · ".join(f"`{slug}`" for slug, _ in codex_models)
         await ch.send(
             f"Default: **{DEFAULT_ENGINE}**\n"
-            f"Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`\n\n"
+            f"Claude: model `{CLAUDE_MODEL}` · reasoning `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
+            f"Codex: model `{CODEX_MODEL}` · reasoning `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n\n"
             f"**Available models:**\n"
             f"Claude: {claude_list}\n"
-            f"Codex: {codex_list}"
+            f"Codex: {codex_list}\n\n"
+            f"**Reasoning levels:**\n"
+            f"Claude: `low` · `medium` · `high` · `default`\n"
+            f"Codex: `low` · `medium` · `high` · `xhigh` · `default`"
         )
         return
 
@@ -2671,6 +2765,44 @@ async def on_message(message: discord.Message):
                 await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
             return
 
+    # ── Reasoning change (engine-specific) ─────────────────────────────
+    # Accepts: "claude reasoning [level]", "cc reasoning [level]",
+    #          "codex reasoning [level]", "cx reasoning [level]", "openai reasoning [level]"
+    reasoning_match = re.match(
+        r"^(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if reasoning_match:
+        engine_token = reasoning_match.group(1).lower()
+        selector = (reasoning_match.group(2) or "").strip()
+        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        if not selector:
+            if target_engine == "claude":
+                await ch.send(
+                    f"Claude reasoning: `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
+                    "Set with `claude reasoning <low|medium|high|default>`"
+                )
+            else:
+                await ch.send(
+                    f"Codex reasoning: `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n"
+                    "Set with `codex reasoning <low|medium|high|xhigh|default>`"
+                )
+            return
+        selected_effort, err = resolve_reasoning_selector(selector, target_engine)
+        if err:
+            await ch.send(f"❌ {err}")
+            return
+        if target_engine == "claude":
+            CLAUDE_REASONING_EFFORT = selected_effort
+            _save_runtime_config()
+            await ch.send(f"✅ Claude reasoning set to `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`")
+            return
+        CODEX_REASONING_EFFORT = selected_effort
+        _save_runtime_config()
+        await ch.send(f"✅ Codex reasoning set to `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`")
+        return
+
     # ── Default model change ────────────────────────────────────────────
     # Accepts: "model <n|name>", "default model <n|name>"
     if lower == "model" or lower.startswith("model ") or lower == "default model" or lower.startswith("default model "):
@@ -2721,6 +2853,58 @@ async def on_message(message: discord.Message):
             return
         await ch.send(
             f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model <n|name>` or `codex model <n|name>`."
+        )
+        return
+
+    # ── Default reasoning change ────────────────────────────────────────
+    # Accepts: "reasoning [level]", "default reasoning [level]"
+    if lower == "reasoning" or lower.startswith("reasoning ") or lower == "default reasoning" or lower.startswith("default reasoning "):
+        prefix = "default reasoning" if lower.startswith("default reasoning") else "reasoning"
+        new_effort = content[len(prefix):].strip()
+        default_engine = (DEFAULT_ENGINE or "").strip().lower()
+        if not new_effort:
+            if default_engine == "claude":
+                await ch.send(
+                    f"Usage: `{prefix} <level>`\n"
+                    f"Default engine: `claude` · Current reasoning: `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
+                    "Claude levels: `low`, `medium`, `high`, `default`"
+                )
+            elif default_engine == "codex":
+                await ch.send(
+                    f"Usage: `{prefix} <level>`\n"
+                    f"Default engine: `codex` · Current reasoning: `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n"
+                    "Codex levels: `low`, `medium`, `high`, `xhigh`, `default`"
+                )
+            else:
+                await ch.send(
+                    f"Usage: `{prefix} <level>`\n"
+                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <level>` or `codex reasoning <level>`."
+                )
+            return
+        if default_engine == "claude":
+            selected_effort, err = resolve_reasoning_selector(new_effort, "claude")
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            CLAUDE_REASONING_EFFORT = selected_effort
+            _save_runtime_config()
+            await ch.send(
+                f"✅ Default engine is **claude** — reasoning set to `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`"
+            )
+            return
+        if default_engine == "codex":
+            selected_effort, err = resolve_reasoning_selector(new_effort, "codex")
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            CODEX_REASONING_EFFORT = selected_effort
+            _save_runtime_config()
+            await ch.send(
+                f"✅ Default engine is **codex** — reasoning set to `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`"
+            )
+            return
+        await ch.send(
+            f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <level>` or `codex reasoning <level>`."
         )
         return
 
