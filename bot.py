@@ -1715,17 +1715,18 @@ HELP_TEXT_2 = """**Branches:**
 `repos` · `cwd` / `cwd <n>` — show or switch active repo
 `repo <n> status|diff|commit [msg]|push|branches`
 
-**Config:**
+**Config (channel-scoped by default):**
+`engine` — show this channel config (+ global default)
+`engine global` — show global default config
 `claude models` · `codex models` — list available models (numbered)
-`claude model <n|name>` — e.g. `1` / `opus` / `sonnet`
-`codex model <n|name>` — e.g. `1` / `gpt-5.3-codex`
-`engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>`
-`engine claude reasoning <n|level>` · `engine codex reasoning <n|level>`
-`claude reasoning [n|level]` — `1`=`low`, `2`=`medium`, `3`=`high`, `4`=`default`
-`codex reasoning [n|level]` — `1`=`low`, `2`=`medium`, `3`=`high`, `4`=`xhigh`, `5`=`default`
-`reasoning|default reasoning [n|level]` — view/set default-engine reasoning
-`model|default model <n|name>` — set model for default engine
-`engine` — show current config
+`claude model <n|name>` · `codex model <n|name>` — set model for this channel
+`engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>` — set this channel
+`engine global claude|codex` · `engine global claude|codex model <n|name>` — set global default
+`claude reasoning [n|level]` · `codex reasoning [n|level]` — set reasoning for this channel
+`engine claude reasoning <n|level>` · `engine codex reasoning <n|level>` — set this channel
+`engine global claude|codex reasoning <n|level>` — set global default reasoning
+`reasoning|default reasoning [n|level]` — view/set this channel default-engine reasoning
+`model|default model <n|name>` — set model for this channel default engine
 
 **Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`
 
@@ -2209,8 +2210,12 @@ async def on_message(message: discord.Message):
         br = current_branch(cwd)
         sess_info = ""
         if session:
-            sess_info = (f"\n📝 Active session: **{session['engine']}** · "
-                         f"{session['turns']} turn(s)")
+            sess_runtime = get_session_runtime_config(session, ch.id)
+            sess_model = get_model_for_engine(session["engine"], runtime_config=sess_runtime, ch_id=ch.id)
+            sess_info = (
+                f"\n📝 Active session: **{session['engine']}** (`{sess_model}`) · "
+                f"{session['turns']} turn(s)"
+            )
         await ch.send(f"📍 `{cwd}`\n🌿 `{br}`{sess_info}\n"
                        f"```\n{st or '(clean)'}\n```")
         return
@@ -2316,9 +2321,10 @@ async def on_message(message: discord.Message):
             await ch.send("Usage: `plan: <task>`")
             return
 
-        engine = get_default_engine()
+        runtime_config = get_runtime_config(ch.id)
+        engine = get_default_engine(ch.id)
         label = get_engine_label(engine)
-        model = get_model_for_engine(engine)
+        model = get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch.id)
         planning_task = build_plan_prompt(plan_request, ch.id, cwd, engine)
 
         await ch.send(
@@ -2335,6 +2341,7 @@ async def on_message(message: discord.Message):
                 resume=False,
                 cwd=cwd,
                 stop_event=stop_event,
+                runtime_config=runtime_config,
             )
         except Exception as e:
             await ch.send(f"❌ {label} planning error: `{e}`")
@@ -2346,7 +2353,7 @@ async def on_message(message: discord.Message):
             await ch.send("🛑 Planning stopped.")
             return
 
-        save_plan_context(ch.id, cwd, engine, plan_request, output)
+        save_plan_context(ch.id, cwd, engine, plan_request, output, runtime_config=runtime_config)
         await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
         await ch.send("💾 Saved plan context. Run `do:` to execute it.")
         return
@@ -2358,9 +2365,10 @@ async def on_message(message: discord.Message):
             return
 
         do_request = content.split(":", 1)[1].strip()
-        engine = get_default_engine()
+        runtime_config = get_runtime_config(ch.id)
+        engine = get_default_engine(ch.id)
         label = get_engine_label(engine)
-        model = get_model_for_engine(engine)
+        model = get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch.id)
         plan_cwd = (plan_ctx.get("cwd") or "").strip() or cwd
         plan_branch = (plan_ctx.get("branch") or "").strip()
         if plan_branch == "?":
@@ -2423,6 +2431,7 @@ async def on_message(message: discord.Message):
                     resume=False,
                     cwd=cwd,
                     stop_event=stop_event,
+                    runtime_config=runtime_config,
                 )
             except Exception as e:
                 await ch.send(f"❌ {label} error: `{e}`")
@@ -2460,6 +2469,7 @@ async def on_message(message: discord.Message):
                 "turns": 1,
                 "phase": "working",
                 "cwd": cwd,
+                "runtime_config": dict(runtime_config),
             }
 
             auto_commit(exec_description, 1, cwd)
@@ -2762,17 +2772,20 @@ async def on_message(message: discord.Message):
         return
 
     engine_model_match = re.match(
-        r"^engine\s+(claude|cc|codex|cx|openai)\s+model(?:\s+(.+))?$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai)\s+model(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
     if engine_model_match:
-        engine_token = engine_model_match.group(1).lower()
-        selector = (engine_model_match.group(2) or "").strip()
+        scope_token = (engine_model_match.group(1) or "").lower()
+        scope_ch_id = None if scope_token in ("global", "default") else ch.id
+        engine_token = engine_model_match.group(2).lower()
+        selector = (engine_model_match.group(3) or "").strip()
         target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
         if not selector:
             await ch.send(
-                "Usage: `engine claude model <n|name>` or `engine codex model <n|name>`"
+                "Usage: `engine claude model <n|name>`, `engine codex model <n|name>`, "
+                "`engine global claude model <n|name>`, or `engine global codex model <n|name>`"
             )
             return
         if target_engine == "claude":
@@ -2781,11 +2794,14 @@ async def on_message(message: discord.Message):
             if err:
                 await ch.send(f"❌ {err}")
                 return
-            DEFAULT_ENGINE = "claude"
-            CLAUDE_MODEL = selected_model or CLAUDE_MODEL
-            _save_runtime_config()
+            updated = update_runtime_config(
+                scope_ch_id,
+                default_engine="claude",
+                claude_model=selected_model,
+            )
             await ch.send(
-                f"✅ Default engine set to **claude** — model `{CLAUDE_MODEL}`"
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **claude** — "
+                f"model `{updated['claude_model']}`"
             )
             return
         models = get_codex_models()
@@ -2793,114 +2809,174 @@ async def on_message(message: discord.Message):
         if err:
             await ch.send(f"❌ {err}")
             return
-        DEFAULT_ENGINE = "codex"
-        CODEX_MODEL = selected_model or CODEX_MODEL
-        _save_runtime_config()
+        updated = update_runtime_config(
+            scope_ch_id,
+            default_engine="codex",
+            codex_model=selected_model,
+        )
         await ch.send(
-            f"✅ Default engine set to **codex** — model `{CODEX_MODEL}`"
+            f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **codex** — "
+            f"model `{updated['codex_model']}`"
         )
         return
+
     engine_reasoning_match = re.match(
-        r"^engine\s+(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
     if engine_reasoning_match:
-        engine_token = engine_reasoning_match.group(1).lower()
-        selector = (engine_reasoning_match.group(2) or "").strip()
+        scope_token = (engine_reasoning_match.group(1) or "").lower()
+        scope_ch_id = None if scope_token in ("global", "default") else ch.id
+        engine_token = engine_reasoning_match.group(2).lower()
+        selector = (engine_reasoning_match.group(3) or "").strip()
         target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
         if not selector:
             await ch.send(
-                "Usage: `engine claude reasoning <n|level>` or `engine codex reasoning <n|level>`"
+                "Usage: `engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
+                "`engine global claude reasoning <n|level>`, or `engine global codex reasoning <n|level>`"
             )
             return
         selected_effort, err = resolve_reasoning_selector(selector, target_engine)
         if err:
             await ch.send(f"❌ {err}")
             return
-        DEFAULT_ENGINE = target_engine
         if target_engine == "claude":
-            CLAUDE_REASONING_EFFORT = selected_effort
-            _save_runtime_config()
+            updated = update_runtime_config(
+                scope_ch_id,
+                default_engine="claude",
+                claude_reasoning_effort=selected_effort,
+            )
             await ch.send(
-                f"✅ Default engine set to **claude** — reasoning `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`"
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **claude** — "
+                f"reasoning `{format_reasoning_effort(updated['claude_reasoning_effort'])}`"
             )
             return
-        CODEX_REASONING_EFFORT = selected_effort
-        _save_runtime_config()
+        updated = update_runtime_config(
+            scope_ch_id,
+            default_engine="codex",
+            codex_reasoning_effort=selected_effort,
+        )
         await ch.send(
-            f"✅ Default engine set to **codex** — reasoning `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`"
+            f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **codex** — "
+            f"reasoning `{format_reasoning_effort(updated['codex_reasoning_effort'])}`"
         )
         return
+
     engine_only_match = re.match(
-        r"^engine\s+(claude|cc|codex|cx|openai)$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai)$",
         content,
         flags=re.IGNORECASE,
     )
     if engine_only_match:
-        engine_token = engine_only_match.group(1).lower()
+        scope_token = (engine_only_match.group(1) or "").lower()
+        scope_ch_id = None if scope_token in ("global", "default") else ch.id
+        engine_token = engine_only_match.group(2).lower()
         target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
-        DEFAULT_ENGINE = target_engine
-        _save_runtime_config()
-        model = CLAUDE_MODEL if target_engine == "claude" else CODEX_MODEL
-        effort = CLAUDE_REASONING_EFFORT if target_engine == "claude" else CODEX_REASONING_EFFORT
+        updated = update_runtime_config(scope_ch_id, default_engine=target_engine)
+        model = get_model_for_engine(target_engine, runtime_config=updated)
+        effort = get_reasoning_for_engine(target_engine, runtime_config=updated)
         await ch.send(
-            f"✅ Default engine set to **{target_engine}** — current model `{model}` · reasoning `{format_reasoning_effort(effort)}`"
-        )
-        return
-    if lower.startswith("engine "):
-        await ch.send(
-            "Usage: `engine`, `engine claude`, `engine codex`, "
-            "`engine claude model <n|name>`, `engine codex model <n|name>`, "
-            "`engine claude reasoning <n|level>`, or `engine codex reasoning <n|level>`"
+            f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **{target_engine}** — "
+            f"current model `{model}` · reasoning `{format_reasoning_effort(effort)}`"
         )
         return
 
-    if lower == "engine":
+    if lower == "engine" or lower == "engine global" or lower == "engine default":
+        show_global = lower in ("engine global", "engine default")
+        channel_config = get_runtime_config(ch.id)
+        global_config = get_runtime_config(None)
+        config = global_config if show_global else channel_config
         claude_models = await get_claude_models()
         codex_models = get_codex_models()
         claude_list = " · ".join(f"`{mid}`" for mid, _ in claude_models)
         codex_list = " · ".join(f"`{slug}`" for slug, _ in codex_models)
+
+        if show_global:
+            body = (
+                f"Global default: **{config['default_engine']}**\n"
+                f"Claude: model `{config['claude_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['claude_reasoning_effort'])}`\n"
+                f"Codex: model `{config['codex_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n\n"
+            )
+        else:
+            scope_note = (
+                "override active" if ch.id in CHANNEL_RUNTIME_CONFIGS else "inherits global default"
+            )
+            body = (
+                f"This channel ({scope_note}): **{config['default_engine']}**\n"
+                f"Claude: model `{config['claude_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['claude_reasoning_effort'])}`\n"
+                f"Codex: model `{config['codex_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n\n"
+                f"Global default: **{global_config['default_engine']}**\n"
+                f"Claude: model `{global_config['claude_model']}` · reasoning "
+                f"`{format_reasoning_effort(global_config['claude_reasoning_effort'])}`\n"
+                f"Codex: model `{global_config['codex_model']}` · reasoning "
+                f"`{format_reasoning_effort(global_config['codex_reasoning_effort'])}`\n\n"
+            )
+
         await ch.send(
-            f"Default: **{DEFAULT_ENGINE}**\n"
-            f"Claude: model `{CLAUDE_MODEL}` · reasoning `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
-            f"Codex: model `{CODEX_MODEL}` · reasoning `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n\n"
-            f"**Available models:**\n"
-            f"Claude: {claude_list}\n"
-            f"Codex: {codex_list}\n\n"
-            f"**Reasoning levels (name or number):**\n"
-            f"Claude:\n{format_reasoning_options_numbered('claude')}\n"
-            f"Codex:\n{format_reasoning_options_numbered('codex')}"
+            body
+            + f"**Available models:**\n"
+            + f"Claude: {claude_list}\n"
+            + f"Codex: {codex_list}\n\n"
+            + f"**Reasoning levels (name or number):**\n"
+            + f"Claude:\n{format_reasoning_options_numbered('claude')}\n"
+            + f"Codex:\n{format_reasoning_options_numbered('codex')}"
+        )
+        return
+
+    if lower.startswith("engine "):
+        await ch.send(
+            "Usage: `engine`, `engine global`, `engine claude`, `engine codex`, "
+            "`engine claude model <n|name>`, `engine codex model <n|name>`, "
+            "`engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
+            "`engine global claude|codex`, `engine global claude|codex model <n|name>`, "
+            "or `engine global claude|codex reasoning <n|level>`"
         )
         return
 
     # ── Model listing ────────────────────────────────────────────────────
     # Accepts: "claude models", "cc models", "codex models", "cx models"
     if lower in ("claude models", "cc models"):
+        channel_config = get_runtime_config(ch.id)
+        current_model = get_model_for_engine("claude", runtime_config=channel_config)
+        global_model = get_model_for_engine("claude")
         models = await get_claude_models()
         listing = "\n".join(
-            f"{idx}. {'▶ ' if mid == CLAUDE_MODEL else ''}`{mid}`"
+            f"{idx}. {'▶ ' if mid == current_model else ''}`{mid}`"
             + (f" ({display_name})" if display_name != mid else "")
             for idx, (mid, display_name) in enumerate(models, start=1)
         )
         await ch.send(
-            f"**Claude models** (current: `{CLAUDE_MODEL}`):\n{listing}\n\n"
-            "Switch with `claude model <n|name>` or `engine claude model <n|name>`"
+            f"**Claude models** (this channel: `{current_model}` · global default: `{global_model}`):\n"
+            f"{listing}\n\n"
+            "Switch this channel with `claude model <n|name>` or "
+            "`engine claude model <n|name>`. "
+            "Switch global default with `engine global claude model <n|name>`."
         )
         return
     if lower in ("codex models", "cx models"):
+        channel_config = get_runtime_config(ch.id)
+        current_model = get_model_for_engine("codex", runtime_config=channel_config)
+        global_model = get_model_for_engine("codex")
         models = get_codex_models()
         def _ctx_label(ctx: int | None) -> str:
             if ctx is None:
                 return ""
             return f" ({ctx // 1000}K ctx)"
         listing = "\n".join(
-            f"{idx}. {'▶ ' if slug == CODEX_MODEL else ''}`{slug}`{_ctx_label(ctx)}"
+            f"{idx}. {'▶ ' if slug == current_model else ''}`{slug}`{_ctx_label(ctx)}"
             for idx, (slug, ctx) in enumerate(models, start=1)
         )
         await ch.send(
-            f"**Codex models** (current: `{CODEX_MODEL}`):\n{listing}\n\n"
-            "Switch with `codex model <n|name>` or `engine codex model <n|name>`"
+            f"**Codex models** (this channel: `{current_model}` · global default: `{global_model}`):\n"
+            f"{listing}\n\n"
+            "Switch this channel with `codex model <n|name>` or "
+            "`engine codex model <n|name>`. "
+            "Switch global default with `engine global codex model <n|name>`."
         )
         return
 
@@ -2913,8 +2989,13 @@ async def on_message(message: discord.Message):
     for _pfx, _engine in _model_prefixes.items():
         if lower.startswith(_pfx):
             selector = content[len(_pfx):].strip()
+            channel_config = get_runtime_config(ch.id)
             if not selector:
-                await ch.send(f"Usage: `{_pfx.strip()} <n|name>`\nCurrent — Claude: `{CLAUDE_MODEL}` · Codex: `{CODEX_MODEL}`")
+                await ch.send(
+                    f"Usage: `{_pfx.strip()} <n|name>`\n"
+                    f"This channel — Claude: `{channel_config['claude_model']}` · "
+                    f"Codex: `{channel_config['codex_model']}`"
+                )
                 return
             if _engine == "claude":
                 models = await get_claude_models()
@@ -2922,18 +3003,16 @@ async def on_message(message: discord.Message):
                 if err:
                     await ch.send(f"❌ {err}")
                     return
-                CLAUDE_MODEL = selected_model or CLAUDE_MODEL
-                _save_runtime_config()
-                await ch.send(f"✅ Claude model set to `{CLAUDE_MODEL}`")
+                updated = update_runtime_config(ch.id, claude_model=selected_model)
+                await ch.send(f"✅ This channel Claude model set to `{updated['claude_model']}`")
             else:
                 models = get_codex_models()
                 selected_model, err = resolve_model_selector(selector, models)
                 if err:
                     await ch.send(f"❌ {err}")
                     return
-                CODEX_MODEL = selected_model or CODEX_MODEL
-                _save_runtime_config()
-                await ch.send(f"✅ Codex model set to `{CODEX_MODEL}`")
+                updated = update_runtime_config(ch.id, codex_model=selected_model)
+                await ch.send(f"✅ This channel Codex model set to `{updated['codex_model']}`")
             return
 
     # ── Reasoning change (engine-specific) ─────────────────────────────
@@ -2948,16 +3027,19 @@ async def on_message(message: discord.Message):
         engine_token = reasoning_match.group(1).lower()
         selector = (reasoning_match.group(2) or "").strip()
         target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        channel_config = get_runtime_config(ch.id)
         if not selector:
             if target_engine == "claude":
                 await ch.send(
-                    f"Claude reasoning: `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
+                    f"Claude reasoning (this channel): "
+                    f"`{format_reasoning_effort(channel_config['claude_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('claude')}\n"
                     "Set with `claude reasoning <n|level>`"
                 )
             else:
                 await ch.send(
-                    f"Codex reasoning: `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n"
+                    f"Codex reasoning (this channel): "
+                    f"`{format_reasoning_effort(channel_config['codex_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('codex')}\n"
                     "Set with `codex reasoning <n|level>`"
                 )
@@ -2967,13 +3049,17 @@ async def on_message(message: discord.Message):
             await ch.send(f"❌ {err}")
             return
         if target_engine == "claude":
-            CLAUDE_REASONING_EFFORT = selected_effort
-            _save_runtime_config()
-            await ch.send(f"✅ Claude reasoning set to `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`")
+            updated = update_runtime_config(ch.id, claude_reasoning_effort=selected_effort)
+            await ch.send(
+                "✅ This channel Claude reasoning set to "
+                f"`{format_reasoning_effort(updated['claude_reasoning_effort'])}`"
+            )
             return
-        CODEX_REASONING_EFFORT = selected_effort
-        _save_runtime_config()
-        await ch.send(f"✅ Codex reasoning set to `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`")
+        updated = update_runtime_config(ch.id, codex_reasoning_effort=selected_effort)
+        await ch.send(
+            "✅ This channel Codex reasoning set to "
+            f"`{format_reasoning_effort(updated['codex_reasoning_effort'])}`"
+        )
         return
 
     # ── Default model change ────────────────────────────────────────────
@@ -2984,24 +3070,26 @@ async def on_message(message: discord.Message):
         else:
             prefix = "model"
         new_model = content[len(prefix):].strip()
-        default_engine = (DEFAULT_ENGINE or "").strip().lower()
+        channel_config = get_runtime_config(ch.id)
+        default_engine = _normalize_engine_name(channel_config.get("default_engine"))
         if not new_model:
             if default_engine == "claude":
-                current = CLAUDE_MODEL
+                current = str(channel_config["claude_model"])
             elif default_engine == "codex":
-                current = CODEX_MODEL
+                current = str(channel_config["codex_model"])
             else:
                 current = None
             if current:
                 await ch.send(
                     f"Usage: `{prefix} <n|name>`\n"
-                    f"Default engine: `{DEFAULT_ENGINE}` · Current model: `{current}`\n"
+                    f"This channel default engine: `{default_engine}` · Current model: `{current}`\n"
                     f"Use `claude model <n|name>` / `codex model <n|name>` to set explicitly."
                 )
             else:
                 await ch.send(
                     f"Usage: `{prefix} <n|name>`\n"
-                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model <n|name>` or `codex model <n|name>`."
+                    f"Default engine is `{default_engine}`. "
+                    "Use `claude model <n|name>` or `codex model <n|name>`."
                 )
             return
         if default_engine == "claude":
@@ -3010,9 +3098,11 @@ async def on_message(message: discord.Message):
             if err:
                 await ch.send(f"❌ {err}")
                 return
-            CLAUDE_MODEL = selected_model or CLAUDE_MODEL
-            _save_runtime_config()
-            await ch.send(f"✅ Default engine is **claude** — model set to `{CLAUDE_MODEL}`")
+            updated = update_runtime_config(ch.id, claude_model=selected_model)
+            await ch.send(
+                "✅ This channel default engine is **claude** — "
+                f"model set to `{updated['claude_model']}`"
+            )
             return
         if default_engine == "codex":
             models = get_codex_models()
@@ -3020,12 +3110,15 @@ async def on_message(message: discord.Message):
             if err:
                 await ch.send(f"❌ {err}")
                 return
-            CODEX_MODEL = selected_model or CODEX_MODEL
-            _save_runtime_config()
-            await ch.send(f"✅ Default engine is **codex** — model set to `{CODEX_MODEL}`")
+            updated = update_runtime_config(ch.id, codex_model=selected_model)
+            await ch.send(
+                "✅ This channel default engine is **codex** — "
+                f"model set to `{updated['codex_model']}`"
+            )
             return
         await ch.send(
-            f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude model <n|name>` or `codex model <n|name>`."
+            f"❌ Default engine is `{default_engine}`. "
+            "Use `claude model <n|name>` or `codex model <n|name>`."
         )
         return
 
@@ -3034,24 +3127,28 @@ async def on_message(message: discord.Message):
     if lower == "reasoning" or lower.startswith("reasoning ") or lower == "default reasoning" or lower.startswith("default reasoning "):
         prefix = "default reasoning" if lower.startswith("default reasoning") else "reasoning"
         new_effort = content[len(prefix):].strip()
-        default_engine = (DEFAULT_ENGINE or "").strip().lower()
+        channel_config = get_runtime_config(ch.id)
+        default_engine = _normalize_engine_name(channel_config.get("default_engine"))
         if not new_effort:
             if default_engine == "claude":
                 await ch.send(
                     f"Usage: `{prefix} <n|level>`\n"
-                    f"Default engine: `claude` · Current reasoning: `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`\n"
+                    f"This channel default engine: `claude` · Current reasoning: "
+                    f"`{format_reasoning_effort(channel_config['claude_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('claude')}"
                 )
             elif default_engine == "codex":
                 await ch.send(
                     f"Usage: `{prefix} <n|level>`\n"
-                    f"Default engine: `codex` · Current reasoning: `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`\n"
+                    f"This channel default engine: `codex` · Current reasoning: "
+                    f"`{format_reasoning_effort(channel_config['codex_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('codex')}"
                 )
             else:
                 await ch.send(
                     f"Usage: `{prefix} <n|level>`\n"
-                    f"DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
+                    f"Default engine is `{default_engine}`. "
+                    "Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
                 )
             return
         if default_engine == "claude":
@@ -3059,10 +3156,10 @@ async def on_message(message: discord.Message):
             if err:
                 await ch.send(f"❌ {err}")
                 return
-            CLAUDE_REASONING_EFFORT = selected_effort
-            _save_runtime_config()
+            updated = update_runtime_config(ch.id, claude_reasoning_effort=selected_effort)
             await ch.send(
-                f"✅ Default engine is **claude** — reasoning set to `{format_reasoning_effort(CLAUDE_REASONING_EFFORT)}`"
+                "✅ This channel default engine is **claude** — reasoning set to "
+                f"`{format_reasoning_effort(updated['claude_reasoning_effort'])}`"
             )
             return
         if default_engine == "codex":
@@ -3070,14 +3167,15 @@ async def on_message(message: discord.Message):
             if err:
                 await ch.send(f"❌ {err}")
                 return
-            CODEX_REASONING_EFFORT = selected_effort
-            _save_runtime_config()
+            updated = update_runtime_config(ch.id, codex_reasoning_effort=selected_effort)
             await ch.send(
-                f"✅ Default engine is **codex** — reasoning set to `{format_reasoning_effort(CODEX_REASONING_EFFORT)}`"
+                "✅ This channel default engine is **codex** — reasoning set to "
+                f"`{format_reasoning_effort(updated['codex_reasoning_effort'])}`"
             )
             return
         await ch.send(
-            f"❌ DEFAULT_ENGINE is `{DEFAULT_ENGINE}`. Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
+            f"❌ Default engine is `{default_engine}`. "
+            "Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
         )
         return
 
@@ -3142,7 +3240,7 @@ async def on_message(message: discord.Message):
         run_git(["git", "checkout", branch], cwd)
         # Parse engine from branch name (auto/engine/slug-timestamp)
         parts = branch.split("/")
-        engine = parts[1] if len(parts) >= 3 else DEFAULT_ENGINE
+        engine = _normalize_engine_name(parts[1] if len(parts) >= 3 else get_default_engine(ch.id))
         active_sessions[ch.id] = {
             "branch": branch,
             "engine": engine,
@@ -3150,6 +3248,7 @@ async def on_message(message: discord.Message):
             "turns": 0,
             "phase": "working",
             "cwd": cwd,
+            "runtime_config": get_runtime_config(ch.id),
         }
         diff_stat = get_diff_stat(cwd)
         await ch.send(f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n"
@@ -3160,12 +3259,14 @@ async def on_message(message: discord.Message):
     if session and session.get("phase") != "review":
         engine = session["engine"]
         label = "Claude Code" if engine == "claude" else "Codex CLI"
+        session_runtime_config = get_session_runtime_config(session, ch.id)
+        session_model = get_model_for_engine(engine, runtime_config=session_runtime_config, ch_id=ch.id)
         session["turns"] += 1
 
         images = await download_attachments(message)
         follow_up_task = content or "Describe and analyze these images"
 
-        await ch.send(f"🔄 **{label}** follow-up (turn {session['turns']})...\n"
+        await ch.send(f"🔄 **{label}** (`{session_model}`) follow-up (turn {session['turns']})...\n"
                        f"> {truncate(follow_up_task, 200)}"
                        + (f"\n📎 {len(images)} image(s) attached" if images else ""))
         stop_event = asyncio.Event()
@@ -3179,6 +3280,7 @@ async def on_message(message: discord.Message):
                 images=images,
                 cwd=cwd,
                 stop_event=stop_event,
+                runtime_config=session_runtime_config,
             )
         except Exception as e:
             await ch.send(f"❌ Error: `{e}`")
@@ -3199,7 +3301,11 @@ async def on_message(message: discord.Message):
 
     # ── New task → start a session ────────────────────────────────────────
     images = await download_attachments(message)
-    engine, task = parse_engine_and_task(content) if content else (DEFAULT_ENGINE, "")
+    channel_runtime = get_runtime_config(ch.id)
+    default_engine = get_default_engine(ch.id)
+    engine, task = parse_engine_and_task(content, default_engine) if content else (default_engine, "")
+    runtime_config = dict(channel_runtime)
+    model = get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch.id)
     if not task and images:
         task = "Describe and analyze these images"
     if not task:
@@ -3212,7 +3318,7 @@ async def on_message(message: discord.Message):
         await ch.send("⚠️ Previous session discarded.\n")
 
     label = "Claude Code" if engine == "claude" else "Codex CLI"
-    await ch.send(f"🧠 **{label}** starting on `{cwd}`...\n> {truncate(task, 200)}"
+    await ch.send(f"🧠 **{label}** (`{model}`) starting on `{cwd}`...\n> {truncate(task, 200)}"
                    + (f"\n📎 {len(images)} image(s) attached" if images else ""))
 
     try:
@@ -3233,6 +3339,7 @@ async def on_message(message: discord.Message):
             images=images,
             cwd=cwd,
             stop_event=stop_event,
+            runtime_config=runtime_config,
         )
     except Exception as e:
         await ch.send(f"❌ {label} error: `{e}`")
@@ -3269,6 +3376,7 @@ async def on_message(message: discord.Message):
         "turns": 1,
         "phase": "working",
         "cwd": cwd,
+        "runtime_config": runtime_config,
     }
 
     auto_commit(task, 1, cwd)
