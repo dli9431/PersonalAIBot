@@ -125,6 +125,7 @@ bash start.sh
 ```
 add input validation to the signup form
 claude: write tests for the auth module
+claude code: improve caching in the API client
 codex: refactor the database queries
 cc: fix the CSS on the navbar
 cx: add error handling to the API routes
@@ -147,7 +148,7 @@ Use `plan show` to inspect saved plan context and `plan clear` to remove it manu
 
 ### Iterate
 
-Send follow-up messages freely — the engine keeps session context via `--resume`.
+Send follow-up messages freely — the engine keeps session context (`claude --continue`, `codex exec resume --last`).
 If a run times out, the bot saves a short context snapshot and injects it on resume. Clear it with `context clear` if needed.
 
 ```
@@ -159,7 +160,7 @@ make the error messages more descriptive
 
 ```
 done      → shows full diff + push prompt
-yes       → commit, push & merge to dev/main
+yes       → commit + push, then merge to dev (or choose merge target)
 no        → discard all changes
 abort     → discard immediately (any time)
 ```
@@ -184,7 +185,7 @@ pr main               → open a GitHub PR targeting main
 | Command | Description |
 |---------|-------------|
 | `<task>` | Run with the default engine |
-| `claude: <task>` / `cc: <task>` | Run with Claude Code |
+| `claude: <task>` / `cc: <task>` / `claude code: <task>` | Run with Claude Code |
 | `codex: <task>` / `cx: <task>` / `openai: <task>` | Run with Codex CLI |
 | `plan: <task>` | Planning mode with default engine/model; saves plan context |
 | `do: [extra instructions]` | Execute saved plan context with default engine/model, then clear it |
@@ -196,12 +197,12 @@ pr main               → open a GitHub PR targeting main
 | `<follow-up>` | Continue with same engine and context |
 | `stop` | Cancel the currently running engine turn |
 | `diff` | Peek at current changes |
-| `undo` | Revert the last engine run |
+| `undo` | Discard uncommitted working-tree changes in the active session |
 | `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
-| `context clear` | Forget saved timeout/resume context |
+| `context clear` | Forget saved timeout/resume context (`resume clear` / `clear context` aliases) |
 | `plan show` | Show saved plan context for this channel |
-| `plan clear` | Clear saved plan context without executing it |
+| `plan clear` | Clear saved plan context without executing it (`clear plan` alias) |
 | `abort` | Discard all changes immediately |
 
 ### Ending a session
@@ -209,7 +210,7 @@ pr main               → open a GitHub PR targeting main
 | Command | Description |
 |---------|-------------|
 | `done` | Show full diff and prompt for push |
-| `yes` / `push` | Commit, push & merge |
+| `yes` / `push` | Commit + push, then merge to `DEV_BRANCH` if it exists (otherwise asks for merge target) |
 | `no` / `discard` | Discard all changes |
 | `skip` | Commit & push, skip the merge step |
 
@@ -228,8 +229,8 @@ pr main               → open a GitHub PR targeting main
 | Command | Description |
 |---------|-------------|
 | `branches` | List recent branches (assigns `N` references) |
-| `switch <branch\|N>` | Switch branches (auto-commit if in session) |
-| `branch delete <name\|N> [local\|remote\|both] [force]` | Delete a branch (checks if merged first) |
+| `switch <branch\|N>` / `branch switch <branch\|N>` | Switch branches (auto-commit if in session) |
+| `branch delete <name\|N> [local\|remote\|both] [force]` / `branch del ...` | Delete a branch (checks if merged first, unless `force`) |
 | `branch protect [list\|add\|remove\|clear\|reset]` | Manage protected branches (blocks deletion) |
 
 ### Multi-repo
@@ -266,11 +267,13 @@ pr main               → open a GitHub PR targeting main
 | `engine claude model <n\|name>` | Set default engine to Claude and choose model by number or name |
 | `engine codex model <n\|name>` | Set default engine to Codex and choose model by number or name |
 | `claude reasoning [n\|level]` | View/set Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
-| `codex reasoning [n\|level]` | View/set Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
+| `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
 | `engine claude reasoning <n\|level>` | Set default engine to Claude and set its reasoning effort |
 | `engine codex reasoning <n\|level>` | Set default engine to Codex and set its reasoning effort |
 | `model <n\|name>` | Set model for the default engine by number or name |
+| `default model <n\|name>` | Alias for `model <n\|name>` |
 | `reasoning [n\|level]` | View/set reasoning effort for the default engine |
+| `default reasoning [n\|level]` | Alias for `reasoning [n\|level]` |
 | `status` | Current branch and working tree |
 | `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
@@ -281,8 +284,8 @@ Engine/model/reasoning selections are persisted in `.bot_state.json` and restore
 
 | Command | Description |
 |---------|-------------|
-| `claude login` | Re-authenticate Claude Code |
-| `codex login` | Re-authenticate Codex CLI |
+| `claude login` / `cc login` | Re-authenticate Claude Code |
+| `codex login` / `cx login` / `openai login` | Re-authenticate Codex CLI |
 | `login both` | Re-authenticate both |
 | `restart` | Restart the bot process |
 
@@ -364,7 +367,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 - **ALLOWED_USER_ID gate** — every message is checked against your Discord user ID; no one else can trigger anything
 - **Tool deny list** — Claude Code is blocked from `rm`, `sudo`, `curl`, `wget`, and `WebFetch` by default
 - **Codex sandbox** — `workspace-write` mode with network off, configured via `~/.codex/config.toml` (see `codex-config-example.toml`)
-- **Feature branches only** — the bot never commits directly to main or dev; you always review a diff first
+- **Session tasks use feature branches** — task/follow-up runs branch off your base and show diff before merge; direct commits to other branches only happen if you explicitly run manual git commands (for example `repo <n> commit`)
 - **No secrets in code** — all tokens loaded from `.env` at runtime, never hardcoded, `.env` gitignored
 - **SSH auth for git** — no stored HTTPS passwords
 
@@ -383,7 +386,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 - [ ] `.env` in `.gitignore`
 - [ ] Claude Code: `rm`, `sudo`, `curl`, `wget` denied via `CLAUDE_DENIED_TOOLS`
 - [ ] Codex: copy `codex-config-example.toml` → `~/.codex/config.toml` for workspace-write sandbox + no network
-- [ ] All git work on feature branches, never main directly
+- [ ] Session task work stays on feature branches (avoid direct commits on `main`/`dev` unless intentional)
 - [ ] Review the diff before saying `yes`
 - [ ] SSH keys for git auth (not HTTPS with stored password)
 - [ ] (WSL) Repos under WSL filesystem (`/home/...`), not `/mnt/c/`
