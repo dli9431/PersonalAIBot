@@ -1452,7 +1452,12 @@ async def run_claude_code(
         "--model", model,
         "--verbose",
         "--output-format", "stream-json",
-        "--max-turns", "10",
+        "--max-turns", "25",
+        "--append-system-prompt",
+        "You MUST implement changes, not just read or analyze files. "
+        "Do not stop after reading context — use Edit/Write tools to "
+        "make the requested code changes. If the task asks you to add, "
+        "modify, or fix something, you must edit the relevant files.",
     ])
     if reasoning_effort:
         cmd.extend(["--effort", reasoning_effort])
