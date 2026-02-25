@@ -3376,7 +3376,7 @@ async def on_message(message: discord.Message):
         "turns": 1,
         "phase": "working",
         "cwd": cwd,
-        "runtime_config": runtime_config,
+        "runtime_config": dict(runtime_config),
     }
 
     auto_commit(task, 1, cwd)
