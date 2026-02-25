@@ -42,7 +42,7 @@ MAX_DIFF_CHARS = 1800
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
-# Claude Code (mutable at runtime via Discord `claude model` / `model` commands)
+# Claude Code (global fallback defaults; channels can override at runtime)
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "sonnet")
 CLAUDE_REASONING_EFFORT = os.getenv("CLAUDE_REASONING_EFFORT", "").strip().lower() or None
 CLAUDE_ALLOWED_TOOLS = os.getenv("CLAUDE_ALLOWED_TOOLS",
@@ -118,6 +118,8 @@ last_pushed: dict[int, str] = {}
 channel_cwd: dict[int, str] = {}
 # channel_id → numbered branch list from last `branches` command
 branch_listing: dict[int, list[str]] = {}
+# channel_id → runtime config override (engine/model/reasoning)
+CHANNEL_RUNTIME_CONFIGS: dict[int, dict] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -273,39 +275,134 @@ def _set_protected_branches(branches: list[str], save: bool = True) -> None:
         _save_state(state)
 
 
-def _save_runtime_config() -> None:
-    data = _load_state()
-    data["runtime_config"] = {
-        "default_engine": "codex" if (DEFAULT_ENGINE or "").strip().lower() == "codex" else "claude",
+def _normalize_engine_name(engine: object | None) -> str:
+    if isinstance(engine, str) and engine.strip().lower() == "codex":
+        return "codex"
+    return "claude"
+
+
+def _normalize_model_name(value: object | None, fallback: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _normalize_reasoning_effort(value: object | None) -> str | None:
+    return value.strip().lower() if isinstance(value, str) and value.strip() else None
+
+
+def _global_runtime_config() -> dict[str, str | None]:
+    return {
+        "default_engine": _normalize_engine_name(DEFAULT_ENGINE),
         "claude_model": CLAUDE_MODEL,
         "codex_model": CODEX_MODEL,
         "claude_reasoning_effort": CLAUDE_REASONING_EFFORT,
         "codex_reasoning_effort": CODEX_REASONING_EFFORT,
     }
+
+
+def _coerce_runtime_config(
+    config: object | None,
+    fallback: dict[str, str | None] | None = None,
+) -> dict[str, str | None]:
+    base = dict(fallback or _global_runtime_config())
+    if not isinstance(config, dict):
+        return base
+
+    if "default_engine" in config:
+        base["default_engine"] = _normalize_engine_name(config.get("default_engine"))
+
+    base["claude_model"] = _normalize_model_name(
+        config.get("claude_model"),
+        str(base.get("claude_model") or CLAUDE_MODEL),
+    )
+    base["codex_model"] = _normalize_model_name(
+        config.get("codex_model"),
+        str(base.get("codex_model") or CODEX_MODEL),
+    )
+
+    if "claude_reasoning_effort" in config:
+        base["claude_reasoning_effort"] = _normalize_reasoning_effort(
+            config.get("claude_reasoning_effort")
+        )
+    if "codex_reasoning_effort" in config:
+        base["codex_reasoning_effort"] = _normalize_reasoning_effort(
+            config.get("codex_reasoning_effort")
+        )
+    return base
+
+
+def _apply_global_runtime_config(config: dict[str, str | None]) -> None:
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT
+    DEFAULT_ENGINE = _normalize_engine_name(config.get("default_engine"))
+    CLAUDE_MODEL = _normalize_model_name(config.get("claude_model"), CLAUDE_MODEL)
+    CODEX_MODEL = _normalize_model_name(config.get("codex_model"), CODEX_MODEL)
+    CLAUDE_REASONING_EFFORT = _normalize_reasoning_effort(config.get("claude_reasoning_effort"))
+    CODEX_REASONING_EFFORT = _normalize_reasoning_effort(config.get("codex_reasoning_effort"))
+
+
+def get_runtime_config(ch_id: int | None = None) -> dict[str, str | None]:
+    global_config = _global_runtime_config()
+    if ch_id is None:
+        return dict(global_config)
+    return _coerce_runtime_config(CHANNEL_RUNTIME_CONFIGS.get(ch_id), fallback=global_config)
+
+
+def set_runtime_config(ch_id: int | None, config: dict[str, str | None]) -> dict[str, str | None]:
+    global_config = _global_runtime_config()
+    normalized = _coerce_runtime_config(config, fallback=global_config)
+    if ch_id is None:
+        _apply_global_runtime_config(normalized)
+    else:
+        if normalized == global_config:
+            CHANNEL_RUNTIME_CONFIGS.pop(ch_id, None)
+        else:
+            CHANNEL_RUNTIME_CONFIGS[ch_id] = normalized
+    _save_runtime_config()
+    return get_runtime_config(ch_id)
+
+
+def update_runtime_config(ch_id: int | None, **updates: object) -> dict[str, str | None]:
+    config = get_runtime_config(ch_id)
+    config.update(updates)
+    return set_runtime_config(ch_id, config)
+
+
+def runtime_scope_name(ch_id: int | None) -> str:
+    return "global default" if ch_id is None else "this channel"
+
+
+def _save_runtime_config() -> None:
+    data = _load_state()
+    global_config = _global_runtime_config()
+    data["runtime_config"] = global_config
+    channel_configs: dict[str, dict[str, str | None]] = {}
+    for ch_id, config in CHANNEL_RUNTIME_CONFIGS.items():
+        normalized = _coerce_runtime_config(config, fallback=global_config)
+        if normalized != global_config:
+            channel_configs[str(ch_id)] = normalized
+    if channel_configs:
+        data["channel_runtime_configs"] = channel_configs
+    else:
+        data.pop("channel_runtime_configs", None)
     _save_state(data)
 
 
 def _load_runtime_config() -> None:
-    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT
+    global CHANNEL_RUNTIME_CONFIGS
     data = _load_state()
-    config = data.get("runtime_config")
-    if not isinstance(config, dict):
+    global_config = _coerce_runtime_config(data.get("runtime_config"), fallback=_global_runtime_config())
+    _apply_global_runtime_config(global_config)
+    CHANNEL_RUNTIME_CONFIGS = {}
+    scoped_configs = data.get("channel_runtime_configs")
+    if not isinstance(scoped_configs, dict):
         return
-    default_engine = config.get("default_engine")
-    if isinstance(default_engine, str) and default_engine.strip():
-        DEFAULT_ENGINE = "codex" if default_engine.strip().lower() == "codex" else "claude"
-    claude_model = config.get("claude_model")
-    if isinstance(claude_model, str) and claude_model.strip():
-        CLAUDE_MODEL = claude_model.strip()
-    codex_model = config.get("codex_model")
-    if isinstance(codex_model, str) and codex_model.strip():
-        CODEX_MODEL = codex_model.strip()
-    if "claude_reasoning_effort" in config:
-        value = config.get("claude_reasoning_effort")
-        CLAUDE_REASONING_EFFORT = value.strip().lower() if isinstance(value, str) and value.strip() else None
-    if "codex_reasoning_effort" in config:
-        value = config.get("codex_reasoning_effort")
-        CODEX_REASONING_EFFORT = value.strip().lower() if isinstance(value, str) and value.strip() else None
+    for ch_id, config in scoped_configs.items():
+        try:
+            ch_num = int(ch_id)
+        except (TypeError, ValueError):
+            continue
+        CHANNEL_RUNTIME_CONFIGS[ch_num] = _coerce_runtime_config(config, fallback=global_config)
 
 
 def _init_protected_branches() -> None:
@@ -442,13 +539,14 @@ def save_plan_context(
     engine: str,
     request: str,
     plan_output: object | None,
+    runtime_config: dict[str, str | None] | None = None,
 ) -> None:
     data = _load_state()
     contexts = data.setdefault("plan_contexts", {})
     entry = {
         "ts": int(time.time()),
         "engine": engine,
-        "model": get_model_for_engine(engine),
+        "model": get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch_id),
         "cwd": cwd or "",
         "branch": _safe_current_branch(cwd),
         "request": request.strip(),
@@ -699,7 +797,7 @@ def branch_merged_status(branch: str, path: str | None = None) -> tuple[bool, bo
     return local_merged, remote_merged
 
 
-def parse_engine_and_task(content: str) -> tuple[str, str]:
+def parse_engine_and_task(content: str, default_engine: str) -> tuple[str, str]:
     lower = content.lower()
     for prefix in ("claude:", "cc:", "claude code:"):
         if lower.startswith(prefix):
@@ -707,15 +805,35 @@ def parse_engine_and_task(content: str) -> tuple[str, str]:
     for prefix in ("codex:", "cx:", "openai:"):
         if lower.startswith(prefix):
             return "codex", content[len(prefix):].strip()
-    return DEFAULT_ENGINE, content
+    return _normalize_engine_name(default_engine), content
 
 
-def get_default_engine() -> str:
-    return "codex" if (DEFAULT_ENGINE or "").strip().lower() == "codex" else "claude"
+def get_default_engine(ch_id: int | None = None) -> str:
+    return _normalize_engine_name(get_runtime_config(ch_id).get("default_engine"))
 
 
-def get_model_for_engine(engine: str) -> str:
-    return CODEX_MODEL if engine == "codex" else CLAUDE_MODEL
+def get_model_for_engine(
+    engine: str,
+    runtime_config: dict[str, str | None] | None = None,
+    ch_id: int | None = None,
+) -> str:
+    config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
+    return str(config["codex_model"] if _normalize_engine_name(engine) == "codex" else config["claude_model"])
+
+
+def get_reasoning_for_engine(
+    engine: str,
+    runtime_config: dict[str, str | None] | None = None,
+    ch_id: int | None = None,
+) -> str | None:
+    config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
+    key = "codex_reasoning_effort" if _normalize_engine_name(engine) == "codex" else "claude_reasoning_effort"
+    value = config.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def get_session_runtime_config(session: dict, ch_id: int) -> dict[str, str | None]:
+    return _coerce_runtime_config(session.get("runtime_config"), fallback=get_runtime_config(ch_id))
 
 
 def get_engine_label(engine: str) -> str:
@@ -1310,8 +1428,17 @@ async def _run_claude_streaming(
     return output
 
 
-async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
+async def run_claude_code(
+    task: str,
+    ch: discord.TextChannel,
+    resume: bool = False,
+    images: list[str] | None = None,
+    cwd: str | None = None,
+    runtime_config: dict[str, str | None] | None = None,
+) -> str:
     """Run Claude Code. If resume=True, uses --continue to continue last session."""
+    model = get_model_for_engine("claude", runtime_config=runtime_config, ch_id=ch.id)
+    reasoning_effort = get_reasoning_for_engine("claude", runtime_config=runtime_config, ch_id=ch.id)
     if images:
         img_lines = "\n".join(f"- {p}" for p in images)
         task = f"Examine the image(s) at the following path(s) using the Read tool:\n{img_lines}\n\n{task}"
@@ -1322,13 +1449,13 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
         cmd.extend(["-p", task])
 
     cmd.extend([
-        "--model", CLAUDE_MODEL,
+        "--model", model,
         "--verbose",
         "--output-format", "stream-json",
         "--max-turns", "10",
     ])
-    if CLAUDE_REASONING_EFFORT:
-        cmd.extend(["--effort", CLAUDE_REASONING_EFFORT])
+    if reasoning_effort:
+        cmd.extend(["--effort", reasoning_effort])
     if CLAUDE_ALLOWED_TOOLS:
         cmd.append("--allowedTools")
         cmd.extend(CLAUDE_ALLOWED_TOOLS)
@@ -1339,22 +1466,31 @@ async def run_claude_code(task: str, ch: discord.TextChannel, resume: bool = Fal
     return await _run_claude_streaming(cmd, ch, "Claude Code", cwd=cwd)
 
 
-async def run_codex(task: str, ch: discord.TextChannel, resume: bool = False, images: list[str] | None = None, cwd: str | None = None) -> str:
+async def run_codex(
+    task: str,
+    ch: discord.TextChannel,
+    resume: bool = False,
+    images: list[str] | None = None,
+    cwd: str | None = None,
+    runtime_config: dict[str, str | None] | None = None,
+) -> str:
     """Run Codex CLI. If resume=True, uses exec resume --last for context."""
+    model = get_model_for_engine("codex", runtime_config=runtime_config, ch_id=ch.id)
+    reasoning_effort = get_reasoning_for_engine("codex", runtime_config=runtime_config, ch_id=ch.id)
     if resume:
         cmd = [
             "codex", "exec", "resume", "--last",
             "--full-auto",
-            "--model", CODEX_MODEL,
+            "--model", model,
         ]
     else:
         cmd = [
             "codex", "exec",
             "--full-auto",
-            "--model", CODEX_MODEL,
+            "--model", model,
         ]
-    if CODEX_REASONING_EFFORT:
-        cmd.extend(["-c", f"model_reasoning_effort=\"{CODEX_REASONING_EFFORT}\""])
+    if reasoning_effort:
+        cmd.extend(["-c", f"model_reasoning_effort=\"{reasoning_effort}\""])
     if images:
         cmd.extend(["--image", ",".join(images)])
     cmd.append(task)
@@ -1373,8 +1509,10 @@ async def run_engine(
     images: list[str] | None = None,
     cwd: str | None = None,
     stop_event: asyncio.Event | None = None,
+    runtime_config: dict[str, str | None] | None = None,
 ) -> str:
     runner = run_codex if engine == "codex" else run_claude_code
+    run_config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch.id))
 
     if stop_event and stop_event.is_set():
         return "(stopped)"
@@ -1384,7 +1522,7 @@ async def run_engine(
         task = build_resume_prompt(task, ch.id, cwd, engine)
 
     try:
-        output = await runner(task, ch, resume, images, cwd=cwd)
+        output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
         if stop_event and stop_event.is_set():
             return "(stopped)"
         clear_resume_context(ch.id)
@@ -1401,7 +1539,13 @@ async def run_engine(
             await ch.send(f"⏳ Timed out — saved context and auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
             try:
                 resume_task = build_resume_prompt("continue where you left off", ch.id, cwd, engine)
-                output = await runner(resume_task, ch, resume=True, cwd=cwd)
+                output = await runner(
+                    resume_task,
+                    ch,
+                    resume=True,
+                    cwd=cwd,
+                    runtime_config=run_config,
+                )
                 if stop_event and stop_event.is_set():
                     return "(stopped)"
                 clear_resume_context(ch.id)
@@ -1554,8 +1698,8 @@ Type follow-ups freely — engine keeps context
 `pr <target>` — open a pull request"""
 
 
-def help_text_1() -> str:
-    return HELP_TEXT_1_TEMPLATE.format(default=get_default_engine())
+def help_text_1(ch_id: int | None = None) -> str:
+    return HELP_TEXT_1_TEMPLATE.format(default=f"{get_default_engine(ch_id)} · this channel")
 
 HELP_TEXT_2 = """**Branches:**
 `branches` — list branches (use `N` in commands)
@@ -1599,7 +1743,8 @@ def _help_embed(title: str, text: str) -> discord.Embed:
 async def ensure_pinned_help(channel: discord.abc.Messageable) -> bool:
     """Ensure help messages are pinned and up to date. Returns True if changed."""
     changed = False
-    current_help_1 = help_text_1()
+    channel_id = getattr(channel, "id", None)
+    current_help_1 = help_text_1(channel_id if isinstance(channel_id, int) else None)
 
     # Fetch existing pins — if forbidden, fall back to plain text
     help_by_title: dict[str, list[discord.Message]] = {
@@ -1677,10 +1822,15 @@ async def on_ready():
     ssh_ok = check_github_ssh()
     claude_ok, claude_status = check_claude_cli()
     codex_ok, codex_status = check_codex_cli()
+    global_config = get_runtime_config(None)
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user  : {ALLOWED_USER_ID}")
-    print(f"   Default engine: {DEFAULT_ENGINE}")
-    print(f"   Claude: {CLAUDE_MODEL} · Codex: {CODEX_MODEL}")
+    print(f"   Default engine: {global_config['default_engine']} (global)")
+    print(
+        f"   Claude: {global_config['claude_model']} · "
+        f"Codex: {global_config['codex_model']} (global)"
+    )
+    print(f"   Channel runtime overrides: {len(CHANNEL_RUNTIME_CONFIGS)}")
     print(f"   gh CLI        : {'yes' if has_gh_cli() else 'no'}")
     print(f"   GitHub SSH    : {'yes' if ssh_ok else '⚠️  FAILED'}")
     print(f"   Claude CLI    : {claude_status}")
@@ -1768,7 +1918,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message: discord.Message):
-    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT, _restart_on_close
+    global _restart_on_close
     if message.author.bot or not is_authorised(message):
         return
 
