@@ -120,7 +120,7 @@ channel_cwd: dict[int, str] = {}
 branch_listing: dict[int, list[str]] = {}
 # channel_id → runtime config override (engine/model/reasoning)
 CHANNEL_RUNTIME_CONFIGS: dict[int, dict] = {}
-# channel_id → token usage dict from last Claude Code run
+# channel_id → token usage dict from last engine run (includes "engine")
 channel_last_usage: dict[int, dict] = {}
 
 
@@ -274,6 +274,8 @@ def _absorb_usage_into_session(session: dict, ch_id: int) -> None:
     """Accumulate the last engine run's token usage into the session's running total."""
     last = channel_last_usage.get(ch_id, {})
     if not last:
+        return
+    if _normalize_engine_name(last.get("engine")) != _normalize_engine_name(session.get("engine")):
         return
     total = session.setdefault("total_usage", {})
     for key in ("input_tokens", "output_tokens", "cache_read", "cache_write"):
@@ -1462,9 +1464,10 @@ async def _run_claude_streaming(
         except discord.HTTPException:
             pass
 
-    if result_usage:
-        channel_last_usage[ch.id] = result_usage
-        _accumulate_global_usage("claude", result_usage)
+    usage_snapshot = {"engine": "claude"}
+    usage_snapshot.update(result_usage)
+    channel_last_usage[ch.id] = usage_snapshot
+    _accumulate_global_usage("claude", result_usage)
 
     stderr = b"".join(stderr_chunks).decode(errors="replace")
     output = final_result or "".join(accumulated_text) or "(no output)"
@@ -1546,7 +1549,10 @@ async def run_codex(
         cmd.extend(["--image", ",".join(images)])
     cmd.append(task)
 
-    return await _run_with_live_output(cmd, ch, "Codex CLI", cwd=cwd)
+    output = await _run_with_live_output(cmd, ch, "Codex CLI", cwd=cwd)
+    channel_last_usage[ch.id] = {"engine": "codex"}
+    _accumulate_global_usage("codex", {})
+    return output
 
 
 MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
@@ -1571,6 +1577,8 @@ async def run_engine(
     raw_task = task
     if resume:
         task = build_resume_prompt(task, ch.id, cwd, engine)
+    # Prevent stale usage from a previous run leaking into this turn/session.
+    channel_last_usage[ch.id] = {"engine": engine}
 
     try:
         output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
@@ -2333,7 +2341,7 @@ async def on_message(message: discord.Message):
         stats = get_global_usage_stats()
         lines = ["📊 **Engine usage (all time)**"]
         if not stats:
-            lines.append("No usage recorded yet. Usage is tracked for Claude Code runs.")
+            lines.append("No usage recorded yet.")
         else:
             for eng, data in sorted(stats.items()):
                 in_tok = data.get("input_tokens", 0)
@@ -2345,7 +2353,7 @@ async def on_message(message: discord.Message):
                 if cache_r or cache_w:
                     line += f" · {cache_r:,} cache read / {cache_w:,} cache write"
                 lines.append(line)
-        if session and session.get("engine") == "claude":
+        if session:
             sess_usage = session.get("total_usage", {})
             in_tok = sess_usage.get("input_tokens", 0)
             out_tok = sess_usage.get("output_tokens", 0)
@@ -3460,7 +3468,9 @@ async def on_message(message: discord.Message):
         "phase": "working",
         "cwd": cwd,
         "runtime_config": dict(runtime_config),
+        "total_usage": {},
     }
+    _absorb_usage_into_session(active_sessions[ch.id], ch.id)
 
     auto_commit(task, 1, cwd)
     await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
