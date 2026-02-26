@@ -2101,7 +2101,7 @@ HELP_TEXT_2 = """**Branches:**
 `status` — current branch and working tree
 `usage` — engine/session token usage + remaining limits (best effort)
 `branches` — list branches (use `N` references)
-`pull [branch]` — pull latest changes
+`pull [branch|N]` — pull latest changes
 `doctor` — run CLI/repo diagnostics
 `help` — refresh pinned command reference
 
@@ -2949,9 +2949,20 @@ async def on_message(message: discord.Message):
         return
 
     if lower.startswith("pull"):
-        arg = lower[4:].strip()
-        if arg:
-            branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg, arg)
+        arg_raw = content[4:].strip()
+        arg_lower = arg_raw.lower()
+        if arg_raw:
+            branch = None
+            if arg_raw.startswith("#") or arg_raw.lstrip("#").isdigit():
+                numeric = arg_raw.lstrip("#")
+                if not arg_raw.startswith("#"):
+                    # Quick selector: pull 1 => dev, pull 2 => main.
+                    branch = {"1": DEV_BRANCH, "2": MAIN_BRANCH}.get(numeric)
+                if not branch:
+                    # Numbered ref from the last `branches` listing (supports #N).
+                    branch = resolve_branch(arg_raw, ch.id, cwd)
+            if not branch:
+                branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg_lower, arg_raw)
         else:
             branch = _resolve_checkout_branch(cwd) or current_branch(cwd) or DEV_BRANCH
         if not branch:
