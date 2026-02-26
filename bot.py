@@ -1781,7 +1781,7 @@ HELP_TEXT_2 = """**Branches:**
 `reasoning|default reasoning [n|level]` — view/set this channel default-engine reasoning
 `model|default model <n|name>` — set model for this channel default engine
 
-**Info:** `status` · `branches` · `pull [branch]` · `doctor` · `help`
+**Info:** `status` · `usage` · `branches` · `pull [branch]` · `doctor` · `help`
 
 **Login:** `claude|cc login` · `codex|cx|openai login` · `login both`
 **System:** `restart`"""
