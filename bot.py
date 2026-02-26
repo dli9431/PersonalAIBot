@@ -120,6 +120,8 @@ channel_cwd: dict[int, str] = {}
 branch_listing: dict[int, list[str]] = {}
 # channel_id → runtime config override (engine/model/reasoning)
 CHANNEL_RUNTIME_CONFIGS: dict[int, dict] = {}
+# channel_id → token usage dict from last Claude Code run
+channel_last_usage: dict[int, dict] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -245,6 +247,39 @@ def _save_state(state: dict) -> None:
         STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
     except OSError:
         pass
+
+
+def _accumulate_global_usage(engine: str, usage: dict) -> None:
+    """Add token counts from one run to persistent global usage stats."""
+    if not usage:
+        return
+    data = _load_state()
+    stats = data.setdefault("usage_stats", {})
+    eng = stats.setdefault(engine, {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read": 0, "cache_write": 0, "runs": 0,
+    })
+    eng["input_tokens"] += usage.get("input_tokens", 0)
+    eng["output_tokens"] += usage.get("output_tokens", 0)
+    eng["cache_read"] += usage.get("cache_read", 0)
+    eng["cache_write"] += usage.get("cache_write", 0)
+    eng["runs"] += 1
+    _save_state(data)
+
+
+def get_global_usage_stats() -> dict:
+    """Return persistent cumulative usage stats from bot state."""
+    return _load_state().get("usage_stats", {})
+
+
+def _absorb_usage_into_session(session: dict, ch_id: int) -> None:
+    """Accumulate the last engine run's token usage into the session's running total."""
+    last = channel_last_usage.get(ch_id, {})
+    if not last:
+        return
+    total = session.setdefault("total_usage", {})
+    for key in ("input_tokens", "output_tokens", "cache_read", "cache_write"):
+        total[key] = total.get(key, 0) + last.get(key, 0)
 
 
 PROTECTED_BRANCHES: list[str] = []
@@ -1353,6 +1388,7 @@ async def _run_claude_streaming(
     tool_activity: list[str] = []
     final_result: str | None = None
     stderr_chunks: list[bytes] = []
+    result_usage: dict = {}
     start = time.time()
     last_edit_time = 0.0
     last_content = ""
@@ -1385,6 +1421,14 @@ async def _run_claude_streaming(
                         tool_activity.append(item["name"])
             elif event_type == "result":
                 final_result = event.get("result", "")
+                usage_data = event.get("usage") or {}
+                if usage_data:
+                    result_usage.update({
+                        "input_tokens": usage_data.get("input_tokens", 0),
+                        "output_tokens": usage_data.get("output_tokens", 0),
+                        "cache_read": usage_data.get("cache_read_input_tokens", 0),
+                        "cache_write": usage_data.get("cache_creation_input_tokens", 0),
+                    })
 
             now = time.time()
             if now - last_edit_time >= STATUS_REFRESH:
@@ -1419,6 +1463,10 @@ async def _run_claude_streaming(
             await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)")
         except discord.HTTPException:
             pass
+
+    if result_usage:
+        channel_last_usage[ch.id] = result_usage
+        _accumulate_global_usage("claude", result_usage)
 
     stderr = b"".join(stderr_chunks).decode(errors="replace")
     output = final_result or "".join(accumulated_text) or "(no output)"
@@ -2221,6 +2269,11 @@ async def on_message(message: discord.Message):
                 f"\n📝 Active session: **{session['engine']}** (`{sess_model}`) · "
                 f"{session['turns']} turn(s)"
             )
+            sess_usage = session.get("total_usage", {})
+            in_tok = sess_usage.get("input_tokens", 0)
+            out_tok = sess_usage.get("output_tokens", 0)
+            if in_tok or out_tok:
+                sess_info += f" · {in_tok:,} in / {out_tok:,} out tokens"
         await ch.send(f"📍 `{cwd}`\n🌿 `{br}`{sess_info}\n"
                        f"```\n{st or '(clean)'}\n```")
         return
@@ -2276,6 +2329,32 @@ async def on_message(message: discord.Message):
                 fix_lines.append("Codex trust: run `codex` once interactively in each untrusted project directory.")
         if fix_lines:
             await ch.send("**Suggested fixes:**\n" + "\n".join(f"• {line}" for line in fix_lines))
+        return
+
+    if lower == "usage":
+        stats = get_global_usage_stats()
+        lines = ["📊 **Engine usage (all time)**"]
+        if not stats:
+            lines.append("No usage recorded yet. Usage is tracked for Claude Code runs.")
+        else:
+            for eng, data in sorted(stats.items()):
+                in_tok = data.get("input_tokens", 0)
+                out_tok = data.get("output_tokens", 0)
+                cache_r = data.get("cache_read", 0)
+                cache_w = data.get("cache_write", 0)
+                runs = data.get("runs", 0)
+                line = f"**{eng}**: {runs} run(s) · {in_tok:,} in / {out_tok:,} out"
+                if cache_r or cache_w:
+                    line += f" · {cache_r:,} cache read / {cache_w:,} cache write"
+                lines.append(line)
+        if session and session.get("engine") == "claude":
+            sess_usage = session.get("total_usage", {})
+            in_tok = sess_usage.get("input_tokens", 0)
+            out_tok = sess_usage.get("output_tokens", 0)
+            if in_tok or out_tok:
+                lines.append(f"\n📝 **Current session**: {in_tok:,} in / {out_tok:,} out tokens "
+                              f"({session['turns']} turn(s))")
+        await ch.send("\n".join(lines))
         return
 
     if lower in ("context clear", "resume clear", "clear context"):
@@ -3296,6 +3375,7 @@ async def on_message(message: discord.Message):
         if stop_event.is_set():
             return
 
+        _absorb_usage_into_session(session, ch.id)
         auto_commit(session["description"], session["turns"], cwd)
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
         stat = get_diff_stat(cwd)
