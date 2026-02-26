@@ -1936,6 +1936,24 @@ async def discard_changes(branch: str, path: str | None = None) -> str | None:
 
 # ── Merge / PR ────────────────────────────────────────────────────────────────
 
+def _detach_if_worktree_on_branch(branch: str, path: str | None = None) -> None:
+    """Detach the provided worktree if it's currently on the given branch."""
+    if not path:
+        return
+    # Never detach the canonical repo checkout unexpectedly.
+    if _canonical_repo(path) == path:
+        return
+    if not pathlib.Path(path).exists():
+        return
+    if current_branch(path) == branch:
+        run_git(["git", "checkout", "--detach"], path)
+
+
+def _missing_branch_error(msg: str) -> bool:
+    low = msg.lower()
+    return ("branch" in low and "not found" in low) or ("remote ref does not exist" in low)
+
+
 async def merge_branch(source: str, target: str, path: str | None = None) -> str:
     # Merge on the canonical repo to avoid "branch checked out in another worktree" errors
     canonical = _canonical_repo(path or REPO_PATH)
@@ -1962,9 +1980,27 @@ async def merge_branch(source: str, target: str, path: str | None = None) -> str
         if is_protected_branch(source):
             result += f"\n🛡️ Protected branch; skipping delete for `{source}`."
         else:
-            run_git(["git", "branch", "-D", source], canonical)
-            run_git(["git", "push", "origin", "--delete", source], canonical)
-            result += f"\n🗑️ Deleted branch `{source}`."
+            # If source is checked out in this channel's worktree, detach first so delete can succeed.
+            _detach_if_worktree_on_branch(source, path)
+            local_delete = run_git(["git", "branch", "-D", source], canonical)
+            remote_delete = run_git(["git", "push", "origin", "--delete", source], canonical)
+            local_msg = (local_delete.stderr or local_delete.stdout or "").strip()
+            remote_msg = (remote_delete.stderr or remote_delete.stdout or "").strip()
+            local_ok = local_delete.returncode == 0 or _missing_branch_error(local_msg)
+            remote_ok = remote_delete.returncode == 0 or _missing_branch_error(remote_msg)
+            if local_ok and remote_ok:
+                result += f"\n🗑️ Deleted branch `{source}`."
+            else:
+                if not local_ok:
+                    result += (
+                        f"\n⚠️ Local delete failed for `{source}`:\n"
+                        f"```\n{truncate(local_msg or 'unknown error', 200)}\n```"
+                    )
+                if not remote_ok:
+                    result += (
+                        f"\n⚠️ Remote delete failed for `{source}`:\n"
+                        f"```\n{truncate(remote_msg or 'unknown error', 200)}\n```"
+                    )
 
     # Pull the target branch so the local repo stays up to date
     run_git(["git", "pull", "--ff-only"], canonical)
