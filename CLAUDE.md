@@ -57,7 +57,7 @@ No build step, test suite, or linter is configured.
 **Task execution:** plain text, `claude: <task>`, `cc: <task>`, `codex: <task>`, `cx: <task>`, `openai: <task>`
 **Session control:** `stop`, `done`, `yes`/`push`/`approve`/`lgtm`/`ship it`, `no`/`discard`/`reject`/`nah`, `abort`, `skip`, `diff`, `undo`
 **Branch nav:** `branch switch <branch|N>`, `switch <branch|N>`, `cwd [n]`, `branches`, `branch delete <name|N> [local|remote|both] [force]`, `branch protect [list|add|remove|clear|reset]`
-**Git:** `merge <target>`, `merge src>tgt`, `merge src into tgt`, `pr <target>`, `pull [branch]`
+**Git:** `merge <target>`, `merge src>tgt`, `merge src into tgt`, `pr <target>`, `pull [branch|N]`
 **Multi-repo:** `repos`, `repo <n> status|diff|commit [msg]|push|branches`
 **Recovery:** `recover`, `recover <id>`, `recover drop <id>`
 **Config:** `claude models`, `codex models` — list available (numbered); `claude model <n|name>`, `cc model <n|name>`, `codex model <n|name>`, `cx model <n|name>`, `engine claude`, `engine codex`, `engine claude model <n|name>`, `engine codex model <n|name>`, `engine`
