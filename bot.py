@@ -2952,16 +2952,15 @@ async def on_message(message: discord.Message):
         arg_raw = content[4:].strip()
         arg_lower = arg_raw.lower()
         if arg_raw:
-            branch = None
-            if arg_raw.startswith("#") or arg_raw.lstrip("#").isdigit():
-                numeric = arg_raw.lstrip("#")
-                if not arg_raw.startswith("#"):
-                    # Quick selector: pull 1 => dev, pull 2 => main.
-                    branch = {"1": DEV_BRANCH, "2": MAIN_BRANCH}.get(numeric)
-                if not branch:
-                    # Numbered ref from the last `branches` listing (supports #N).
-                    branch = resolve_branch(arg_raw, ch.id, cwd)
-            if not branch:
+            if arg_raw.lstrip("#").isdigit():
+                # Numbered ref from the last `branches` listing (supports #N).
+                branch = resolve_branch(arg_raw, ch.id, cwd)
+                if branch is None:
+                    await ch.send(
+                        f"❌ `{arg_raw}` didn't match any branch. Run `branches` first to use `N` refs."
+                    )
+                    return
+            else:
                 branch = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(arg_lower, arg_raw)
         else:
             branch = _resolve_checkout_branch(cwd) or current_branch(cwd) or DEV_BRANCH
