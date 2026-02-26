@@ -156,6 +156,15 @@ also add client-side validation
 make the error messages more descriptive
 ```
 
+### Check usage and limits
+
+```
+usage
+```
+
+Shows all-time token usage per engine, live remaining usage limits for Claude/Codex (best effort),
+and current session token counts when available.
+
 ### Review and push
 
 ```
