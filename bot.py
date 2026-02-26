@@ -251,8 +251,6 @@ def _save_state(state: dict) -> None:
 
 def _accumulate_global_usage(engine: str, usage: dict) -> None:
     """Add token counts from one run to persistent global usage stats."""
-    if not usage:
-        return
     data = _load_state()
     stats = data.setdefault("usage_stats", {})
     eng = stats.setdefault(engine, {
