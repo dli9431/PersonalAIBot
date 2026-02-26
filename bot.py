@@ -464,6 +464,7 @@ def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
             branch = "?"
     channels[str(ch_id)] = {
         "cwd": cwd,
+        "repo": _canonical_repo(cwd),
         "branch": branch,
         "updated": int(time.time()),
     }
@@ -474,20 +475,33 @@ def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
 def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
     data = _load_state()
     channels = data.get("channels", {}) or {}
+    # Prune stale worktrees for all known repos on startup
+    pruned_repos: set[str] = set()
     for ch_id_str, info in channels.items():
         if isinstance(info, dict):
-            cwd = info.get("cwd")
+            # Fall back to canonical repo if the worktree path no longer exists
+            repo = info.get("repo") or _canonical_repo(info.get("cwd", ""))
+            cwd = info.get("cwd", "")
+            if cwd and not pathlib.Path(cwd).exists():
+                cwd = repo  # worktree gone, use canonical
             if cwd:
                 try:
                     channel_cwd[int(ch_id_str)] = cwd
                 except ValueError:
                     continue
+            if repo and repo not in pruned_repos and pathlib.Path(repo).exists():
+                prune_worktrees(repo)
+                pruned_repos.add(repo)
     last_id = data.get("last_active_channel")
     if last_id is None:
         return None, None, None, None
     info = channels.get(str(last_id)) or {}
     cwd = info.get("cwd")
+    repo = info.get("repo") or _canonical_repo(cwd or "")
     branch = info.get("branch")
+    # If cwd was a worktree that no longer exists, fall back to canonical
+    if cwd and not pathlib.Path(cwd).exists():
+        cwd = repo
     checkout_error = None
     if cwd and branch and pathlib.Path(cwd).exists():
         res = run_git(["git", "checkout", branch], cwd)
@@ -1863,18 +1877,22 @@ def create_branch(
     # Prefer the provided base branch (for saved plan execution), else resolve fallback.
     preferred_base = (base_branch or "").strip()
     base = None
-    if preferred_base and _ensure_local_branch(preferred_base, path):
+    canonical = _canonical_repo(path or REPO_PATH)
+    if preferred_base and _ensure_local_branch(preferred_base, canonical):
         base = preferred_base
     if not base:
-        base = _resolve_checkout_branch(path)
+        base = _resolve_checkout_branch(canonical)
     if not base:
         raise RuntimeError("No base branch found (missing dev/main and no local branches).")
-    checkout = run_git(["git", "checkout", base], path)
-    if checkout.returncode != 0:
-        err = (checkout.stderr or checkout.stdout or "").strip() or "checkout failed"
-        raise RuntimeError(f"Base checkout failed for `{base}`: {err}")
-    run_git(["git", "pull", "--ff-only"], path)
-    run_git(["git", "checkout", "-b", branch], path)
+    # Fetch the base so the new branch is up-to-date. Use canonical repo for fetch
+    # to avoid "branch already checked out in another worktree" errors.
+    run_git(["git", "fetch", "origin", base], canonical)
+    # Create feature branch directly from origin/<base> — works in worktrees
+    # without needing to checkout the base branch first.
+    create = run_git(["git", "checkout", "-b", branch, f"origin/{base}"], path)
+    if create.returncode != 0:
+        err = (create.stderr or create.stdout or "").strip() or "branch creation failed"
+        raise RuntimeError(f"Branch creation failed for `{branch}` from `origin/{base}`: {err}")
     return branch
 
 
@@ -1899,35 +1917,41 @@ async def commit_and_push(branch: str, description: str, path: str | None = None
 
 
 async def discard_changes(branch: str, path: str | None = None) -> str | None:
+    canonical = _canonical_repo(path or REPO_PATH)
     run_git(["git", "checkout", "."], path)
     run_git(["git", "clean", "-fd"], path)
-    target = _resolve_checkout_branch(path, avoid=branch)
+    target = _resolve_checkout_branch(canonical, avoid=branch)
     if target:
+        # In worktree context, checking out target may fail if it's used elsewhere;
+        # that's fine — the worktree will be removed by _end_session.
         run_git(["git", "checkout", target], path)
     current = current_branch(path)
     if is_protected_branch(branch):
         return current or target
     if current and current != branch:
-        run_git(["git", "branch", "-D", branch], path)
+        # Delete feature branch from canonical repo so it works even if worktree is detached
+        run_git(["git", "branch", "-D", branch], canonical)
     return current or target
 
 
 # ── Merge / PR ────────────────────────────────────────────────────────────────
 
 async def merge_branch(source: str, target: str, path: str | None = None) -> str:
-    run_git(["git", "fetch", "--all"], path)
-    run_git(["git", "checkout", target], path)
-    run_git(["git", "pull", "--ff-only"], path)
+    # Merge on the canonical repo to avoid "branch checked out in another worktree" errors
+    canonical = _canonical_repo(path or REPO_PATH)
+    run_git(["git", "fetch", "--all"], canonical)
+    run_git(["git", "checkout", target], canonical)
+    run_git(["git", "pull", "--ff-only"], canonical)
 
     merge = run_git(["git", "merge", source, "--no-ff",
-                      "-m", f"merge {source} into {target}"], path)
+                      "-m", f"merge {source} into {target}"], canonical)
     if merge.returncode != 0:
         msg = merge.stdout or merge.stderr or "unknown error"
-        run_git(["git", "merge", "--abort"], path)
+        run_git(["git", "merge", "--abort"], canonical)
         return (f"❌ Merge conflict `{source}` → `{target}`:\n"
                 f"```\n{truncate(msg, 500)}\n```\nAborted. Resolve at desktop.")
 
-    push = run_git(["git", "push", "origin", target], path)
+    push = run_git(["git", "push", "origin", target], canonical)
     if push.returncode != 0:
         return f"❌ Merged locally but push failed:\n```\n{push.stderr[-500:]}\n```"
 
@@ -1938,14 +1962,67 @@ async def merge_branch(source: str, target: str, path: str | None = None) -> str
         if is_protected_branch(source):
             result += f"\n🛡️ Protected branch; skipping delete for `{source}`."
         else:
-            run_git(["git", "branch", "-D", source], path)
-            run_git(["git", "push", "origin", "--delete", source], path)
+            run_git(["git", "branch", "-D", source], canonical)
+            run_git(["git", "push", "origin", "--delete", source], canonical)
             result += f"\n🗑️ Deleted branch `{source}`."
 
     # Pull the target branch so the local repo stays up to date
-    run_git(["git", "pull", "--ff-only"], path)
+    run_git(["git", "pull", "--ff-only"], canonical)
 
     return result
+
+
+# ── Worktree helpers ──────────────────────────────────────────────────────
+
+def _worktree_base(repo_path: str) -> pathlib.Path:
+    return pathlib.Path(repo_path) / ".worktrees"
+
+
+def _worktree_path(repo_path: str, channel_id: int) -> str:
+    return str(_worktree_base(repo_path) / f"ch-{channel_id}")
+
+
+def _canonical_repo(path: str) -> str:
+    """If path is a worktree under .worktrees/, return the parent repo. Else return path as-is."""
+    p = pathlib.Path(path)
+    if p.parent.name == ".worktrees":
+        return str(p.parent.parent)
+    return path
+
+
+def ensure_worktree(repo_path: str, channel_id: int) -> str:
+    """Create or reuse a worktree for this channel. Returns worktree path."""
+    canonical = _canonical_repo(repo_path)
+    wt_path = _worktree_path(canonical, channel_id)
+    if pathlib.Path(wt_path).exists():
+        return wt_path
+    pathlib.Path(wt_path).parent.mkdir(parents=True, exist_ok=True)
+    # Use --detach so we don't conflict with any branch checked out elsewhere
+    result = run_git(["git", "worktree", "add", "--detach", wt_path], canonical)
+    if result.returncode != 0:
+        raise RuntimeError(f"Worktree creation failed: {(result.stderr or result.stdout or '').strip()}")
+    return wt_path
+
+
+def remove_worktree(repo_path: str, channel_id: int) -> None:
+    """Remove a channel's worktree after session ends."""
+    canonical = _canonical_repo(repo_path)
+    wt_path = _worktree_path(canonical, channel_id)
+    if pathlib.Path(wt_path).exists():
+        run_git(["git", "worktree", "remove", wt_path, "--force"], canonical)
+
+
+def prune_worktrees(repo_path: str) -> None:
+    """Clean up stale worktree references."""
+    run_git(["git", "worktree", "prune"], _canonical_repo(repo_path))
+
+
+def _end_session(ch_id: int, cwd: str) -> None:
+    """Clean up session: remove worktree, reset channel_cwd, delete session."""
+    canonical = _canonical_repo(cwd)
+    remove_worktree(canonical, ch_id)
+    channel_cwd[ch_id] = canonical
+    active_sessions.pop(ch_id, None)
 
 
 async def create_pr(source: str, target: str, title: str, path: str | None = None) -> str:
@@ -2286,17 +2363,18 @@ async def on_message(message: discord.Message):
             await ch.send(result)
             if "✅" in result:
                 last_pushed[ch.id] = session["branch"]
-                dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
+                canonical = _canonical_repo(cwd)
+                dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], canonical).returncode == 0
                 if dev_exists:
                     await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
                     merge_result = await merge_branch(session["branch"], DEV_BRANCH, cwd)
                     await ch.send(merge_result)
-                    record_state(ch.id, cwd, DEV_BRANCH)
+                    record_state(ch.id, canonical, DEV_BRANCH)
                     await ch.send("`pr main` to create a PR to main")
-                    del active_sessions[ch.id]
+                    _end_session(ch.id, cwd)
                 else:
                     branches = [b for b in run_git(
-                        ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], cwd
+                        ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], canonical
                     ).stdout.strip().split("\n") if b and b != session["branch"]]
                     listing = "\n".join(f"• `{b}`" for b in branches[:10])
                     session["phase"] = "merge_target"
@@ -2304,11 +2382,12 @@ async def on_message(message: discord.Message):
                         f"⚠️ No `{DEV_BRANCH}` branch found. Which branch should `{session['branch']}` merge into?\n{listing}\nReply with the branch name, or `skip` to skip merging."
                     )
             else:
-                fallback = _resolve_checkout_branch(cwd, avoid=session["branch"])
+                canonical = _canonical_repo(cwd)
+                fallback = _resolve_checkout_branch(canonical, avoid=session["branch"])
                 if fallback:
-                    run_git(["git", "checkout", fallback], cwd)
-                    record_state(ch.id, cwd, fallback)
-                del active_sessions[ch.id]
+                    run_git(["git", "checkout", fallback], canonical)
+                    record_state(ch.id, canonical, fallback)
+                _end_session(ch.id, cwd)
             return
         # If no session but maybe old-style pending
         await ch.send("No session awaiting approval. Send `done` first to review changes.")
@@ -2318,31 +2397,35 @@ async def on_message(message: discord.Message):
         await ch.send("⏳ Committing and pushing (skip merge)...")
         result = await commit_and_push(session["branch"], session["description"], cwd)
         await ch.send(result)
+        canonical = _canonical_repo(cwd)
         if "✅" in result:
             last_pushed[ch.id] = session["branch"]
-            record_state(ch.id, cwd, session["branch"])
-            del active_sessions[ch.id]
+            record_state(ch.id, canonical, session["branch"])
+            _end_session(ch.id, cwd)
             await ch.send("⏭️ Skipped merge. Use `merge <target>` or `pr <target>` any time.")
         else:
-            fallback = _resolve_checkout_branch(cwd, avoid=session["branch"])
+            fallback = _resolve_checkout_branch(canonical, avoid=session["branch"])
             if fallback:
-                run_git(["git", "checkout", fallback], cwd)
-                record_state(ch.id, cwd, fallback)
-            del active_sessions[ch.id]
+                run_git(["git", "checkout", fallback], canonical)
+                record_state(ch.id, canonical, fallback)
+            _end_session(ch.id, cwd)
         return
 
     # ── Session: merge target selection ───────────────────────────────────
     if session and session.get("phase") == "merge_target":
         if lower == "skip":
+            canonical = _canonical_repo(cwd)
+            record_state(ch.id, canonical, session["branch"])
             await ch.send("⏭️ Skipped merge. Use `merge <branch>` or `pr <branch>` any time.")
-            del active_sessions[ch.id]
+            _end_session(ch.id, cwd)
             return
         target_input = content.strip()
-        target = resolve_branch_case_insensitive(target_input, cwd) or target_input
-        check = run_git(["git", "rev-parse", "--verify", target], cwd)
+        canonical = _canonical_repo(cwd)
+        target = resolve_branch_case_insensitive(target_input, canonical) or target_input
+        check = run_git(["git", "rev-parse", "--verify", target], canonical)
         if check.returncode != 0:
             # If there are multiple case-insensitive matches, ask for exact name.
-            branches = get_branch_list(cwd)
+            branches = get_branch_list(canonical)
             ci_matches = [b for b in branches if b.lower() == target_input.lower()]
             if len(ci_matches) > 1:
                 listing = "\n".join(f"• `{b}`" for b in ci_matches[:10])
@@ -2352,7 +2435,7 @@ async def on_message(message: discord.Message):
                 )
                 return
             branches = [b for b in run_git(
-                ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], cwd
+                ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], canonical
             ).stdout.strip().split("\n") if b and b != session["branch"]]
             listing = "\n".join(f"• `{b}`" for b in branches[:10])
             await ch.send(f"Branch `{target}` not found. Pick one:\n{listing}\nOr `skip` to skip.")
@@ -2360,15 +2443,15 @@ async def on_message(message: discord.Message):
         await ch.send(f"⏳ Merging into `{target}`...")
         merge_result = await merge_branch(session["branch"], target, cwd)
         await ch.send(merge_result)
-        record_state(ch.id, cwd, target)
-        del active_sessions[ch.id]
+        record_state(ch.id, canonical, target)
+        _end_session(ch.id, cwd)
         return
 
     # ── Session: discard ──────────────────────────────────────────────────
     if lower in ("no", "reject", "discard", "nah"):
         if session and session.get("phase") == "review":
             base = await discard_changes(session["branch"], cwd)
-            del active_sessions[ch.id]
+            _end_session(ch.id, cwd)
             if base and base != session["branch"]:
                 await ch.send(f"🗑️ Discarded, back on `{base}`.")
             elif base:
@@ -2383,7 +2466,7 @@ async def on_message(message: discord.Message):
     if lower == "abort":
         if session:
             base = await discard_changes(session["branch"], cwd)
-            del active_sessions[ch.id]
+            _end_session(ch.id, cwd)
             if base and base != session["branch"]:
                 await ch.send(f"🗑️ Session aborted, back on `{base}`.")
             elif base:
@@ -2751,7 +2834,7 @@ async def on_message(message: discord.Message):
 
             if session:
                 await discard_changes(session["branch"], cwd)
-                del active_sessions[ch.id]
+                _end_session(ch.id, cwd)
                 await ch.send("⚠️ Previous session discarded before executing saved plan.")
                 session = None
 
@@ -2768,6 +2851,12 @@ async def on_message(message: discord.Message):
                 )
 
             try:
+                cwd = ensure_worktree(cwd, ch.id)
+            except Exception as e:
+                await ch.send(f"❌ Worktree creation failed: `{e}`")
+                return
+
+            try:
                 branch = create_branch(
                     exec_description,
                     engine,
@@ -2776,6 +2865,8 @@ async def on_message(message: discord.Message):
                 )
             except Exception as e:
                 await ch.send(f"❌ Branch creation failed: `{e}`")
+                remove_worktree(_canonical_repo(cwd), ch.id)
+                channel_cwd[ch.id] = _canonical_repo(cwd)
                 return
             record_state(ch.id, cwd, branch)
 
@@ -2794,25 +2885,29 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 await ch.send(f"❌ {label} error: `{e}`")
                 await discard_changes(branch, cwd)
+                _end_session(ch.id, cwd)
                 return
             finally:
                 stop_events.pop(ch.id, None)
 
             if stop_event.is_set():
                 await discard_changes(branch, cwd)
+                _end_session(ch.id, cwd)
                 return
 
             clear_saved_plan = True
 
             # If no files changed, clean up the branch and skip starting a session.
             if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
-                base = _resolve_checkout_branch(cwd, avoid=branch)
+                canonical = _canonical_repo(cwd)
+                base = _resolve_checkout_branch(canonical, avoid=branch)
                 if base:
-                    run_git(["git", "checkout", base], cwd)
-                    run_git(["git", "branch", "-D", branch], cwd)
-                    record_state(ch.id, cwd, base)
+                    run_git(["git", "branch", "-D", branch], canonical)
+                    record_state(ch.id, canonical, base)
                 else:
-                    record_state(ch.id, cwd, current_branch(cwd) or branch)
+                    record_state(ch.id, canonical, current_branch(canonical) or branch)
+                remove_worktree(canonical, ch.id)
+                channel_cwd[ch.id] = canonical
                 await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
                 msg = "ℹ️ No files changed — no session started."
                 if not base:
@@ -2947,8 +3042,9 @@ async def on_message(message: discord.Message):
     if lower.startswith("cwd"):
         arg = lower[3:].strip()
         if not arg:
-            proj_label = next((l for l, p in GIT_PROJECTS if p == cwd), cwd)
-            await ch.send(f"Active repo: **{proj_label}** (`{cwd}`)\nUse `cwd <n>` to switch.")
+            canonical = _canonical_repo(cwd)
+            proj_label = next((l for l, p in GIT_PROJECTS if p == canonical), canonical)
+            await ch.send(f"Active repo: **{proj_label}** (`{canonical}`)\nUse `cwd <n>` to switch.")
             return
         proj = resolve_project(arg)
         if proj is None:
@@ -2958,13 +3054,25 @@ async def on_message(message: discord.Message):
         if session:
             # Auto-commit current work before switching repos
             auto_commit(session["description"], session["turns"], cwd)
-            new_branch = current_branch(path)
-            session["cwd"] = path
+            # Remove old worktree from previous repo
+            remove_worktree(_canonical_repo(cwd), ch.id)
+            # Create new worktree for the new repo
+            try:
+                new_wt = ensure_worktree(path, ch.id)
+            except Exception as e:
+                await ch.send(f"❌ Worktree creation failed for `{label}`: `{e}`")
+                return
+            new_branch = current_branch(new_wt)
+            session["cwd"] = new_wt
             session["branch"] = new_branch
-        channel_cwd[ch.id] = path
-        new_branch = current_branch(path)
-        record_state(ch.id, path, new_branch)
-        await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
+            channel_cwd[ch.id] = new_wt
+            record_state(ch.id, new_wt, new_branch)
+            await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
+        else:
+            channel_cwd[ch.id] = path
+            new_branch = current_branch(path)
+            record_state(ch.id, path, new_branch)
+            await ch.send(f"✅ Switched to **{label}** (`{path}`) · branch `{new_branch}`")
         return
 
     # ── Switch branch ─────────────────────────────────────────────────────
@@ -3539,8 +3647,9 @@ async def on_message(message: discord.Message):
 
     # ── Recover orphaned branches ────────────────────────────────────────
     if lower == "recover":
+        canonical = _canonical_repo(cwd)
         result = run_git(["git", "branch", "--sort=-committerdate",
-                          "--format=%(refname:short)"])
+                          "--format=%(refname:short)"], canonical)
         orphans = [b for b in result.stdout.strip().split("\n")
                    if b.startswith(f"{BRANCH_PREFIX}/")]
         if not orphans:
@@ -3557,11 +3666,12 @@ async def on_message(message: discord.Message):
     if lower.startswith("recover drop ") or lower.startswith("recover "):
         is_drop = lower.startswith("recover drop ")
         arg = content[13:].strip() if is_drop else content[8:].strip()
+        canonical = _canonical_repo(cwd)
 
         # Resolve short ID (trailing digits) to full branch name
         if not arg.startswith(f"{BRANCH_PREFIX}/"):
             result = run_git(["git", "branch", "--sort=-committerdate",
-                              "--format=%(refname:short)"])
+                              "--format=%(refname:short)"], canonical)
             candidates = [b for b in result.stdout.strip().split("\n")
                           if b.startswith(f"{BRANCH_PREFIX}/") and b.endswith(f"-{arg}")]
             if len(candidates) == 1:
@@ -3581,21 +3691,29 @@ async def on_message(message: discord.Message):
                     f"Use `branch protect remove {arg}` if you really need to delete it."
                 )
                 return
-            run_git(["git", "branch", "-D", arg], cwd)
-            run_git(["git", "push", "origin", "--delete", arg], cwd)
+            run_git(["git", "branch", "-D", arg], canonical)
+            run_git(["git", "push", "origin", "--delete", arg], canonical)
             await ch.send(f"🗑️ Deleted `{arg}` locally and remotely.")
             return
 
         branch = arg
-        # Check branch exists
-        check = run_git(["git", "rev-parse", "--verify", branch], cwd)
+        # Check branch exists (use canonical repo for branch lookup)
+        canonical = _canonical_repo(cwd)
+        check = run_git(["git", "rev-parse", "--verify", branch], canonical)
         if check.returncode != 0:
             await ch.send(f"Branch `{branch}` not found.")
             return
         if session:
             await discard_changes(session["branch"], cwd)
+            _end_session(ch.id, cwd)
             await ch.send("⚠️ Previous session discarded.\n")
-        run_git(["git", "checkout", branch], cwd)
+        # Create worktree for the recovered branch
+        try:
+            wt_path = ensure_worktree(canonical, ch.id)
+        except Exception as e:
+            await ch.send(f"❌ Worktree creation failed: `{e}`")
+            return
+        run_git(["git", "checkout", branch], wt_path)
         # Parse engine from branch name (auto/engine/slug-timestamp)
         parts = branch.split("/")
         engine = _normalize_engine_name(parts[1] if len(parts) >= 3 else get_default_engine(ch.id))
@@ -3605,10 +3723,11 @@ async def on_message(message: discord.Message):
             "description": "recovered session",
             "turns": 0,
             "phase": "working",
-            "cwd": cwd,
+            "cwd": wt_path,
             "runtime_config": get_runtime_config(ch.id),
         }
-        diff_stat = get_diff_stat(cwd)
+        channel_cwd[ch.id] = wt_path
+        diff_stat = get_diff_stat(wt_path)
         await ch.send(f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n"
                        f"Send a follow-up, `diff` to inspect, or `done` when finished.")
         return
@@ -3674,6 +3793,8 @@ async def on_message(message: discord.Message):
     # Clean up any leftover session
     if session:
         await discard_changes(session["branch"], cwd)
+        _end_session(ch.id, cwd)
+        cwd = _canonical_repo(cwd)  # reset to canonical after cleanup
         await ch.send("⚠️ Previous session discarded.\n")
 
     label = "Claude Code" if engine == "claude" else "Codex CLI"
@@ -3681,9 +3802,17 @@ async def on_message(message: discord.Message):
                    + (f"\n📎 {len(images)} image(s) attached" if images else ""))
 
     try:
+        cwd = ensure_worktree(cwd, ch.id)
+    except Exception as e:
+        await ch.send(f"❌ Worktree creation failed: `{e}`")
+        return
+
+    try:
         branch = create_branch(task, engine, cwd)
     except Exception as e:
         await ch.send(f"❌ Branch creation failed: `{e}`")
+        remove_worktree(_canonical_repo(cwd), ch.id)
+        channel_cwd[ch.id] = _canonical_repo(cwd)
         return
     record_state(ch.id, cwd, branch)
 
@@ -3703,23 +3832,27 @@ async def on_message(message: discord.Message):
     except Exception as e:
         await ch.send(f"❌ {label} error: `{e}`")
         await discard_changes(branch, cwd)
+        _end_session(ch.id, cwd)
         return
     finally:
         stop_events.pop(ch.id, None)
 
     if stop_event.is_set():
         await discard_changes(branch, cwd)
+        _end_session(ch.id, cwd)
         return
 
     # If no files changed, clean up the branch and skip starting a session
     if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
-        base = _resolve_checkout_branch(cwd, avoid=branch)
+        canonical = _canonical_repo(cwd)
+        base = _resolve_checkout_branch(canonical, avoid=branch)
         if base:
-            run_git(["git", "checkout", base], cwd)
-            run_git(["git", "branch", "-D", branch], cwd)
-            record_state(ch.id, cwd, base)
+            run_git(["git", "branch", "-D", branch], canonical)
+            record_state(ch.id, canonical, base)
         else:
-            record_state(ch.id, cwd, current_branch(cwd) or branch)
+            record_state(ch.id, canonical, current_branch(canonical) or branch)
+        remove_worktree(canonical, ch.id)
+        channel_cwd[ch.id] = canonical
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
         msg = "ℹ️ No files changed — no session started."
         if not base:
