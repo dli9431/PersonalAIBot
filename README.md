@@ -281,7 +281,7 @@ pr main               → open a GitHub PR targeting main
 | `reasoning [n\|level]` | View/set reasoning effort for this channel's default engine |
 | `default reasoning [n\|level]` | Alias for `reasoning [n\|level]` |
 | `status` | Current branch and working tree |
-| `usage` | Show cumulative token usage per engine (all-time runs, input/output/cache tokens); also shows current session token count when available |
+| `usage` | Show cumulative token usage per engine (all-time runs, input/output/cache tokens), plus live remaining usage-limit status for Claude/Codex (best effort), and current session token count when available |
 | `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
 
