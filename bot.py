@@ -784,6 +784,185 @@ def check_codex_cli() -> tuple[bool, str]:
         return False, "not installed — run: npm install -g @openai/codex"
 
 
+def _format_reset_at(ts: object) -> str | None:
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    # Codex may return reset timestamps in Unix ms depending on transport/version.
+    if value > 10_000_000_000:
+        value /= 1000.0
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _extract_limit_line(text: str) -> str | None:
+    """Return a concise limit-status line from CLI text output."""
+    if not text:
+        return None
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in strip_ansi(text).splitlines() if ln.strip()]
+    if not lines:
+        return None
+    prefer = [
+        ln for ln in lines
+        if re.search(r"\b(remaining|left|reset|quota|limit|usage)\b", ln, re.IGNORECASE)
+    ]
+    selected = prefer[:2] if prefer else lines[:1]
+    summary = " | ".join(selected)
+    return summary[:240]
+
+
+def get_claude_remaining_limit_summary() -> tuple[str | None, str | None]:
+    """Best-effort: query Claude CLI for current remaining usage limits."""
+    commands = (
+        ["claude", "-p", "/rate-limit-options", "--output-format", "text"],
+        ["claude", "-p", "/status", "--output-format", "text"],
+    )
+    last_error: str | None = None
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except FileNotFoundError:
+            return None, "Claude CLI not installed"
+        except subprocess.TimeoutExpired:
+            last_error = "timed out while checking Claude usage"
+            continue
+
+        raw = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        summary = _extract_limit_line(raw)
+        if summary:
+            return summary, None
+        if proc.returncode != 0:
+            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or ["command failed"])[-1]
+            last_error = tail
+    return None, (last_error or "no limit details returned by Claude CLI")
+
+
+def _format_codex_snapshot(label: str, snapshot: dict) -> str | None:
+    windows: list[str] = []
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = window.get("usedPercent")
+        if not isinstance(used, (int, float)):
+            continue
+        remaining = max(0.0, 100.0 - float(used))
+        part = f"{key} {remaining:.1f}% remaining"
+        reset_at = _format_reset_at(window.get("resetsAt"))
+        if reset_at:
+            part += f" (resets {reset_at})"
+        windows.append(part)
+
+    credits = snapshot.get("credits")
+    if isinstance(credits, dict):
+        if credits.get("unlimited") is True:
+            windows.append("credits unlimited")
+        elif credits.get("hasCredits") and credits.get("balance"):
+            windows.append(f"credits {credits.get('balance')}")
+
+    if not windows:
+        return None
+    return f"{label}: " + " · ".join(windows)
+
+
+def get_codex_remaining_limit_summary() -> tuple[str | None, str | None]:
+    """Query Codex app-server for current account rate-limit usage."""
+    init_req = {
+        "id": "init",
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "PersonalAIBot", "version": "1.0"},
+            "capabilities": None,
+        },
+    }
+    limits_req = {
+        "id": "limits",
+        "method": "account/rateLimits/read",
+    }
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None, "Codex CLI not installed"
+
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(init_req) + "\n")
+        proc.stdin.flush()
+        proc.stdin.write(json.dumps(limits_req) + "\n")
+        proc.stdin.flush()
+        # Keep stdin open briefly so Codex can process the second request.
+        time.sleep(0.8)
+        proc.stdin.close()
+        stdout = proc.stdout.read() if proc.stdout else ""
+        stderr = proc.stderr.read() if proc.stderr else ""
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return None, "timed out while checking Codex usage"
+    except Exception:
+        proc.kill()
+        return None, "failed to query Codex usage limits"
+
+    result_payload: dict | None = None
+    error_message: str | None = None
+    for raw in (stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("id") != "limits":
+            continue
+        if isinstance(msg.get("result"), dict):
+            result_payload = msg["result"]
+        elif isinstance(msg.get("error"), dict):
+            error_message = str(msg["error"].get("message") or "Codex rate-limit query failed")
+
+    if not result_payload:
+        if error_message:
+            return None, error_message
+        err_lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+        if err_lines:
+            # Drop startup warnings and keep the most useful failure text.
+            useful = [ln for ln in err_lines if "WARNING:" not in ln]
+            tail = (useful or err_lines)[-1]
+            return None, tail
+        return None, "no response from Codex app-server"
+
+    snapshots: list[tuple[str, dict]] = []
+    by_id = result_payload.get("rateLimitsByLimitId")
+    if isinstance(by_id, dict):
+        for limit_id, snap in by_id.items():
+            if isinstance(snap, dict):
+                label = str(snap.get("limitName") or limit_id or "default")
+                snapshots.append((label, snap))
+    if not snapshots and isinstance(result_payload.get("rateLimits"), dict):
+        snap = result_payload["rateLimits"]
+        label = str(snap.get("limitName") or snap.get("limitId") or "default")
+        snapshots.append((label, snap))
+
+    if not snapshots:
+        return None, "Codex returned no rate-limit windows"
+
+    parts = [p for p in (_format_codex_snapshot(label, snap) for label, snap in snapshots) if p]
+    if not parts:
+        return None, "Codex returned no remaining-limit values"
+    return " ; ".join(parts[:2]), None
+
+
 def _normalize_path(path: str) -> str:
     p = pathlib.Path(path).expanduser()
     try:
@@ -2353,6 +2532,35 @@ async def on_message(message: discord.Message):
                 if cache_r or cache_w:
                     line += f" · {cache_r:,} cache read / {cache_w:,} cache write"
                 lines.append(line)
+
+        lines.append("\n📉 **Current remaining limits**")
+        claude_ok, _ = check_claude_cli()
+        codex_ok, _ = check_codex_cli()
+        limit_tasks = []
+        task_meta: list[str] = []
+        if claude_ok:
+            limit_tasks.append(asyncio.to_thread(get_claude_remaining_limit_summary))
+            task_meta.append("claude")
+        if codex_ok:
+            limit_tasks.append(asyncio.to_thread(get_codex_remaining_limit_summary))
+            task_meta.append("codex")
+
+        live_limits: dict[str, tuple[str | None, str | None]] = {}
+        if limit_tasks:
+            results = await asyncio.gather(*limit_tasks)
+            for eng, res in zip(task_meta, results):
+                live_limits[eng] = res
+
+        for eng in ("claude", "codex"):
+            if eng not in live_limits:
+                lines.append(f"**{eng}**: unavailable (CLI not installed or not authenticated)")
+                continue
+            summary, err = live_limits[eng]
+            if summary:
+                lines.append(f"**{eng}**: {summary}")
+            else:
+                lines.append(f"**{eng}**: unavailable ({err or 'unknown error'})")
+
         if session:
             sess_usage = session.get("total_usage", {})
             in_tok = sess_usage.get("input_tokens", 0)
