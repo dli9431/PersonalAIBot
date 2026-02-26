@@ -817,29 +817,51 @@ def _extract_limit_line(text: str) -> str | None:
 
 
 def get_claude_remaining_limit_summary() -> tuple[str | None, str | None]:
-    """Best-effort: query Claude CLI for current remaining usage limits."""
-    commands = (
-        ["claude", "-p", "/rate-limit-options", "--output-format", "text"],
-        ["claude", "-p", "/status", "--output-format", "text"],
-    )
-    last_error: str | None = None
-    for cmd in commands:
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        except FileNotFoundError:
-            return None, "Claude CLI not installed"
-        except subprocess.TimeoutExpired:
-            last_error = "timed out while checking Claude usage"
-            continue
+    """Best-effort: read Claude credentials and stats cache for usage info."""
+    home = pathlib.Path.home()
+    creds_path = home / ".claude" / ".credentials.json"
+    stats_path = home / ".claude" / "stats-cache.json"
 
-        raw = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
-        summary = _extract_limit_line(raw)
-        if summary:
-            return summary, None
-        if proc.returncode != 0:
-            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or ["command failed"])[-1]
-            last_error = tail
-    return None, (last_error or "no limit details returned by Claude CLI")
+    parts: list[str] = []
+
+    # Read subscription/tier info from credentials.
+    if creds_path.is_file():
+        try:
+            with open(creds_path) as f:
+                creds = json.load(f)
+            oauth = creds.get("claudeAiOauth", {})
+            plan = oauth.get("subscriptionType")
+            tier = oauth.get("rateLimitTier", "")
+            if plan:
+                parts.append(f"{plan} plan")
+            if tier:
+                parts.append(f"tier {tier}")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Read recent daily activity from stats cache.
+    if stats_path.is_file():
+        try:
+            with open(stats_path) as f:
+                stats = json.load(f)
+            daily = stats.get("dailyActivity", [])
+            if daily:
+                today = time.strftime("%Y-%m-%d")
+                today_entry = next((d for d in daily if d.get("date") == today), None)
+                if today_entry:
+                    parts.append(
+                        f"today {today_entry.get('messageCount', 0)} msgs / "
+                        f"{today_entry.get('toolCallCount', 0)} tools"
+                    )
+                else:
+                    last = daily[-1]
+                    parts.append(f"last active {last.get('date', '?')}")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if parts:
+        return " · ".join(parts), None
+    return None, "no Claude credentials or stats found"
 
 
 def _format_codex_snapshot(label: str, snapshot: dict) -> str | None:
@@ -896,17 +918,49 @@ def get_codex_remaining_limit_summary() -> tuple[str | None, str | None]:
         return None, "Codex CLI not installed"
 
     try:
-        assert proc.stdin is not None
+        assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(json.dumps(init_req) + "\n")
         proc.stdin.flush()
+        # Wait for the initialize response before sending the next request.
+        import selectors
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        init_lines: list[str] = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready = sel.select(timeout=max(0.1, deadline - time.monotonic()))
+            if ready:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                init_lines.append(line)
+                try:
+                    msg = json.loads(line)
+                    if msg.get("id") == "init":
+                        break
+                except json.JSONDecodeError:
+                    pass
+        sel.close()
         proc.stdin.write(json.dumps(limits_req) + "\n")
         proc.stdin.flush()
-        # Keep stdin open briefly so Codex can process the second request.
-        time.sleep(0.8)
+        # Wait for the rate-limits response.
+        remaining_lines: list[str] = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            remaining_lines.append(line)
+            try:
+                msg = json.loads(line)
+                if msg.get("id") == "limits":
+                    break
+            except json.JSONDecodeError:
+                pass
         proc.stdin.close()
-        stdout = proc.stdout.read() if proc.stdout else ""
+        stdout = "".join(init_lines + remaining_lines)
         stderr = proc.stderr.read() if proc.stderr else ""
-        proc.wait(timeout=15)
+        proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
         return None, "timed out while checking Codex usage"
