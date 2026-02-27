@@ -15,6 +15,7 @@ Requirements:
 
 import asyncio
 import json
+import logging
 import os
 import pathlib
 import re
@@ -106,6 +107,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
+logger = logging.getLogger(__name__)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -475,6 +477,7 @@ def record_state(ch_id: int, cwd: str, branch: str | None = None) -> None:
 def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
     data = _load_state()
     channels = data.get("channels", {}) or {}
+    state_dirty = False
     # Prune stale worktrees for all known repos on startup
     pruned_repos: set[str] = set()
     for ch_id_str, info in channels.items():
@@ -484,6 +487,9 @@ def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
             cwd = info.get("cwd", "")
             if cwd and not pathlib.Path(cwd).exists():
                 cwd = repo  # worktree gone, use canonical
+                if repo and info.get("cwd") != repo:
+                    info["cwd"] = repo
+                    state_dirty = True
             if cwd:
                 try:
                     channel_cwd[int(ch_id_str)] = cwd
@@ -494,14 +500,23 @@ def restore_state() -> tuple[int | None, str | None, str | None, str | None]:
                 pruned_repos.add(repo)
     last_id = data.get("last_active_channel")
     if last_id is None:
+        if state_dirty:
+            _save_state(data)
         return None, None, None, None
-    info = channels.get(str(last_id)) or {}
+    info = channels.get(str(last_id))
+    if not isinstance(info, dict):
+        info = {}
     cwd = info.get("cwd")
     repo = info.get("repo") or _canonical_repo(cwd or "")
     branch = info.get("branch")
     # If cwd was a worktree that no longer exists, fall back to canonical
     if cwd and not pathlib.Path(cwd).exists():
         cwd = repo
+        if repo and info.get("cwd") != repo:
+            info["cwd"] = repo
+            state_dirty = True
+    if state_dirty:
+        _save_state(data)
     checkout_error = None
     if cwd and branch and pathlib.Path(cwd).exists():
         res = run_git(["git", "checkout", branch], cwd)
@@ -1898,10 +1913,41 @@ def create_branch(
 
 def auto_commit(description: str, turn: int, path: str | None = None) -> None:
     """Commit any pending changes as a WIP save after each engine turn."""
-    run_git(["git", "add", "."], path)
-    status = run_git(["git", "status", "--porcelain"], path).stdout.strip()
-    if status:
-        run_git(["git", "commit", "-m", f"WIP (turn {turn}): {description}"], path)
+    cwd = path or REPO_PATH
+    try:
+        add = run_git(["git", "add", "."], path)
+    except Exception:
+        logger.exception("auto_commit failed during git add (turn=%s, path=%s)", turn, cwd)
+        return
+    if add.returncode != 0:
+        err = (add.stderr or add.stdout or "").strip() or f"exit {add.returncode}"
+        logger.error("auto_commit git add failed (turn=%s, path=%s): %s", turn, cwd, truncate(err, 500))
+        return
+
+    try:
+        status_res = run_git(["git", "status", "--porcelain"], path)
+    except Exception:
+        logger.exception("auto_commit failed during git status (turn=%s, path=%s)", turn, cwd)
+        return
+    if status_res.returncode != 0:
+        err = (status_res.stderr or status_res.stdout or "").strip() or f"exit {status_res.returncode}"
+        logger.error("auto_commit git status failed (turn=%s, path=%s): %s", turn, cwd, truncate(err, 500))
+        return
+
+    if status_res.stdout.strip():
+        try:
+            commit = run_git(["git", "commit", "-m", f"WIP (turn {turn}): {description}"], path)
+        except Exception:
+            logger.exception("auto_commit failed during git commit (turn=%s, path=%s)", turn, cwd)
+            return
+        if commit.returncode != 0:
+            err = (commit.stderr or commit.stdout or "").strip() or f"exit {commit.returncode}"
+            logger.error(
+                "auto_commit git commit failed (turn=%s, path=%s): %s",
+                turn,
+                cwd,
+                truncate(err, 500),
+            )
 
 
 async def commit_and_push(branch: str, description: str, path: str | None = None) -> str:
@@ -2026,17 +2072,50 @@ def _canonical_repo(path: str) -> str:
     return path
 
 
+def _worktree_registered(repo_path: str, worktree_path: str) -> tuple[bool, str]:
+    """Return whether worktree_path is present in `git worktree list --porcelain` output."""
+    listed = run_git(["git", "worktree", "list", "--porcelain"], repo_path)
+    if listed.returncode != 0:
+        err = (listed.stderr or listed.stdout or "").strip() or f"exit {listed.returncode}"
+        return False, f"Failed to list worktrees: {err}"
+
+    target = pathlib.Path(worktree_path)
+    try:
+        target = target.resolve()
+    except OSError:
+        pass
+    target_str = str(target)
+
+    for line in listed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = pathlib.Path(line.removeprefix("worktree ").strip())
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            pass
+        if str(candidate) == target_str:
+            return True, ""
+    return False, "worktree path not present in `git worktree list --porcelain` output"
+
+
 def ensure_worktree(repo_path: str, channel_id: int) -> str:
     """Create or reuse a worktree for this channel. Returns worktree path."""
     canonical = _canonical_repo(repo_path)
     wt_path = _worktree_path(canonical, channel_id)
     if pathlib.Path(wt_path).exists():
+        ok, err = _worktree_registered(canonical, wt_path)
+        if not ok:
+            raise RuntimeError(f"Existing worktree verification failed for `{wt_path}`: {err}")
         return wt_path
     pathlib.Path(wt_path).parent.mkdir(parents=True, exist_ok=True)
     # Use --detach so we don't conflict with any branch checked out elsewhere
     result = run_git(["git", "worktree", "add", "--detach", wt_path], canonical)
     if result.returncode != 0:
         raise RuntimeError(f"Worktree creation failed: {(result.stderr or result.stdout or '').strip()}")
+    ok, err = _worktree_registered(canonical, wt_path)
+    if not ok:
+        raise RuntimeError(f"Worktree add succeeded but verification failed for `{wt_path}`: {err}")
     return wt_path
 
 
