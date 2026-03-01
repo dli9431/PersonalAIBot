@@ -3666,14 +3666,18 @@ async def on_message(message: discord.Message):
         if not new_model:
             if default_engine == "claude":
                 current = str(channel_config["claude_model"])
+                current_reasoning = format_reasoning_effort(channel_config["claude_reasoning_effort"])
             elif default_engine == "codex":
                 current = str(channel_config["codex_model"])
+                current_reasoning = format_reasoning_effort(channel_config["codex_reasoning_effort"])
             else:
                 current = None
+                current_reasoning = None
             if current:
                 await ch.send(
                     f"Usage: `{prefix} <n|name>`\n"
-                    f"This channel default engine: `{default_engine}` · Current model: `{current}`\n"
+                    f"This channel default engine: `{default_engine}` · Current model: `{current}` · "
+                    f"Current reasoning: `{current_reasoning}`\n"
                     f"Use `claude model <n|name>` / `codex model <n|name>` to set explicitly."
                 )
             else:
