@@ -85,7 +85,7 @@ PROTECTED_BRANCHES=main,dev
 DEFAULT_ENGINE=claude    # or codex
 ENGINE_TIMEOUT=300
 CONTEXT_MAX_CHARS=4000   # max chars saved for timeout resume context
-PLAN_CONTEXT_MAX_CHARS=12000  # max chars saved for plan + plan do context
+PLAN_CONTEXT_MAX_CHARS=12000  # max chars saved for plan + plan: do context
 
 # Claude Code settings
 CLAUDE_MODEL=sonnet
@@ -138,12 +138,12 @@ You can also plan first, then execute:
 
 ```
 plan: add retry logic to the payment webhook flow
-plan do
+plan: do
 ```
 
 `plan:` runs in planning mode with this channel's default engine/model and saves context to disk.
 Successive `plan:` commands in the same repo/engine extend the saved context instead of replacing it.
-`plan do` (optionally with extra instructions) executes the last saved plan context for this
+`plan: do` (optionally with extra instructions) executes the last saved plan context for this
 channel, then clears it.
 Use `plan show` to inspect saved plan context and `plan clear` to remove it manually.
 
@@ -199,7 +199,7 @@ pr main               → open a GitHub PR targeting main
 | `claude: <task>` / `cc: <task>` / `claude code: <task>` | Run with Claude Code |
 | `codex: <task>` / `cx: <task>` / `openai: <task>` | Run with Codex CLI |
 | `plan: <task>` | Planning mode with this channel's default engine/model; saves plan context |
-| `plan do [extra instructions]` | Execute saved plan context with this channel's default engine/model, then clear it |
+| `plan: do [extra instructions]` | Execute saved plan context with this channel's default engine/model, then clear it |
 
 ### During a session
 

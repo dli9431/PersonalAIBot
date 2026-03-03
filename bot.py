@@ -2346,7 +2346,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves/extends plan context)
-`plan do [extra instructions]` — execute saved plan context, then clear it
+`plan: do [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
 
 **During a session:**
@@ -3097,11 +3097,158 @@ async def on_message(message: discord.Message):
         return
 
     if lower.startswith("plan:"):
-        plan_request = content.split(":", 1)[1].strip()
-        if not plan_request:
-            await ch.send("Usage: `plan: <task>`")
+        plan_input = content.split(":", 1)[1].strip()
+        if not plan_input:
+            await ch.send("Usage: `plan: <task>` or `plan: do [extra instructions]`")
             return
 
+        plan_input_lower = plan_input.lower()
+        execute_saved_plan = (
+            plan_input_lower == "do"
+            or plan_input_lower.startswith("do:")
+            or plan_input_lower.startswith("do ")
+        )
+
+        if execute_saved_plan:
+            plan_ctx = load_plan_context(ch.id)
+            if not plan_ctx:
+                await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
+                return
+
+            do_request = plan_input[2:].strip()
+            if do_request.startswith(":"):
+                do_request = do_request[1:].strip()
+            runtime_config = get_runtime_config(ch.id)
+            engine = get_default_engine(ch.id)
+            label = get_engine_label(engine)
+            model = get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch.id)
+            plan_cwd = (plan_ctx.get("cwd") or "").strip() or cwd
+            plan_branch = (plan_ctx.get("branch") or "").strip()
+            if plan_branch == "?":
+                plan_branch = ""
+            plan_branch_exists = False
+            exec_description = (
+                do_request
+                or (plan_ctx.get("request") or "").strip()
+                or "execute saved plan"
+            )
+            execution_task = build_do_prompt(plan_ctx, do_request)
+            clear_saved_plan = False
+
+            try:
+                if not plan_cwd or not pathlib.Path(plan_cwd).exists():
+                    await ch.send(f"❌ Saved plan repo not found: `{plan_cwd or '(empty)'}`")
+                    return
+                plan_branch_exists = bool(
+                    plan_branch
+                    and (_branch_exists(plan_branch, plan_cwd) or _remote_branch_exists(plan_branch, plan_cwd))
+                )
+
+                if session:
+                    await discard_changes(session["branch"], cwd)
+                    _end_session(ch.id, cwd)
+                    await ch.send("⚠️ Previous session discarded before executing saved plan.")
+                    session = None
+
+                cwd = plan_cwd
+                channel_cwd[ch.id] = cwd
+                await ch.send(
+                    f"🚀 Executing saved plan with **{label}** (`{model}`) on `{cwd}`...\n"
+                    f"> {truncate(exec_description, 200)}"
+                )
+                if plan_branch and not plan_branch_exists:
+                    await ch.send(
+                        f"⚠️ Saved planning branch `{plan_branch}` not found. "
+                        "Using the default base branch instead."
+                    )
+
+                try:
+                    cwd = ensure_worktree(cwd, ch.id)
+                except Exception as e:
+                    await ch.send(f"❌ Worktree creation failed: `{e}`")
+                    return
+
+                try:
+                    branch = create_branch(
+                        exec_description,
+                        engine,
+                        cwd,
+                        base_branch=plan_branch if plan_branch_exists else None,
+                    )
+                except Exception as e:
+                    await ch.send(f"❌ Branch creation failed: `{e}`")
+                    remove_worktree(_canonical_repo(cwd), ch.id)
+                    channel_cwd[ch.id] = _canonical_repo(cwd)
+                    return
+                record_state(ch.id, cwd, branch)
+
+                stop_event = asyncio.Event()
+                stop_events[ch.id] = stop_event
+                try:
+                    output = await run_engine(
+                        engine,
+                        execution_task,
+                        ch,
+                        resume=False,
+                        cwd=cwd,
+                        stop_event=stop_event,
+                        runtime_config=runtime_config,
+                    )
+                except Exception as e:
+                    await ch.send(f"❌ {label} error: `{e}`")
+                    await discard_changes(branch, cwd)
+                    _end_session(ch.id, cwd)
+                    return
+                finally:
+                    stop_events.pop(ch.id, None)
+
+                if stop_event.is_set():
+                    await discard_changes(branch, cwd)
+                    _end_session(ch.id, cwd)
+                    return
+
+                clear_saved_plan = True
+
+                # If no files changed, clean up the branch and skip starting a session.
+                if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
+                    canonical = _canonical_repo(cwd)
+                    base = _resolve_checkout_branch(canonical, avoid=branch)
+                    if base:
+                        run_git(["git", "branch", "-D", branch], canonical)
+                        record_state(ch.id, canonical, base)
+                    else:
+                        record_state(ch.id, canonical, current_branch(canonical) or branch)
+                    remove_worktree(canonical, ch.id)
+                    channel_cwd[ch.id] = canonical
+                    await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+                    msg = "ℹ️ No files changed — no session started."
+                    if not base:
+                        msg += " (Branch left checked out; no base branch found.)"
+                    await ch.send(msg)
+                    return
+
+                active_sessions[ch.id] = {
+                    "branch": branch,
+                    "engine": engine,
+                    "description": exec_description,
+                    "turns": 1,
+                    "phase": "working",
+                    "cwd": cwd,
+                    "runtime_config": dict(runtime_config),
+                }
+
+                auto_commit(exec_description, 1, cwd)
+                await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+                stat = get_diff_stat(cwd)
+                await ch.send(f"📊 {stat}\n"
+                              f"Send a follow-up to keep iterating, `diff` to inspect, "
+                              f"or `done` when finished.")
+                return
+            finally:
+                if clear_saved_plan and clear_plan_context(ch.id):
+                    await ch.send("🧹 Cleared saved plan context.")
+
+        plan_request = plan_input
         runtime_config = get_runtime_config(ch.id)
         engine = get_default_engine(ch.id)
         label = get_engine_label(engine)
@@ -3136,150 +3283,7 @@ async def on_message(message: discord.Message):
 
         save_plan_context(ch.id, cwd, engine, plan_request, output, runtime_config=runtime_config)
         await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
-        await ch.send("💾 Saved plan context. Run `plan do` to execute it.")
-        return
-
-    if lower == "plan do" or lower.startswith("plan do ") or lower.startswith("plan do:"):
-        plan_ctx = load_plan_context(ch.id)
-        if not plan_ctx:
-            await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
-            return
-
-        do_request = content[len("plan do"):].strip()
-        if do_request.startswith(":"):
-            do_request = do_request[1:].strip()
-        runtime_config = get_runtime_config(ch.id)
-        engine = get_default_engine(ch.id)
-        label = get_engine_label(engine)
-        model = get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch.id)
-        plan_cwd = (plan_ctx.get("cwd") or "").strip() or cwd
-        plan_branch = (plan_ctx.get("branch") or "").strip()
-        if plan_branch == "?":
-            plan_branch = ""
-        plan_branch_exists = False
-        exec_description = (
-            do_request
-            or (plan_ctx.get("request") or "").strip()
-            or "execute saved plan"
-        )
-        execution_task = build_do_prompt(plan_ctx, do_request)
-        clear_saved_plan = False
-
-        try:
-            if not plan_cwd or not pathlib.Path(plan_cwd).exists():
-                await ch.send(f"❌ Saved plan repo not found: `{plan_cwd or '(empty)'}`")
-                return
-            plan_branch_exists = bool(
-                plan_branch
-                and (_branch_exists(plan_branch, plan_cwd) or _remote_branch_exists(plan_branch, plan_cwd))
-            )
-
-            if session:
-                await discard_changes(session["branch"], cwd)
-                _end_session(ch.id, cwd)
-                await ch.send("⚠️ Previous session discarded before executing saved plan.")
-                session = None
-
-            cwd = plan_cwd
-            channel_cwd[ch.id] = cwd
-            await ch.send(
-                f"🚀 Executing saved plan with **{label}** (`{model}`) on `{cwd}`...\n"
-                f"> {truncate(exec_description, 200)}"
-            )
-            if plan_branch and not plan_branch_exists:
-                await ch.send(
-                    f"⚠️ Saved planning branch `{plan_branch}` not found. "
-                    "Using the default base branch instead."
-                )
-
-            try:
-                cwd = ensure_worktree(cwd, ch.id)
-            except Exception as e:
-                await ch.send(f"❌ Worktree creation failed: `{e}`")
-                return
-
-            try:
-                branch = create_branch(
-                    exec_description,
-                    engine,
-                    cwd,
-                    base_branch=plan_branch if plan_branch_exists else None,
-                )
-            except Exception as e:
-                await ch.send(f"❌ Branch creation failed: `{e}`")
-                remove_worktree(_canonical_repo(cwd), ch.id)
-                channel_cwd[ch.id] = _canonical_repo(cwd)
-                return
-            record_state(ch.id, cwd, branch)
-
-            stop_event = asyncio.Event()
-            stop_events[ch.id] = stop_event
-            try:
-                output = await run_engine(
-                    engine,
-                    execution_task,
-                    ch,
-                    resume=False,
-                    cwd=cwd,
-                    stop_event=stop_event,
-                    runtime_config=runtime_config,
-                )
-            except Exception as e:
-                await ch.send(f"❌ {label} error: `{e}`")
-                await discard_changes(branch, cwd)
-                _end_session(ch.id, cwd)
-                return
-            finally:
-                stop_events.pop(ch.id, None)
-
-            if stop_event.is_set():
-                await discard_changes(branch, cwd)
-                _end_session(ch.id, cwd)
-                return
-
-            clear_saved_plan = True
-
-            # If no files changed, clean up the branch and skip starting a session.
-            if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
-                canonical = _canonical_repo(cwd)
-                base = _resolve_checkout_branch(canonical, avoid=branch)
-                if base:
-                    run_git(["git", "branch", "-D", branch], canonical)
-                    record_state(ch.id, canonical, base)
-                else:
-                    record_state(ch.id, canonical, current_branch(canonical) or branch)
-                remove_worktree(canonical, ch.id)
-                channel_cwd[ch.id] = canonical
-                await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
-                msg = "ℹ️ No files changed — no session started."
-                if not base:
-                    msg += " (Branch left checked out; no base branch found.)"
-                await ch.send(msg)
-                return
-
-            active_sessions[ch.id] = {
-                "branch": branch,
-                "engine": engine,
-                "description": exec_description,
-                "turns": 1,
-                "phase": "working",
-                "cwd": cwd,
-                "runtime_config": dict(runtime_config),
-            }
-
-            auto_commit(exec_description, 1, cwd)
-            await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
-            stat = get_diff_stat(cwd)
-            await ch.send(f"📊 {stat}\n"
-                          f"Send a follow-up to keep iterating, `diff` to inspect, "
-                          f"or `done` when finished.")
-            return
-        finally:
-            if clear_saved_plan and clear_plan_context(ch.id):
-                await ch.send("🧹 Cleared saved plan context.")
-
-    if lower.startswith("do:"):
-        await ch.send("`do:` was renamed to `plan do`. Use `plan do [extra instructions]`.")
+        await ch.send("💾 Saved plan context. Run `plan: do` to execute it.")
         return
 
     if lower == "branches":
