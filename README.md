@@ -150,6 +150,7 @@ Use `plan show` to inspect saved plan context and `plan clear` to remove it manu
 
 Send follow-up messages freely — the engine keeps session context (`claude --continue`, `codex exec resume --last`).
 If a run times out, the bot saves a short context snapshot and injects it on resume. Clear it with `context clear` if needed.
+If you need to append work while a turn is still running, send `add: <instruction>` (or `queue:`). The bot saves run context, queues the instruction, then resumes automatically.
 
 ```
 also add client-side validation
@@ -205,11 +206,12 @@ pr main               → open a GitHub PR targeting main
 |---------|-------------|
 | `<follow-up>` | Continue with the same engine and the session's model/reasoning snapshot |
 | `stop` | Cancel the currently running engine turn |
+| `add: <instruction>` / `queue: <instruction>` | Queue extra instructions during an in-progress run; bot resumes automatically after the current turn |
 | `diff` | Peek at current changes |
 | `undo` | Discard uncommitted working-tree changes in the active session |
 | `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
-| `context clear` | Forget saved timeout/resume context (`resume clear` / `clear context` aliases) |
+| `context clear` | Forget saved timeout/resume context and queued follow-ups (`resume clear` / `clear context` aliases) |
 | `plan show` | Show saved plan context for this channel |
 | `plan clear` | Clear saved plan context without executing it (`clear plan` alias) |
 | `abort` | Discard all changes immediately |
