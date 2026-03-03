@@ -99,6 +99,8 @@ _restart_on_close = False
 stop_events: dict[int, asyncio.Event] = {}
 # channel_id → running subprocess for engine
 running_procs: dict[int, asyncio.subprocess.Process] = {}
+# channel_id → currently running task metadata (engine/cwd/task/run_id)
+active_run_contexts: dict[int, dict] = {}
 _RESTART_FLAG = pathlib.Path("/tmp/bot_restart_channel")
 
 # ── Discord client setup ─────────────────────────────────────────────────────
@@ -540,6 +542,113 @@ def _tail_text(text: str, max_chars: int = CONTEXT_MAX_CHARS) -> str:
     if len(clean) <= max_chars:
         return clean
     return clean[-max_chars:]
+
+
+def save_queued_run_command(
+    ch_id: int,
+    command: str,
+    images: list[str] | None = None,
+    run_id: str | None = None,
+) -> int:
+    data = _load_state()
+    queues = data.setdefault("queued_run_commands", {})
+    key = str(ch_id)
+    raw_queue = queues.get(key)
+    if not isinstance(raw_queue, list):
+        raw_queue = []
+        queues[key] = raw_queue
+    clean_images = [p.strip() for p in (images or []) if isinstance(p, str) and p.strip()]
+    raw_queue.append({
+        "ts": int(time.time()),
+        "run_id": (run_id or "").strip(),
+        "command": command.strip(),
+        "images": clean_images,
+    })
+    _save_state(data)
+    return len(raw_queue)
+
+
+def queued_run_command_count(ch_id: int, run_id: str | None = None) -> int:
+    data = _load_state()
+    queues = data.get("queued_run_commands") or {}
+    raw_queue = queues.get(str(ch_id))
+    if not isinstance(raw_queue, list):
+        return 0
+    if run_id is None:
+        return len(raw_queue)
+    key = run_id.strip()
+    return sum(
+        1
+        for item in raw_queue
+        if isinstance(item, dict) and (str(item.get("run_id") or "").strip() == key)
+    )
+
+
+def pop_queued_run_commands(ch_id: int, run_id: str | None = None) -> list[dict]:
+    data = _load_state()
+    queues = data.get("queued_run_commands") or {}
+    key = str(ch_id)
+    raw_queue = queues.get(key)
+    if not isinstance(raw_queue, list):
+        return []
+
+    selected: list[dict] = []
+    remaining: list[dict] = []
+    match_id = (run_id or "").strip() if run_id is not None else None
+    for item in raw_queue:
+        if not isinstance(item, dict):
+            continue
+        item_run_id = str(item.get("run_id") or "").strip()
+        is_match = match_id is None or item_run_id == match_id or (match_id is not None and not item_run_id)
+        clean_command = str(item.get("command") or "").strip()
+        raw_images = item.get("images")
+        clean_images = []
+        if isinstance(raw_images, list):
+            clean_images = [str(p).strip() for p in raw_images if isinstance(p, str) and str(p).strip()]
+        if is_match:
+            if clean_command or clean_images:
+                selected.append({"command": clean_command, "images": clean_images})
+        else:
+            remaining.append({
+                "run_id": item_run_id,
+                "command": clean_command,
+                "images": clean_images,
+            })
+
+    if remaining:
+        queues[key] = remaining
+        data["queued_run_commands"] = queues
+    else:
+        queues.pop(key, None)
+        if queues:
+            data["queued_run_commands"] = queues
+        else:
+            data.pop("queued_run_commands", None)
+    _save_state(data)
+    return selected
+
+
+def build_queued_followup_task(entries: list[dict]) -> tuple[str, list[str]]:
+    if not entries:
+        return "Continue where you left off.", []
+
+    lines = [
+        "Additional user instructions were queued while your previous run was still in progress.",
+        "Apply them now in order, preserving prior work unless a later instruction says otherwise.",
+    ]
+    images: list[str] = []
+    for idx, entry in enumerate(entries, 1):
+        cmd = str(entry.get("command") or "").strip()
+        entry_images = [
+            p for p in (entry.get("images") or [])
+            if isinstance(p, str) and p.strip() and pathlib.Path(p).exists()
+        ]
+        images.extend(entry_images)
+        if cmd:
+            lines.append(f"{idx}. {cmd}")
+        else:
+            lines.append(f"{idx}. Inspect the queued image attachment(s) and apply the requested follow-up.")
+    return "\n".join(lines), images
 
 
 def save_resume_context(
@@ -1832,52 +1941,95 @@ async def run_engine(
 ) -> str:
     runner = run_codex if engine == "codex" else run_claude_code
     run_config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch.id))
+    run_id = f"{ch.id}-{time.time_ns()}"
 
     if stop_event and stop_event.is_set():
         return "(stopped)"
 
     raw_task = task
-    if resume:
-        task = build_resume_prompt(task, ch.id, cwd, engine)
-    # Prevent stale usage from a previous run leaking into this turn/session.
-    channel_last_usage[ch.id] = {"engine": engine}
-
+    active_run_contexts[ch.id] = {
+        "run_id": run_id,
+        "engine": engine,
+        "cwd": cwd,
+        "task": raw_task,
+        "resume": bool(resume),
+        "started_at": int(time.time()),
+    }
     try:
-        output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
-        if stop_event and stop_event.is_set():
-            return "(stopped)"
-        clear_resume_context(ch.id)
-        return output
-    except subprocess.TimeoutExpired as e:
-        if stop_event and stop_event.is_set():
-            return "(stopped)"
-        save_resume_context(ch.id, cwd, engine, raw_task, getattr(e, "output", None), reason="timeout")
-        # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
-        for attempt in range(1, MAX_AUTO_CONTINUES + 1):
+        if resume:
+            task = build_resume_prompt(task, ch.id, cwd, engine)
+        # Prevent stale usage from a previous run leaking into this turn/session.
+        channel_last_usage[ch.id] = {"engine": engine}
+
+        output: str | None = None
+        try:
+            output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
+        except subprocess.TimeoutExpired as e:
             if stop_event and stop_event.is_set():
                 return "(stopped)"
-            auto_commit(raw_task, 0, cwd)  # save any partial work
-            await ch.send(f"⏳ Timed out — saved context and auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})...")
-            try:
-                resume_task = build_resume_prompt("continue where you left off", ch.id, cwd, engine)
-                output = await runner(
-                    resume_task,
-                    ch,
-                    resume=True,
-                    cwd=cwd,
-                    runtime_config=run_config,
-                )
+            save_resume_context(ch.id, cwd, engine, raw_task, getattr(e, "output", None), reason="timeout")
+            # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
+            for attempt in range(1, MAX_AUTO_CONTINUES + 1):
                 if stop_event and stop_event.is_set():
                     return "(stopped)"
-                clear_resume_context(ch.id)
-                return output
-            except subprocess.TimeoutExpired as e2:
-                save_resume_context(ch.id, cwd, engine, raw_task, getattr(e2, "output", None), reason="timeout")
-                continue
-        auto_commit(raw_task, 0, cwd)
-        await ch.send(f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
-                       f"Send a follow-up to continue manually, or `done` to review what's there.")
-        return "(timed out — partial work auto-committed)"
+                auto_commit(raw_task, 0, cwd)  # save any partial work
+                await ch.send(
+                    f"⏳ Timed out — saved context and auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})..."
+                )
+                try:
+                    resume_task = build_resume_prompt("continue where you left off", ch.id, cwd, engine)
+                    output = await runner(
+                        resume_task,
+                        ch,
+                        resume=True,
+                        cwd=cwd,
+                        runtime_config=run_config,
+                    )
+                    break
+                except subprocess.TimeoutExpired as e2:
+                    save_resume_context(ch.id, cwd, engine, raw_task, getattr(e2, "output", None), reason="timeout")
+                    continue
+            if output is None:
+                auto_commit(raw_task, 0, cwd)
+                await ch.send(
+                    f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
+                    f"Send a follow-up to continue manually, or `done` to review what's there."
+                )
+                return "(timed out — partial work auto-committed)"
+
+            if stop_event and stop_event.is_set():
+                return "(stopped)"
+
+        if stop_event and stop_event.is_set():
+            return "(stopped)"
+        if output is None:
+            output = "(no output)"
+
+        queued_entries = pop_queued_run_commands(ch.id, run_id=run_id)
+        if queued_entries:
+            save_resume_context(ch.id, cwd, engine, raw_task, output, reason="queued_followup")
+            queued_task, queued_images = build_queued_followup_task(queued_entries)
+            await ch.send(
+                f"📥 Processing {len(queued_entries)} queued follow-up instruction(s) from this run..."
+            )
+            next_output = await run_engine(
+                engine,
+                queued_task,
+                ch,
+                resume=True,
+                images=queued_images or None,
+                cwd=cwd,
+                stop_event=stop_event,
+                runtime_config=run_config,
+            )
+            if next_output == "(stopped)":
+                return "(stopped)"
+            output = f"{output}\n\n[queued follow-up]\n\n{next_output}"
+
+        clear_resume_context(ch.id)
+        return output
+    finally:
+        active_run_contexts.pop(ch.id, None)
 
 
 # ── Git workflow ──────────────────────────────────────────────────────────────
@@ -2166,10 +2318,11 @@ HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 **During a session:**
 Type follow-ups freely — engine keeps context
 `stop` — cancel the current run
+`add: <instruction>` / `queue: <instruction>` — queue work during an active run (auto-resumes after finish)
 `switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — peek at changes · `undo` — discard uncommitted changes
-`context clear` — forget saved timeout context (`resume clear` / `clear context`)
+`context clear` — forget saved timeout context and queued follow-ups (`resume clear` / `clear context`)
 
 **Ending a session:**
 `done` — full diff + push prompt
@@ -2444,6 +2597,38 @@ async def on_message(message: discord.Message):
             await ch.send("🛑 Stopped current run.")
         else:
             await ch.send("No active run to stop.")
+        return
+
+    # ── Queue follow-up while run is active ───────────────────────────────
+    proc = running_procs.get(ch.id)
+    run_in_progress = bool(proc and proc.returncode is None)
+    if run_in_progress:
+        queue_match = re.match(r"^(add|queue)\s*:\s*(.*)$", content, flags=re.IGNORECASE)
+        if queue_match:
+            queued_command = (queue_match.group(2) or "").strip()
+            queued_images = await download_attachments(message)
+            if not queued_command and not queued_images:
+                await ch.send("Usage while running: `add: <instruction>` (or attach image(s) with it).")
+                return
+
+            run_ctx = active_run_contexts.get(ch.id) or {}
+            run_id = str(run_ctx.get("run_id") or "").strip() or None
+            run_engine_name = str(run_ctx.get("engine") or (session or {}).get("engine") or get_default_engine(ch.id))
+            run_cwd = run_ctx.get("cwd") or cwd
+            run_task = str(run_ctx.get("task") or queued_command or "queued follow-up")
+            save_resume_context(ch.id, run_cwd, run_engine_name, run_task, None, reason="queued_followup")
+            save_queued_run_command(ch.id, queued_command, queued_images, run_id=run_id)
+            queue_len = queued_run_command_count(ch.id, run_id=run_id)
+            await ch.send(
+                f"📥 Queued follow-up #{queue_len} for the current run. "
+                "I’ll resume automatically when it finishes."
+            )
+            return
+
+        await ch.send(
+            "⏳ A run is already in progress. Send `add: <instruction>` (or `queue:`) to append work, "
+            "or `stop` to cancel."
+        )
         return
 
     # ── Session: done → show full diff and prompt ─────────────────────────
@@ -2831,10 +3016,16 @@ async def on_message(message: discord.Message):
 
     if lower in ("context clear", "resume clear", "clear context"):
         cleared = clear_resume_context(ch.id)
-        if cleared:
-            await ch.send("🧹 Cleared saved resume context for this channel.")
+        queued = pop_queued_run_commands(ch.id)
+        if cleared or queued:
+            parts = []
+            if cleared:
+                parts.append("saved resume context")
+            if queued:
+                parts.append(f"{len(queued)} queued follow-up(s)")
+            await ch.send(f"🧹 Cleared {' and '.join(parts)} for this channel.")
         else:
-            await ch.send("No saved resume context to clear.")
+            await ch.send("No saved resume context or queued follow-ups to clear.")
         return
 
     if lower == "plan show":
