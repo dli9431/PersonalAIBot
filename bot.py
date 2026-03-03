@@ -2346,7 +2346,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves/extends plan context)
-`plan: do [extra instructions]` — execute saved plan context, then clear it
+`plan: do [extra instructions]` / `plan do [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
 
 **During a session:**
@@ -3096,10 +3096,18 @@ async def on_message(message: discord.Message):
             await ch.send("No saved plan context to clear.")
         return
 
-    if lower.startswith("plan:"):
-        plan_input = content.split(":", 1)[1].strip()
+    if lower.startswith("plan:") or lower == "plan do" or lower.startswith("plan do ") or lower.startswith("plan do:"):
+        if lower.startswith("plan:"):
+            plan_input = content.split(":", 1)[1].strip()
+        else:
+            do_tail = content[len("plan do"):].strip()
+            if do_tail.startswith(":"):
+                do_tail = do_tail[1:].strip()
+            plan_input = f"do {do_tail}".strip()
         if not plan_input:
-            await ch.send("Usage: `plan: <task>` or `plan: do [extra instructions]`")
+            await ch.send(
+                "Usage: `plan: <task>` or `plan: do [extra instructions]` (alias: `plan do [extra instructions]`)"
+            )
             return
 
         plan_input_lower = plan_input.lower()
@@ -3283,7 +3291,7 @@ async def on_message(message: discord.Message):
 
         save_plan_context(ch.id, cwd, engine, plan_request, output, runtime_config=runtime_config)
         await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
-        await ch.send("💾 Saved plan context. Run `plan: do` to execute it.")
+        await ch.send("💾 Saved plan context. Run `plan: do` (or `plan do`) to execute it.")
         return
 
     if lower == "branches":
