@@ -142,6 +142,7 @@ do:
 ```
 
 `plan:` runs in planning mode with this channel's default engine/model and saves context to disk.
+Successive `plan:` commands in the same repo/engine extend the saved context instead of replacing it.
 `do:` (optionally with extra instructions) executes the last saved plan context for this
 channel, then clears it.
 Use `plan show` to inspect saved plan context and `plan clear` to remove it manually.
