@@ -2346,7 +2346,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:`
 `plan: <task>` — planning mode with default engine/model (saves/extends plan context)
-`do: [extra instructions]` — execute saved plan context, then clear it
+`plan do [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
 
 **During a session:**
@@ -3136,16 +3136,18 @@ async def on_message(message: discord.Message):
 
         save_plan_context(ch.id, cwd, engine, plan_request, output, runtime_config=runtime_config)
         await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
-        await ch.send("💾 Saved plan context. Run `do:` to execute it.")
+        await ch.send("💾 Saved plan context. Run `plan do` to execute it.")
         return
 
-    if lower.startswith("do:"):
+    if lower == "plan do" or lower.startswith("plan do ") or lower.startswith("plan do:"):
         plan_ctx = load_plan_context(ch.id)
         if not plan_ctx:
             await ch.send("No saved plan context for this channel. Run `plan: <task>` first.")
             return
 
-        do_request = content.split(":", 1)[1].strip()
+        do_request = content[len("plan do"):].strip()
+        if do_request.startswith(":"):
+            do_request = do_request[1:].strip()
         runtime_config = get_runtime_config(ch.id)
         engine = get_default_engine(ch.id)
         label = get_engine_label(engine)
@@ -3275,6 +3277,10 @@ async def on_message(message: discord.Message):
         finally:
             if clear_saved_plan and clear_plan_context(ch.id):
                 await ch.send("🧹 Cleared saved plan context.")
+
+    if lower.startswith("do:"):
+        await ch.send("`do:` was renamed to `plan do`. Use `plan do [extra instructions]`.")
+        return
 
     if lower == "branches":
         branches = get_branch_list(cwd)[:15]
