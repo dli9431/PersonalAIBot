@@ -706,6 +706,28 @@ def _safe_current_branch(path: str | None) -> str:
         return "?"
 
 
+def _can_extend_plan_context(previous: dict | None, cwd: str | None, engine: str) -> bool:
+    if not previous:
+        return False
+    prev_engine = (previous.get("engine") or "").strip()
+    if prev_engine and prev_engine != engine:
+        return False
+    prev_cwd = (previous.get("cwd") or "").strip()
+    if cwd and prev_cwd and prev_cwd != cwd:
+        return False
+    return True
+
+
+def _append_plan_text(existing: str, addition: str) -> str:
+    existing = existing.strip()
+    addition = addition.strip()
+    if not existing:
+        return addition
+    if not addition:
+        return existing
+    return f"{existing}\n\n---\n\n{addition}"
+
+
 def save_plan_context(
     ch_id: int,
     cwd: str | None,
@@ -716,14 +738,28 @@ def save_plan_context(
 ) -> None:
     data = _load_state()
     contexts = data.setdefault("plan_contexts", {})
+    previous = contexts.get(str(ch_id))
+    request_text = request.strip()
+    plan_text = _tail_text(_coerce_text(plan_output), max_chars=PLAN_CONTEXT_MAX_CHARS)
+    if _can_extend_plan_context(previous if isinstance(previous, dict) else None, cwd, engine):
+        prev_request = (previous.get("request") or "").strip()
+        prev_plan = (previous.get("plan") or "").strip()
+        request_text = _tail_text(
+            _append_plan_text(prev_request, request_text),
+            max_chars=PLAN_CONTEXT_MAX_CHARS,
+        )
+        plan_text = _tail_text(
+            _append_plan_text(prev_plan, plan_text),
+            max_chars=PLAN_CONTEXT_MAX_CHARS,
+        )
     entry = {
         "ts": int(time.time()),
         "engine": engine,
         "model": get_model_for_engine(engine, runtime_config=runtime_config, ch_id=ch_id),
         "cwd": cwd or "",
         "branch": _safe_current_branch(cwd),
-        "request": request.strip(),
-        "plan": _tail_text(_coerce_text(plan_output), max_chars=PLAN_CONTEXT_MAX_CHARS),
+        "request": request_text,
+        "plan": plan_text,
     }
     contexts[str(ch_id)] = entry
     _save_state(data)
@@ -762,18 +798,16 @@ def build_plan_prompt(
         "Inspect the repository and produce an execution plan only.",
         "Return concise markdown with sections: Goal, Steps, Files, Validation, Risks.",
     ]
-    if previous and (not previous.get("engine") or previous.get("engine") == engine):
-        prev_cwd = (previous.get("cwd") or "").strip()
-        if not cwd or not prev_cwd or prev_cwd == cwd:
-            prev_request = (previous.get("request") or "").strip()
-            prev_plan = (previous.get("plan") or "").strip()
-            lines.append("Existing saved plan context:")
-            if prev_request:
-                lines.append(f"Previous request: {prev_request}")
-            if prev_plan:
-                lines.append("Previous plan:")
-                lines.append(prev_plan)
-            lines.append("Update and replace that plan using the new request below.")
+    if _can_extend_plan_context(previous, cwd, engine):
+        prev_request = (previous.get("request") or "").strip()
+        prev_plan = (previous.get("plan") or "").strip()
+        lines.append("Existing saved plan context:")
+        if prev_request:
+            lines.append(f"Previous request: {prev_request}")
+        if prev_plan:
+            lines.append("Previous plan:")
+            lines.append(prev_plan)
+        lines.append("Extend and refine that plan using the new request below.")
     lines.append("Planning request:")
     lines.append(request.strip())
     return "\n".join(line for line in lines if line)
@@ -2311,7 +2345,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:`
-`plan: <task>` — planning mode with default engine/model (saves plan context)
+`plan: <task>` — planning mode with default engine/model (saves/extends plan context)
 `do: [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
 
