@@ -599,7 +599,7 @@ def pop_queued_run_commands(ch_id: int, run_id: str | None = None) -> list[dict]
         if not isinstance(item, dict):
             continue
         item_run_id = str(item.get("run_id") or "").strip()
-        is_match = match_id is None or item_run_id == match_id
+        is_match = match_id is None or item_run_id == match_id or (match_id is not None and not item_run_id)
         clean_command = str(item.get("command") or "").strip()
         raw_images = item.get("images")
         clean_images = []
