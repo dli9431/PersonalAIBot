@@ -39,7 +39,7 @@ No build step, test suite, or linter is configured.
 
 - **Dual-engine**: Prefix tasks with `claude:`/`cc:` or `codex:`/`cx:`/`openai:` to pick an engine, or use `DEFAULT_ENGINE` from `.env`.
 - **Iterative sessions**: Follow-up messages continue with `--resume` / `exec resume --last`. Sessions have phases: `"working"` → `"review"` → `"merge_target"` (when no dev branch) → cleared. Turn counter incremented each run, reflected in WIP commit messages.
-- **Review flow**: `done` → diff shown → `yes`/`push`/`approve`/`lgtm`/`ship it` to commit+push+merge, or `no`/`discard`/`reject`/`nah` to abandon.
+- **Review flow**: `review`/`done` shows structured major changes (before/after/why) → `yes`/`push`/`approve`/`lgtm`/`ship it` to commit+push+merge, or `no`/`discard`/`reject`/`nah` to abandon.
 - **No-change cleanup**: If the engine makes no file changes, the feature branch is deleted and no session is started.
 - **Multi-repo**: `GIT_PROJECTS` env var registers additional repos. `cwd <n>` switches the active repo per channel. All git ops accept an optional `path` param.
 - **Branch switching**: `branch switch <branch|N>` (or `switch <branch|N>`) mid-session auto-commits and checks out the target branch. `N` refs are populated by the `branches` command via `branch_listing` dict (cached per channel).
@@ -55,10 +55,10 @@ No build step, test suite, or linter is configured.
 ## Discord Commands (handled in on_message)
 
 **Task execution:** plain text, `claude: <task>`, `cc: <task>`, `codex: <task>`, `cx: <task>`, `openai: <task>`
-**Session control:** `stop`, `done`, `yes`/`push`/`approve`/`lgtm`/`ship it`, `no`/`discard`/`reject`/`nah`, `abort`, `skip`, `diff`, `undo`
+**Session control:** `stop`, `review`, `done`, `yes`/`push`/`approve`/`lgtm`/`ship it`, `no`/`discard`/`reject`/`nah`, `abort`, `skip`, `diff`, `undo`
 **Branch nav:** `branch switch <branch|N>`, `switch <branch|N>`, `cwd [n]`, `branches`, `branch delete <name|N> [local|remote|both] [force]`, `branch protect [list|add|remove|clear|reset]`
 **Git:** `merge <target>`, `merge src>tgt`, `merge src into tgt`, `pr <target>`, `pull [branch|N]`
-**Multi-repo:** `repos`, `repo <n> status|diff|commit [msg]|push|branches`
+**Multi-repo:** `repos`, `repo <n> status|diff|review|commit [msg]|push|branches`
 **Recovery:** `recover`, `recover <id>`, `recover drop <id>`
 **Config:** `claude models`, `codex models` — list available (numbered); `claude model <n|name>`, `cc model <n|name>`, `codex model <n|name>`, `cx model <n|name>`, `engine claude`, `engine codex`, `engine claude model <n|name>`, `engine codex model <n|name>`, `engine`
 **Login:** `claude login`, `codex login`, `openai login`, `login both`
