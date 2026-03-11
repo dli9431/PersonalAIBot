@@ -25,7 +25,7 @@ No build step, test suite, or linter is configured.
 
 1. **Config & State** (~lines 29-110) — Environment variables via `python-dotenv`. `GIT_PROJECTS` list of (label, path) tuples for multi-repo support. Per-channel state: `active_sessions`, `last_pushed`, `channel_cwd`, `branch_listing`. Stop events and running procs tracked for cancellation.
 
-2. **Helpers** (~lines 113-493) — Auth check, slugify, `run_git(cmd, path)` with optional cwd override, `resolve_project`, `resolve_branch` (N ref lookup), `get_diff`/`get_diff_stat` (compares feature branch vs base, not just working tree), `branch_merged_status`, protected branch management, ANSI stripping, image download helpers.
+2. **Helpers** (~lines 113-493) — Auth check, slugify, `run_git(cmd, path)` with optional cwd override, `resolve_project`, `resolve_branch` (N ref lookup), `get_diff`/`get_diff_stat`, structured `review` parsing/formatting helpers (major changes with before/after/why), branch/protection helpers, ANSI stripping, image download helpers.
 
 3. **Login Helpers** (~lines 495-579) — `login_codex()` and `login_claude()` run the respective CLI auth flows, streaming output to Discord. Both use a `_login_lock` dict to prevent concurrent logins.
 
