@@ -40,6 +40,8 @@ MAIN_BRANCH = os.getenv("MAIN_BRANCH", "main")
 DEV_BRANCH = os.getenv("DEV_BRANCH", "dev")
 PROTECTED_BRANCHES_ENV = os.getenv("PROTECTED_BRANCHES", "")
 MAX_DIFF_CHARS = 1800
+REVIEW_MESSAGE_LIMIT = 1900
+REVIEW_CODE_CHUNK_LIMIT = 600
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
@@ -214,6 +216,7 @@ def expand_branch_args(tokens: list[str], ch_id: int, cwd: str) -> list[str]:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_HUNK_CONTEXT_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@ ?(.*)$")
 
 
 def strip_ansi(text: str) -> str:
@@ -225,6 +228,84 @@ def truncate(text: str, limit: int = MAX_DIFF_CHARS) -> str:
         return text
     h = limit // 2 - 20
     return text[:h] + "\n\n... (truncated) ...\n\n" + text[-h:]
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _sanitize_code_block_text(text: str) -> str:
+    clean = text or "(none)"
+    return clean.replace("```", "'''")
+
+
+def _split_text_for_code_block(text: str, max_chunk_chars: int) -> list[str]:
+    """Split text into chunks suitable for fenced code blocks without truncating content."""
+    max_chunk = max(80, max_chunk_chars)
+    lines = (text or "").splitlines()
+    if not lines:
+        return ["(none)"]
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for line in lines:
+        raw_line = line
+        while len(raw_line) > max_chunk:
+            segment = raw_line[:max_chunk]
+            raw_line = raw_line[max_chunk:]
+            if current_lines:
+                chunks.append("\n".join(current_lines))
+                current_lines = []
+                current_len = 0
+            chunks.append(segment)
+        line_len = len(raw_line) + 1
+        if current_lines and current_len + line_len > max_chunk:
+            chunks.append("\n".join(current_lines))
+            current_lines = [raw_line]
+            current_len = line_len
+        else:
+            current_lines.append(raw_line)
+            current_len += line_len
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks or ["(none)"]
+
+
+def _record_session_followup(session: dict, instruction: str) -> None:
+    note = _collapse_whitespace(instruction)
+    if not note or note.lower() == "describe and analyze these images":
+        return
+    followups = session.setdefault("followups", [])
+    if not isinstance(followups, list):
+        followups = []
+        session["followups"] = followups
+    if note in followups:
+        return
+    followups.append(note)
+    if len(followups) > 12:
+        del followups[:-12]
+
+
+def _session_intent_summary(session: dict | None, limit: int = 260) -> str:
+    if not session:
+        return ""
+    parts: list[str] = []
+    initial = _collapse_whitespace(str(session.get("description") or ""))
+    if initial:
+        parts.append(initial)
+    followups = session.get("followups")
+    if isinstance(followups, list):
+        for followup in followups:
+            note = _collapse_whitespace(str(followup or ""))
+            if note and note not in parts:
+                parts.append(note)
+    if not parts:
+        return ""
+    summary = " | ".join(parts)
+    return truncate(summary, limit).replace("\n", " ")
 
 
 def current_branch(path: str | None = None) -> str:
@@ -1421,6 +1502,417 @@ def get_diff(path: str | None = None) -> str:
     return combined.strip() or "(no changes detected)"
 
 
+def _collect_unified_review_sections(path: str | None = None) -> list[tuple[str, str]]:
+    base = _base_branch(path)
+    sections: list[tuple[str, str]] = []
+
+    committed = run_git(
+        ["git", "diff", "--unified=0", "--find-renames", "--no-color", f"{base}...HEAD"],
+        path,
+    ).stdout.strip()
+    if committed:
+        sections.append((f"committed vs `{base}`", committed))
+
+    staged = run_git(
+        ["git", "diff", "--cached", "--unified=0", "--find-renames", "--no-color"],
+        path,
+    ).stdout.strip()
+    if staged:
+        sections.append(("staged vs HEAD", staged))
+
+    unstaged = run_git(
+        ["git", "diff", "--unified=0", "--find-renames", "--no-color"],
+        path,
+    ).stdout.strip()
+    if unstaged:
+        sections.append(("unstaged vs index", unstaged))
+
+    untracked = run_git(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        path,
+    ).stdout.strip()
+    if untracked:
+        patches: list[str] = []
+        for rel_path in (line.strip() for line in untracked.splitlines() if line.strip()):
+            patch = run_git(
+                ["git", "diff", "--no-index", "--unified=0", "--no-color", "/dev/null", rel_path],
+                path,
+            ).stdout.strip()
+            if patch:
+                patches.append(patch)
+                continue
+            patches.append(
+                "\n".join(
+                    [
+                        f"diff --git a/{rel_path} b/{rel_path}",
+                        "new file mode 100644",
+                        "--- /dev/null",
+                        f"+++ b/{rel_path}",
+                        "@@ -0,0 +1 @@",
+                        f"+(new untracked file: {rel_path})",
+                    ]
+                )
+            )
+        if patches:
+            sections.append(("untracked files", "\n\n".join(patches)))
+
+    return sections
+
+
+def _strip_diff_path(path_token: str, prefix: str) -> str:
+    token = path_token.strip().strip('"')
+    if token.startswith(prefix):
+        return token[len(prefix):]
+    return token
+
+
+def _parse_diff_header_paths(line: str) -> tuple[str, str]:
+    parts = line.split(" ", 3)
+    if len(parts) < 4:
+        return "", ""
+    before = _strip_diff_path(parts[2], "a/")
+    after = _strip_diff_path(parts[3], "b/")
+    return before, after
+
+
+def _review_file_label(file_state: dict) -> str:
+    rename_from = str(file_state.get("rename_from") or "").strip()
+    rename_to = str(file_state.get("rename_to") or "").strip()
+    if rename_from and rename_to and rename_from != rename_to:
+        return f"{rename_from} -> {rename_to}"
+    after = str(file_state.get("after") or "").strip()
+    if after and after != "/dev/null":
+        return after
+    before = str(file_state.get("before") or "").strip()
+    if before and before != "/dev/null":
+        return before
+    return "(unknown file)"
+
+
+def _parse_unified_review_units(diff_text: str, source_label: str) -> list[dict]:
+    units: list[dict] = []
+    current_file: dict | None = None
+    current_hunk: dict | None = None
+
+    def flush_hunk() -> None:
+        nonlocal current_hunk
+        if current_file is None or current_hunk is None:
+            current_hunk = None
+            return
+        before_lines = current_hunk.get("before") or []
+        after_lines = current_hunk.get("after") or []
+        if before_lines or after_lines:
+            current_file.setdefault("hunks", []).append(current_hunk)
+        current_hunk = None
+
+    def flush_file() -> None:
+        nonlocal current_file
+        flush_hunk()
+        if current_file is None:
+            return
+
+        file_label = _review_file_label(current_file)
+        rename_from = str(current_file.get("rename_from") or "").strip()
+        rename_to = str(current_file.get("rename_to") or "").strip()
+        has_rename = bool(rename_from and rename_to and rename_from != rename_to)
+        before_path = str(current_file.get("before") or "").strip()
+        after_path = str(current_file.get("after") or "").strip()
+        old_mode = str(current_file.get("old_mode") or "").strip()
+        new_mode = str(current_file.get("new_mode") or "").strip()
+
+        if has_rename:
+            units.append(
+                {
+                    "file": file_label,
+                    "before": rename_from,
+                    "after": rename_to,
+                    "source": source_label,
+                    "kind": "rename",
+                    "before_path": before_path or rename_from,
+                    "after_path": after_path or rename_to,
+                    "hunk_context": "",
+                }
+            )
+
+        if old_mode and new_mode and old_mode != new_mode:
+            units.append(
+                {
+                    "file": file_label,
+                    "before": f"mode {old_mode}",
+                    "after": f"mode {new_mode}",
+                    "source": source_label,
+                    "kind": "metadata",
+                    "before_path": before_path,
+                    "after_path": after_path,
+                    "hunk_context": "",
+                }
+            )
+
+        if current_file.get("binary"):
+            units.append(
+                {
+                    "file": file_label,
+                    "before": "(binary content before)",
+                    "after": "(binary content after)",
+                    "source": source_label,
+                    "kind": "binary",
+                    "before_path": before_path,
+                    "after_path": after_path,
+                    "hunk_context": "",
+                }
+            )
+
+        hunks = current_file.get("hunks") or []
+        for hunk in hunks:
+            units.append(
+                {
+                    "file": file_label,
+                    "before": "\n".join(hunk.get("before") or []),
+                    "after": "\n".join(hunk.get("after") or []),
+                    "source": source_label,
+                    "kind": "hunk",
+                    "before_path": before_path,
+                    "after_path": after_path,
+                    "hunk_context": str(hunk.get("context") or "").strip(),
+                }
+            )
+
+        if not has_rename and not hunks and not current_file.get("binary") and not (old_mode and new_mode):
+            if current_file.get("new_file"):
+                units.append(
+                    {
+                        "file": file_label,
+                        "before": "(file did not exist)",
+                        "after": "(new file added)",
+                        "source": source_label,
+                        "kind": "new_file",
+                        "before_path": before_path,
+                        "after_path": after_path,
+                        "hunk_context": "",
+                    }
+                )
+                current_file = None
+                return
+            if current_file.get("deleted_file"):
+                units.append(
+                    {
+                        "file": file_label,
+                        "before": "(file removed)",
+                        "after": "(none)",
+                        "source": source_label,
+                        "kind": "deleted_file",
+                        "before_path": before_path,
+                        "after_path": after_path,
+                        "hunk_context": "",
+                    }
+                )
+                current_file = None
+                return
+            units.append(
+                {
+                    "file": file_label,
+                    "before": "(no textual before lines captured)",
+                    "after": "(no textual after lines captured)",
+                    "source": source_label,
+                    "kind": "metadata",
+                    "before_path": before_path,
+                    "after_path": after_path,
+                    "hunk_context": "",
+                }
+            )
+
+        current_file = None
+
+    for raw_line in diff_text.splitlines():
+        line = raw_line.rstrip("\n")
+        if line.startswith("diff --git "):
+            flush_file()
+            before, after = _parse_diff_header_paths(line)
+            current_file = {
+                "before": before,
+                "after": after,
+                "rename_from": "",
+                "rename_to": "",
+                "old_mode": "",
+                "new_mode": "",
+                "new_file": False,
+                "deleted_file": False,
+                "binary": False,
+                "hunks": [],
+            }
+            continue
+
+        if current_file is None:
+            continue
+
+        if line.startswith("rename from "):
+            current_file["rename_from"] = line[len("rename from "):].strip()
+            continue
+        if line.startswith("rename to "):
+            current_file["rename_to"] = line[len("rename to "):].strip()
+            continue
+        if line.startswith("old mode "):
+            current_file["old_mode"] = line[len("old mode "):].strip()
+            continue
+        if line.startswith("new mode "):
+            current_file["new_mode"] = line[len("new mode "):].strip()
+            continue
+        if line.startswith("new file mode "):
+            current_file["new_file"] = True
+            continue
+        if line.startswith("deleted file mode "):
+            current_file["deleted_file"] = True
+            continue
+        if line.startswith("Binary files ") or line == "GIT binary patch":
+            current_file["binary"] = True
+            continue
+        if line.startswith("@@ "):
+            flush_hunk()
+            context_match = _HUNK_CONTEXT_RE.match(line)
+            context = context_match.group(1).strip() if context_match else ""
+            current_hunk = {"context": context, "before": [], "after": []}
+            continue
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue
+        if current_hunk is None:
+            continue
+        if line.startswith("-") and not line.startswith("---"):
+            current_hunk["before"].append(line[1:])
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_hunk["after"].append(line[1:])
+
+    flush_file()
+    return units
+
+
+def _reason_for_review_unit(unit: dict, intent_summary: str) -> str:
+    file_label = str(unit.get("file") or "(unknown file)")
+    source_label = str(unit.get("source") or "current changes")
+    before_text = str(unit.get("before") or "")
+    after_text = str(unit.get("after") or "")
+    before_lines = len(before_text.splitlines()) if before_text else 0
+    after_lines = len(after_text.splitlines()) if after_text else 0
+    hunk_context = str(unit.get("hunk_context") or "").strip()
+    context_text = f" around `{hunk_context}`" if hunk_context else ""
+    intent_text = (
+        f"to support the request: {intent_summary}"
+        if intent_summary
+        else "to match the generated session changes"
+    )
+    kind = str(unit.get("kind") or "hunk")
+
+    if kind == "rename":
+        before_path = str(unit.get("before") or "").strip() or str(unit.get("before_path") or "").strip()
+        after_path = str(unit.get("after") or "").strip() or str(unit.get("after_path") or "").strip()
+        return f"Renamed `{before_path}` to `{after_path}` ({source_label}) {intent_text}."
+    if kind == "binary":
+        return f"Updated binary content in `{file_label}` ({source_label}) {intent_text}."
+    if kind == "new_file":
+        return f"Added new file `{file_label}` ({source_label}) {intent_text}."
+    if kind == "deleted_file":
+        return f"Removed file `{file_label}` ({source_label}) {intent_text}."
+    if kind == "metadata":
+        return f"Adjusted file metadata for `{file_label}` ({source_label}) {intent_text}."
+    if before_lines and after_lines:
+        return (
+            f"Replaced {before_lines} line(s) with {after_lines} line(s) in `{file_label}`"
+            f"{context_text} ({source_label}) {intent_text}."
+        )
+    if after_lines:
+        return (
+            f"Added {after_lines} line(s) in `{file_label}`{context_text} "
+            f"({source_label}) {intent_text}."
+        )
+    if before_lines:
+        return (
+            f"Removed {before_lines} line(s) from `{file_label}`{context_text} "
+            f"({source_label}) {intent_text}."
+        )
+    return f"Updated `{file_label}` ({source_label}) {intent_text}."
+
+
+def build_major_change_review(path: str | None = None, session: dict | None = None) -> list[dict]:
+    sections = _collect_unified_review_sections(path)
+    review_units: list[dict] = []
+    for source_label, diff_text in sections:
+        review_units.extend(_parse_unified_review_units(diff_text, source_label))
+
+    intent_summary = _session_intent_summary(session)
+    entries: list[dict] = []
+    for unit in review_units:
+        before_text = str(unit.get("before") or "").rstrip("\n")
+        after_text = str(unit.get("after") or "").rstrip("\n")
+        entries.append(
+            {
+                "file": str(unit.get("file") or "(unknown file)"),
+                "source": str(unit.get("source") or "current changes"),
+                "before": before_text if before_text else "(none)",
+                "after": after_text if after_text else "(none)",
+                "why": _reason_for_review_unit(unit, intent_summary),
+            }
+        )
+    return entries
+
+
+def _format_review_entry_parts(entry: dict, index: int, total: int) -> list[str]:
+    file_label = str(entry.get("file") or "(unknown file)")
+    source_label = str(entry.get("source") or "current changes")
+    why_text = truncate(str(entry.get("why") or "Updated as part of generated changes."), 320).replace("\n", " ")
+    before_text = _sanitize_code_block_text(str(entry.get("before") or "(none)"))
+    after_text = _sanitize_code_block_text(str(entry.get("after") or "(none)"))
+    static_overhead = (
+        len(file_label)
+        + len(source_label)
+        + len(why_text)
+        + 250
+    )
+    code_budget = max(120, min(REVIEW_CODE_CHUNK_LIMIT, (REVIEW_MESSAGE_LIMIT - static_overhead) // 2))
+    before_chunks = _split_text_for_code_block(before_text, code_budget)
+    after_chunks = _split_text_for_code_block(after_text, code_budget)
+    part_count = max(len(before_chunks), len(after_chunks))
+    blocks: list[str] = []
+
+    for part_idx in range(part_count):
+        before_chunk = before_chunks[part_idx] if part_idx < len(before_chunks) else "(no additional before lines)"
+        after_chunk = after_chunks[part_idx] if part_idx < len(after_chunks) else "(no additional after lines)"
+        part_suffix = f" (part {part_idx + 1}/{part_count})" if part_count > 1 else ""
+        blocks.append(
+            "\n".join(
+                [
+                    f"**Major Change {index}/{total}{part_suffix}**",
+                    f"File: `{file_label}`",
+                    f"Source: `{source_label}`",
+                    "Before:",
+                    f"```text\n{before_chunk}\n```",
+                    "After:",
+                    f"```text\n{after_chunk}\n```",
+                    f"Why: {why_text}",
+                ]
+            )
+        )
+
+    return blocks
+
+
+async def send_major_change_review(
+    channel: discord.abc.Messageable,
+    title: str,
+    entries: list[dict],
+) -> None:
+    if not entries:
+        await channel.send(f"**{title}**\n(no major changes detected)")
+        return
+
+    blocks: list[str] = []
+    total_entries = len(entries)
+    for idx, entry in enumerate(entries, 1):
+        blocks.extend(_format_review_entry_parts(entry, idx, total_entries))
+
+    total_blocks = len(blocks)
+    for idx, block in enumerate(blocks, 1):
+        await channel.send(f"**{title}** · part {idx}/{total_blocks}\n{block}")
+
+
 def get_status_porcelain(path: str | None = None) -> list[str]:
     """Return git status --porcelain lines (empty if clean)."""
     raw = run_git(["git", "status", "--porcelain"], path).stdout.strip()
@@ -2027,7 +2519,7 @@ async def run_engine(
                 auto_commit(raw_task, 0, cwd)
                 await ch.send(
                     f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
-                    f"Send a follow-up to continue manually, or `done` to review what's there."
+                    f"Send a follow-up to continue manually, or `review`/`done` to inspect what's there."
                 )
                 return "(timed out — partial work auto-committed)"
 
@@ -2355,11 +2847,11 @@ Type follow-ups freely — engine keeps context
 `add: <instruction>` / `queue: <instruction>` — queue work during an active run (auto-resumes after finish)
 `switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
-`diff` — peek at changes · `undo` — discard uncommitted changes
+`diff` — quick raw peek · `review` — major changes (before/after/why) · `undo` — discard uncommitted changes
 `context clear` — forget saved timeout context and queued follow-ups (`resume clear` / `clear context`)
 
 **Ending a session:**
-`done` — full diff + push prompt
+`done` — show major-change review + push prompt
 `yes` / `push` — commit + push, then merge · `no` / `discard` — discard
 `abort` — discard immediately · `skip` — skip merge step
 
@@ -2384,7 +2876,7 @@ HELP_TEXT_2 = """**Branches:**
 
 **Multi-repo:**
 `repos` · `cwd` / `cwd <n>` — show or switch active repo
-`repo <n> status|diff|commit [msg]|push|branches`
+`repo <n> status|diff|review|commit [msg]|push|branches`
 
 **Config (channel-scoped by default):**
 `engine` — show this channel config (+ global default)
@@ -2644,6 +3136,8 @@ async def on_message(message: discord.Message):
             if not queued_command and not queued_images:
                 await ch.send("Usage while running: `add: <instruction>` (or attach image(s) with it).")
                 return
+            if session and queued_command:
+                _record_session_followup(session, queued_command)
 
             run_ctx = active_run_contexts.get(ch.id) or {}
             run_id = str(run_ctx.get("run_id") or "").strip() or None
@@ -2665,12 +3159,20 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # ── Session: done → show full diff and prompt ─────────────────────────
+    # ── Session: review (major changes: before/after/why) ─────────────────
+    if lower == "review" and session:
+        entries = build_major_change_review(cwd, session=session)
+        await send_major_change_review(ch, f"Major changes on `{session['branch']}`", entries)
+        return
+    if lower == "review":
+        await ch.send("No active session to review. Start a task or use `repo <n> review`.")
+        return
+
+    # ── Session: done → show major-change review and prompt ───────────────
     if lower == "done" and session:
-        diff = get_diff(cwd)
-        await ch.send(f"**Full diff on `{session['branch']}`:**\n"
-                       f"```diff\n{truncate(diff, 1800)}\n```")
-        if "(no changes detected)" in diff:
+        entries = build_major_change_review(cwd, session=session)
+        await send_major_change_review(ch, f"Major changes on `{session['branch']}`", entries)
+        if not entries:
             base = _base_branch(cwd)
             ahead = get_ahead_count(cwd)
             if ahead <= 0:
@@ -2824,7 +3326,10 @@ async def on_message(message: discord.Message):
         run_git(["git", "checkout", "."], cwd)
         run_git(["git", "clean", "-fd"], cwd)
         session["turns"] = max(0, session["turns"] - 1)
-        await ch.send("↩️ Reverted last changes. Send another instruction or `diff` to check.")
+        await ch.send(
+            "↩️ Reverted last changes. Send another instruction, `diff` for a quick peek, "
+            "or `review` for major changes."
+        )
         return
 
     # ── Merge commands ────────────────────────────────────────────────────
@@ -3249,7 +3754,7 @@ async def on_message(message: discord.Message):
                 await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
                 stat = get_diff_stat(cwd)
                 await ch.send(f"📊 {stat}\n"
-                              f"Send a follow-up to keep iterating, `diff` to inspect, "
+                              f"Send a follow-up to keep iterating, `diff` for a quick peek, `review` for major changes, "
                               f"or `done` when finished.")
                 return
             finally:
@@ -3352,7 +3857,7 @@ async def on_message(message: discord.Message):
     if lower.startswith("repo "):
         parts = content[5:].strip().split(None, 1)  # use original case for commit msg
         if not parts:
-            await ch.send("Usage: `repo <n> status|diff|commit [msg]|push`")
+            await ch.send("Usage: `repo <n> status|diff|review|commit [msg]|push|branches`")
             return
         proj = resolve_project(parts[0].lower())
         if proj is None:
@@ -3372,6 +3877,10 @@ async def on_message(message: discord.Message):
             staged = run_git_in(["git", "diff", "--cached"], path).stdout.strip()
             combined = (diff + "\n" + staged).strip() or "(no changes)"
             await ch.send(f"**{label} diff:**\n```diff\n{truncate(combined, 1800)}\n```")
+
+        elif subcmd_lower == "review":
+            entries = build_major_change_review(path)
+            await send_major_change_review(ch, f"{label} major changes", entries)
 
         elif subcmd_lower.startswith("commit"):
             msg = subcmd[6:].strip() or "auto: bot commit"
@@ -3403,7 +3912,7 @@ async def on_message(message: discord.Message):
             await ch.send(f"**{label} branches:**\n{listing or '(none)'}")
 
         else:
-            await ch.send("Usage: `repo <n> status|diff|commit [msg]|push|branches`")
+            await ch.send("Usage: `repo <n> status|diff|review|commit [msg]|push|branches`")
         return
 
     # ── Switch active working directory ───────────────────────────────────
@@ -3471,7 +3980,9 @@ async def on_message(message: discord.Message):
             session["branch"] = branch_name
             record_state(ch.id, cwd, branch_name)
             stat = get_diff_stat(cwd)
-            await ch.send(f"📊 {stat or 'clean'}\nContinue with a follow-up or `done` when finished.")
+            await ch.send(
+                f"📊 {stat or 'clean'}\nContinue with a follow-up, run `review`, or `done` when finished."
+            )
         else:
             record_state(ch.id, cwd, branch_name)
         return
@@ -4101,7 +4612,7 @@ async def on_message(message: discord.Message):
         channel_cwd[ch.id] = wt_path
         diff_stat = get_diff_stat(wt_path)
         await ch.send(f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n"
-                       f"Send a follow-up, `diff` to inspect, or `done` when finished.")
+                       f"Send a follow-up, `diff` for a quick peek, `review` for major changes, or `done` when finished.")
         return
 
     # ── Follow-up in active session ───────────────────────────────────────
@@ -4114,6 +4625,7 @@ async def on_message(message: discord.Message):
 
         images = await download_attachments(message)
         follow_up_task = content or "Describe and analyze these images"
+        _record_session_followup(session, follow_up_task)
 
         await ch.send(f"🔄 **{label}** (`{session_model}`) follow-up (turn {session['turns']})...\n"
                        f"> {truncate(follow_up_task, 200)}"
@@ -4145,7 +4657,7 @@ async def on_message(message: discord.Message):
         await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
         stat = get_diff_stat(cwd)
         await ch.send(f"📊 {stat}\n"
-                       f"Send another follow-up, `diff` to inspect, `undo` to revert, "
+                       f"Send another follow-up, `diff` for a quick peek, `review` for major changes, `undo` to revert, "
                        f"or `done` when finished.")
         return
 
@@ -4249,7 +4761,7 @@ async def on_message(message: discord.Message):
     await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
     stat = get_diff_stat(cwd)
     await ch.send(f"📊 {stat}\n"
-                   f"Send a follow-up to keep iterating, `diff` to inspect, "
+                   f"Send a follow-up to keep iterating, `diff` for a quick peek, `review` for major changes, "
                    f"or `done` when finished.")
 
 

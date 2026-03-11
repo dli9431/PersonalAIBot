@@ -2,7 +2,7 @@
 
 Self-hosted Discord bot: send coding tasks from your phone, run them through
 Claude Code or Codex CLI on your local machine (Linux, or WSL on Windows),
-review the diff, push, and merge — all from Discord.
+review major changes, push, and merge — all from Discord.
 
 > **Note:** This project replicates one specific workflow from GitHub Copilot —
 > the agent chat mode where you describe a task and it makes code changes for you.
@@ -170,7 +170,8 @@ and current session token counts when available.
 ### Review and push
 
 ```
-done      → shows full diff + push prompt
+review    → detailed major-change review (before / after / why)
+done      → runs the same review + push prompt
 yes       → commit + push, then merge to dev (or choose merge target)
 no        → discard all changes
 abort     → discard immediately (any time)
@@ -208,7 +209,8 @@ pr main               → open a GitHub PR targeting main
 | `<follow-up>` | Continue with the same engine and the session's model/reasoning snapshot |
 | `stop` | Cancel the currently running engine turn |
 | `add: <instruction>` / `queue: <instruction>` | Queue extra instructions during an in-progress run; bot resumes automatically after the current turn |
-| `diff` | Peek at current changes |
+| `diff` | Quick raw peek at current changes |
+| `review` | Detailed major-change review (before/after/why) |
 | `undo` | Discard uncommitted working-tree changes in the active session |
 | `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
@@ -221,7 +223,7 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `done` | Show full diff and prompt for push |
+| `done` | Run detailed major-change review and prompt for push |
 | `yes` / `push` | Commit + push, then merge to `DEV_BRANCH` if it exists (otherwise asks for merge target) |
 | `no` / `discard` | Discard all changes |
 | `skip` | Commit & push, skip the merge step |
@@ -254,6 +256,7 @@ pr main               → open a GitHub PR targeting main
 | `cwd <n>` | Switch active repo |
 | `repo <n> status` | Git status for repo N |
 | `repo <n> diff` | Diff for repo N |
+| `repo <n> review` | Detailed major-change review for repo N |
 | `repo <n> commit [msg]` | Commit staged changes in repo N |
 | `repo <n> push` | Push repo N |
 | `repo <n> branches` | List branches in repo N |
@@ -316,10 +319,10 @@ Global defaults and channel-scoped engine/model/reasoning selections are persist
 You:   add a dark mode toggle to the settings page
 Bot:   🧠 Claude Code working on it...
 Bot:   [streams Claude's output]
-Bot:   Changes detected. Reply done to review, or keep going.
+Bot:   Changes detected. Reply review to inspect major changes, or keep going.
 
 You:   done
-Bot:   [shows git diff]
+Bot:   [shows major changes: before/after/why]
 Bot:   Reply yes to commit & push, no to discard.
 
 You:   yes
@@ -386,7 +389,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 - **ALLOWED_USER_ID gate** — every message is checked against your Discord user ID; no one else can trigger anything
 - **Tool deny list** — Claude Code is blocked from `rm`, `sudo`, `curl`, `wget`, and `WebFetch` by default
 - **Codex sandbox** — `workspace-write` mode with network off, configured via `~/.codex/config.toml` (see `codex-config-example.toml`)
-- **Session tasks use feature branches** — task/follow-up runs branch off your base and show diff before merge; direct commits to other branches only happen if you explicitly run manual git commands (for example `repo <n> commit`)
+- **Session tasks use feature branches** — task/follow-up runs branch off your base and show major-change review before merge; direct commits to other branches only happen if you explicitly run manual git commands (for example `repo <n> commit`)
 - **No secrets in code** — all tokens loaded from `.env` at runtime, never hardcoded, `.env` gitignored
 - **SSH auth for git** — no stored HTTPS passwords
 
@@ -406,7 +409,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 - [ ] Claude Code: `rm`, `sudo`, `curl`, `wget` denied via `CLAUDE_DENIED_TOOLS`
 - [ ] Codex: copy `codex-config-example.toml` → `~/.codex/config.toml` for workspace-write sandbox + no network
 - [ ] Session task work stays on feature branches (avoid direct commits on `main`/`dev` unless intentional)
-- [ ] Review the diff before saying `yes`
+- [ ] Run `review` (or `done`) and verify major changes before saying `yes`
 - [ ] SSH keys for git auth (not HTTPS with stored password)
 - [ ] (WSL) Repos under WSL filesystem (`/home/...`), not `/mnt/c/`
 
@@ -416,7 +419,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 
 This project is vibe-coded — built iteratively with AI assistance and shared as-is. It works well as a personal tool but comes with no guarantees. Use at your own discretion. The MIT license applies: no warranty, no liability, no support obligations.
 
-If it breaks your repo, deletes your code, or causes other chaos — that's on you. Review the diff before saying `yes`.
+If it breaks your repo, deletes your code, or causes other chaos — that's on you. Run `review` (or `done`) before saying `yes`.
 
 ---
 
