@@ -173,7 +173,7 @@ and current session token counts when available.
 
 ```
 review    → detailed major-change review (before / after / why)
-done      → short change summary + push prompt
+done      → descriptive per-file summary + push prompt
 yes       → commit + push, then merge to dev (or choose merge target)
 no        → discard all changes
 abort     → discard immediately (any time)
@@ -227,7 +227,7 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `done` | Show a short change summary and prompt for push |
+| `done` | Show a descriptive per-file summary and prompt for push |
 | `yes` / `push` | Commit + push, then merge to `DEV_BRANCH` if it exists (otherwise asks for merge target) |
 | `no` / `discard` | Discard all changes |
 | `skip` | Commit & push, skip the merge step |
@@ -328,7 +328,7 @@ Bot:   [streams Claude's output]
 Bot:   Changes detected. Reply review to inspect major changes, or keep going.
 
 You:   done
-Bot:   [shows short change summary]
+Bot:   [shows descriptive per-file summary]
 Bot:   Reply yes to commit & push, no to discard.
 
 You:   yes
@@ -415,7 +415,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 - [ ] Claude Code: `rm`, `sudo`, `curl`, `wget` denied via `CLAUDE_DENIED_TOOLS`
 - [ ] Codex: copy `codex-config-example.toml` → `~/.codex/config.toml` for workspace-write sandbox + no network
 - [ ] Session task work stays on feature branches (avoid direct commits on `main`/`dev` unless intentional)
-- [ ] Run `review` for detail or `done` for a quick summary before saying `yes`
+- [ ] Run `review` for detail or `done` for a descriptive summary before saying `yes`
 - [ ] SSH keys for git auth (not HTTPS with stored password)
 - [ ] (WSL) Repos under WSL filesystem (`/home/...`), not `/mnt/c/`
 
@@ -425,7 +425,7 @@ Arguments: -d Ubuntu -- tmux new-session -d -s bot "cd /home/you/PersonalAIBot &
 
 This project is vibe-coded — built iteratively with AI assistance and shared as-is. It works well as a personal tool but comes with no guarantees. Use at your own discretion. The MIT license applies: no warranty, no liability, no support obligations.
 
-If it breaks your repo, deletes your code, or causes other chaos — that's on you. Run `review` for detail or `done` for a quick summary before saying `yes`.
+If it breaks your repo, deletes your code, or causes other chaos — that's on you. Run `review` for detail or `done` for a descriptive summary before saying `yes`.
 
 ---
 
