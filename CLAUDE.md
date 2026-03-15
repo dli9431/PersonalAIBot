@@ -91,6 +91,7 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 - Active sessions are tracked in `active_sessions`; running processes and cancellation state are tracked separately.
 - Follow-up prompts continue the prior engine session using Claude resume or Codex resume.
 - If a run times out, the bot saves resume context and automatically retries up to `MAX_AUTO_CONTINUES = 3`.
+- If those retries are exhausted, the bot also persists an unfinished-session snapshot so `resume` can reopen the saved branch/worktree and restore the session state.
 - While a run is still active, `add:` and `queue:` save follow-up work for automatic resume after the current turn.
 - Planning mode is persisted per channel:
   - `plan: <task>` stores planning output without editing files.
@@ -109,6 +110,7 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 - `usage_stats`
 - `channels` and `last_active_channel`
 - saved resume contexts
+- saved unfinished timeout session snapshots
 - queued follow-up commands
 - saved planning contexts
 
@@ -128,6 +130,8 @@ Planning and recovery:
 - `plan: do [extra instructions]`
 - `plan show`
 - `plan clear`
+- `resume`
+- `resume show`
 - `context clear`
 - `recover`
 - `recover <id>`

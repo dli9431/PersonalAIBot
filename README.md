@@ -150,7 +150,9 @@ Use `plan show` to inspect saved plan context and `plan clear` to remove it manu
 ### Iterate
 
 Send follow-up messages freely — the engine keeps session context (`claude --continue`, `codex exec resume --last`).
-If a run times out, the bot saves a short context snapshot and injects it on resume. Clear it with `context clear` if needed.
+If a run times out, the bot saves a short resume-context snapshot and injects it on the next engine resume.
+If the run still times out after all automatic retries, the bot also saves an unfinished session snapshot you can reopen with `resume` later (`resume show` to inspect it).
+Clear either snapshot with `context clear` if needed.
 If you need to append work while a turn is still running, send `add: <instruction>` (or `queue:`). The bot saves run context, queues the instruction, then resumes automatically.
 
 ```
@@ -214,7 +216,9 @@ pr main               → open a GitHub PR targeting main
 | `undo` | Discard uncommitted working-tree changes in the active session |
 | `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
-| `context clear` | Forget saved timeout/resume context and queued follow-ups (`resume clear` / `clear context` aliases) |
+| `resume` | Reopen the saved unfinished timeout session for this channel |
+| `resume show` | Inspect the saved unfinished timeout snapshot without reopening it |
+| `context clear` | Forget saved timeout/resume context, unfinished timeout snapshot, and queued follow-ups (`resume clear` / `clear context` aliases) |
 | `plan show` | Show saved plan context for this channel |
 | `plan clear` | Clear saved plan context without executing it (`clear plan` alias) |
 | `abort` | Discard all changes immediately |
@@ -265,6 +269,8 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
+| `resume` | Reopen the saved unfinished timeout session for this channel |
+| `resume show` | Show the saved unfinished timeout snapshot |
 | `recover` | List orphaned feature branches |
 | `recover <id>` | Resume an orphaned branch as a session |
 | `recover drop <id>` | Delete an orphaned branch |
