@@ -308,6 +308,31 @@ def _session_intent_summary(session: dict | None, limit: int = 260) -> str:
     return truncate(summary, limit).replace("\n", " ")
 
 
+def _clean_string_list(values: object, limit: int | None = None) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = [_collapse_whitespace(str(value or "")) for value in values]
+    result = [value for value in cleaned if value]
+    if limit is not None and len(result) > limit:
+        return result[-limit:]
+    return result
+
+
+def _coerce_usage_totals(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "cache_read", "cache_write"):
+        raw = value.get(key)
+        try:
+            num = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if num:
+            result[key] = num
+    return result
+
+
 def current_branch(path: str | None = None) -> str:
     return run_git(["git", "branch", "--show-current"], path).stdout.strip()
 
@@ -778,6 +803,113 @@ def clear_resume_context(ch_id: int) -> bool:
     return False
 
 
+def _head_commit_snapshot(path: str | None = None) -> dict[str, object]:
+    if not path or not pathlib.Path(path).exists():
+        return {}
+    result = run_git(["git", "log", "-1", "--format=%H%n%s"], path)
+    if result.returncode != 0:
+        return {}
+    lines = result.stdout.strip().splitlines()
+    sha = lines[0].strip() if lines else ""
+    subject = lines[1].strip() if len(lines) > 1 else ""
+    entry: dict[str, object] = {}
+    if sha:
+        entry["sha"] = sha
+    if subject:
+        entry["subject"] = subject
+    return entry
+
+
+def save_unfinished_task_snapshot(
+    ch_id: int,
+    cwd: str | None,
+    engine: str,
+    task: str,
+    output: object | None,
+    runtime_config: dict[str, str | None] | None = None,
+    reason: str = "timeout_exhausted",
+    auto_commit: dict[str, object] | None = None,
+) -> None:
+    if not cwd:
+        return
+    path = pathlib.Path(cwd)
+    if not path.exists():
+        return
+
+    session = active_sessions.get(ch_id)
+    is_worktree = path.parent.name == ".worktrees"
+    if not session and not is_worktree:
+        return
+    saved_runtime = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
+    official_task = _collapse_whitespace(
+        str((session or {}).get("description") or task or "unfinished task")
+    )
+    followups = _clean_string_list((session or {}).get("followups"), limit=12)
+    intent = _session_intent_summary(session, limit=600) or official_task
+    turns = (session or {}).get("turns")
+    if not isinstance(turns, int) or turns < 1:
+        turns = 1
+
+    entry: dict[str, object] = {
+        "ts": int(time.time()),
+        "reason": reason,
+        "repo": _canonical_repo(cwd),
+        "cwd": cwd,
+        "branch": _safe_current_branch(cwd),
+        "engine": engine,
+        "model": get_model_for_engine(engine, runtime_config=saved_runtime, ch_id=ch_id),
+        "runtime_config": dict(saved_runtime),
+        "task": task.strip(),
+        "official_task": official_task,
+        "intent": intent,
+        "turns": turns,
+        "diff_stat": get_diff_stat(cwd),
+        "output_tail": _tail_text(_coerce_text(output)),
+    }
+    if followups:
+        entry["followups"] = followups
+    totals = _coerce_usage_totals((session or {}).get("total_usage"))
+    if totals:
+        entry["total_usage"] = totals
+    if auto_commit:
+        commit_entry = {
+            key: value
+            for key, value in auto_commit.items()
+            if value not in (None, "", [])
+        }
+        if commit_entry:
+            entry["auto_commit"] = commit_entry
+
+    data = _load_state()
+    snapshots = data.setdefault("unfinished_tasks", {})
+    snapshots[str(ch_id)] = entry
+    _save_state(data)
+
+
+def load_unfinished_task_snapshot(ch_id: int) -> dict | None:
+    data = _load_state()
+    snapshots = data.get("unfinished_tasks") or {}
+    entry = snapshots.get(str(ch_id))
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def clear_unfinished_task_snapshot(ch_id: int) -> bool:
+    data = _load_state()
+    snapshots = data.get("unfinished_tasks") or {}
+    key = str(ch_id)
+    if key not in snapshots:
+        return False
+    del snapshots[key]
+    if snapshots:
+        data["unfinished_tasks"] = snapshots
+    else:
+        data.pop("unfinished_tasks", None)
+    _save_state(data)
+    return True
+
+
 def _safe_current_branch(path: str | None) -> str:
     if not path or not pathlib.Path(path).exists():
         return "?"
@@ -941,6 +1073,19 @@ def build_resume_prompt(
         if ctx.get("branch") and current and ctx.get("branch") != current:
             return task
 
+    snapshot = load_unfinished_task_snapshot(ch_id)
+    if snapshot:
+        snap_engine = _normalize_engine_name(snapshot.get("engine"))
+        snap_branch = str(snapshot.get("branch") or "").strip()
+        snap_repo = str(snapshot.get("repo") or _canonical_repo(str(snapshot.get("cwd") or ""))).strip()
+        current_repo = _canonical_repo(cwd) if cwd else ""
+        if snap_engine != engine:
+            snapshot = None
+        elif ctx.get("branch") and snap_branch and snap_branch != ctx.get("branch"):
+            snapshot = None
+        elif cwd and snap_repo and current_repo and snap_repo != current_repo:
+            snapshot = None
+
     saved_diff = (ctx.get("diff_stat") or "").strip()
     current_diff = ""
     status_lines: list[str] = []
@@ -959,6 +1104,13 @@ def build_resume_prompt(
         f"Saved diff at timeout: {saved_diff}" if saved_diff else "",
         f"Current diff now: {current_diff}" if current_diff else "",
     ]
+    if snapshot:
+        saved_official_task = str(snapshot.get("official_task") or "").strip()
+        saved_intent = str(snapshot.get("intent") or "").strip()
+        if saved_official_task:
+            lines.append(f"Saved official task: {saved_official_task}")
+        if saved_intent and saved_intent != saved_official_task:
+            lines.append(f"Saved overall intent: {saved_intent}")
     if status_known:
         if status_lines:
             max_lines = 12
@@ -2686,11 +2838,13 @@ async def run_engine(
         channel_last_usage[ch.id] = {"engine": engine}
 
         output: str | None = None
+        timeout_output: object | None = None
         try:
             output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
         except subprocess.TimeoutExpired as e:
             if stop_event and stop_event.is_set():
                 return "(stopped)"
+            timeout_output = getattr(e, "output", None)
             save_resume_context(ch.id, cwd, engine, raw_task, getattr(e, "output", None), reason="timeout")
             # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
             for attempt in range(1, MAX_AUTO_CONTINUES + 1):
@@ -2711,13 +2865,29 @@ async def run_engine(
                     )
                     break
                 except subprocess.TimeoutExpired as e2:
+                    timeout_output = getattr(e2, "output", None)
                     save_resume_context(ch.id, cwd, engine, raw_task, getattr(e2, "output", None), reason="timeout")
                     continue
             if output is None:
+                head_before = _head_commit_snapshot(cwd).get("sha")
                 auto_commit(raw_task, 0, cwd)
+                auto_commit_info = _head_commit_snapshot(cwd)
+                if head_before:
+                    auto_commit_info["created"] = auto_commit_info.get("sha") != head_before
+                save_unfinished_task_snapshot(
+                    ch.id,
+                    cwd,
+                    engine,
+                    raw_task,
+                    timeout_output,
+                    runtime_config=run_config,
+                    auto_commit=auto_commit_info,
+                )
                 await ch.send(
                     f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
-                    f"Send a follow-up to continue manually, or `review`/`done` to inspect what's there."
+                    "Saved an unfinished session snapshot. "
+                    "Send a follow-up to continue manually, `resume` to reopen it later, "
+                    "or `review`/`done` to inspect what's there."
                 )
                 return "(timed out — partial work auto-committed)"
 
@@ -2995,6 +3165,97 @@ def ensure_worktree(repo_path: str, channel_id: int) -> str:
     return wt_path
 
 
+def activate_session_on_branch(
+    ch_id: int,
+    repo_path: str,
+    branch: str,
+    engine: str,
+    description: str,
+    runtime_config: dict[str, str | None] | None = None,
+    turns: int = 1,
+    followups: list[str] | None = None,
+    total_usage: dict[str, int] | None = None,
+) -> dict:
+    canonical = _canonical_repo(repo_path)
+    if not pathlib.Path(canonical).exists():
+        raise RuntimeError(f"Saved repo not found: `{canonical}`")
+    if not branch:
+        raise RuntimeError("Saved branch is missing.")
+    if not _ensure_local_branch(branch, canonical):
+        raise RuntimeError(f"Saved branch `{branch}` not found.")
+
+    wt_path = ensure_worktree(canonical, ch_id)
+    checkout = run_git(["git", "checkout", branch], wt_path)
+    if checkout.returncode != 0:
+        err = (checkout.stderr or checkout.stdout or "").strip() or "checkout failed"
+        raise RuntimeError(f"Could not checkout `{branch}`: {err}")
+
+    saved_runtime = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
+    try:
+        turn_count = int(turns)
+    except (TypeError, ValueError):
+        turn_count = 1
+    turn_count = max(0, turn_count)
+    session = {
+        "branch": branch,
+        "engine": _normalize_engine_name(engine),
+        "description": description.strip() or "recovered session",
+        "turns": turn_count,
+        "phase": "working",
+        "cwd": wt_path,
+        "runtime_config": dict(saved_runtime),
+    }
+    cleaned_followups = _clean_string_list(followups, limit=12)
+    if cleaned_followups:
+        session["followups"] = cleaned_followups
+    totals = _coerce_usage_totals(total_usage)
+    if totals:
+        session["total_usage"] = totals
+
+    active_sessions[ch_id] = session
+    channel_cwd[ch_id] = wt_path
+    record_state(ch_id, wt_path, branch)
+    return session
+
+
+def restore_unfinished_session(ch_id: int) -> tuple[dict | None, str | None]:
+    snapshot = load_unfinished_task_snapshot(ch_id)
+    if not snapshot:
+        return None, "No saved unfinished task for this channel."
+
+    repo = str(snapshot.get("repo") or _canonical_repo(str(snapshot.get("cwd") or ""))).strip()
+    branch = str(snapshot.get("branch") or "").strip()
+    if branch == "?":
+        branch = ""
+    engine = _normalize_engine_name(snapshot.get("engine"))
+    description = str(
+        snapshot.get("official_task")
+        or snapshot.get("intent")
+        or snapshot.get("task")
+        or "resumed session"
+    ).strip()
+    followups = snapshot.get("followups")
+    turns = snapshot.get("turns")
+    total_usage = snapshot.get("total_usage")
+    runtime_config = snapshot.get("runtime_config")
+
+    try:
+        session = activate_session_on_branch(
+            ch_id,
+            repo,
+            branch,
+            engine,
+            description,
+            runtime_config=runtime_config if isinstance(runtime_config, dict) else None,
+            turns=turns if isinstance(turns, int) else 1,
+            followups=followups if isinstance(followups, list) else None,
+            total_usage=total_usage if isinstance(total_usage, dict) else None,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    return session, None
+
+
 def remove_worktree(repo_path: str, channel_id: int) -> None:
     """Remove a channel's worktree after session ends."""
     canonical = _canonical_repo(repo_path)
@@ -3014,6 +3275,7 @@ def _end_session(ch_id: int, cwd: str) -> None:
     remove_worktree(canonical, ch_id)
     channel_cwd[ch_id] = canonical
     active_sessions.pop(ch_id, None)
+    clear_unfinished_task_snapshot(ch_id)
 
 
 async def create_pr(source: str, target: str, title: str, path: str | None = None) -> str:
@@ -3046,7 +3308,8 @@ Type follow-ups freely — engine keeps context
 `switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — quick raw peek · `review` — major changes (before/after/why) · `undo` — discard uncommitted changes
-`context clear` — forget saved timeout context and queued follow-ups (`resume clear` / `clear context`)
+`resume` — reopen a saved unfinished timeout session · `resume show` — inspect it
+`context clear` — forget saved timeout context, unfinished snapshot, and queued follow-ups (`resume clear` / `clear context`)
 
 **Ending a session:**
 `done` — show short change summary + push prompt
@@ -3069,6 +3332,7 @@ HELP_TEXT_2 = """**Branches:**
 `switch|branch switch <branch|N>` — switch branch (auto-commit if in session)
 
 **Recovery:**
+`resume` — reopen saved unfinished timeout session · `resume show` — inspect it
 `recover` — list orphaned branches · `recover <id>` — resume
 `recover drop <id>` — delete orphaned branch
 
@@ -3276,6 +3540,17 @@ async def _send_restore_notice():
     if checkout_error:
         msg += f"\n⚠️ Could not checkout branch: `{checkout_error}`"
     await ch.send(msg)
+    snapshot = load_unfinished_task_snapshot(ch_id)
+    if snapshot:
+        saved_engine = _normalize_engine_name(snapshot.get("engine"))
+        saved_model = str(snapshot.get("model") or "?").strip() or "?"
+        saved_branch = str(snapshot.get("branch") or "?").strip() or "?"
+        await ch.send(
+            "🧩 Saved unfinished timeout session found.\n"
+            f"Engine: `{saved_engine}` · Model: `{saved_model}`\n"
+            f"Branch: `{saved_branch}`\n"
+            "Use `resume` to reopen it or `resume show` to inspect the saved snapshot."
+        )
 
 
 @client.event
@@ -3354,6 +3629,96 @@ async def on_message(message: discord.Message):
         await ch.send(
             "⏳ A run is already in progress. Send `add: <instruction>` (or `queue:`) to append work, "
             "or `stop` to cancel."
+        )
+        return
+
+    if lower == "resume show":
+        snapshot = load_unfinished_task_snapshot(ch.id)
+        if not snapshot:
+            await ch.send("No saved unfinished task snapshot for this channel.")
+            return
+        ts = snapshot.get("ts")
+        if isinstance(ts, (int, float)):
+            saved_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        else:
+            saved_at = "unknown"
+        saved_engine = _normalize_engine_name(snapshot.get("engine"))
+        saved_runtime = snapshot.get("runtime_config") if isinstance(snapshot.get("runtime_config"), dict) else None
+        saved_model = str(snapshot.get("model") or "?").strip() or "?"
+        saved_reasoning = format_reasoning_effort(
+            get_reasoning_for_engine(saved_engine, runtime_config=saved_runtime, ch_id=ch.id)
+        )
+        saved_repo = str(snapshot.get("repo") or snapshot.get("cwd") or "(none)").strip() or "(none)"
+        saved_branch = str(snapshot.get("branch") or "?").strip() or "?"
+        saved_task = str(snapshot.get("official_task") or snapshot.get("task") or "(empty)").strip() or "(empty)"
+        saved_intent = str(snapshot.get("intent") or saved_task).strip() or "(empty)"
+        saved_diff = str(snapshot.get("diff_stat") or "no changes").strip() or "no changes"
+        saved_reason = str(snapshot.get("reason") or "timeout_exhausted").strip() or "timeout_exhausted"
+        saved_turns = snapshot.get("turns")
+        auto_commit = snapshot.get("auto_commit") if isinstance(snapshot.get("auto_commit"), dict) else {}
+        auto_commit_subject = str(auto_commit.get("subject") or "").strip()
+        auto_commit_sha = str(auto_commit.get("sha") or "").strip()
+        auto_commit_created = auto_commit.get("created")
+        auto_commit_line = "Auto-commit: `(unknown)`"
+        if auto_commit_subject or auto_commit_sha:
+            auto_commit_line = "Auto-commit: "
+            if isinstance(auto_commit_created, bool):
+                auto_commit_line += "created" if auto_commit_created else "reused HEAD"
+            else:
+                auto_commit_line += "saved"
+            if auto_commit_subject:
+                auto_commit_line += f" · {auto_commit_subject}"
+            if auto_commit_sha:
+                auto_commit_line += f" · `{auto_commit_sha[:12]}`"
+        details = (
+            "🧩 **Saved unfinished task**\n"
+            f"Saved: `{saved_at}`\n"
+            f"Reason: `{saved_reason}`\n"
+            f"Engine: `{saved_engine}` · Model: `{saved_model}` · Reasoning: `{saved_reasoning}`\n"
+            f"Repo: `{saved_repo}`\n"
+            f"Branch: `{saved_branch}`\n"
+            f"Task: {truncate(saved_task, 300)}\n"
+            f"Intent: {truncate(saved_intent, 300)}\n"
+        )
+        if isinstance(saved_turns, int):
+            details += f"Turns completed: `{saved_turns}`\n"
+        details += f"Diff: `{saved_diff}`\n{auto_commit_line}"
+        await ch.send(details)
+        output_tail = str(snapshot.get("output_tail") or "").strip()
+        if output_tail:
+            await ch.send(f"```\n{truncate(output_tail, 1800)}\n```")
+        return
+
+    if lower == "resume":
+        snapshot = load_unfinished_task_snapshot(ch.id)
+        if not snapshot:
+            await ch.send("No saved unfinished task snapshot for this channel.")
+            return
+        if session:
+            await ch.send(
+                f"An active session is already open on `{session['branch']}`. "
+                "Use `diff`, `review`, or send a follow-up directly."
+            )
+            return
+        restored_session, err = restore_unfinished_session(ch.id)
+        if err or not restored_session:
+            await ch.send(f"❌ Could not restore unfinished session: `{err or 'unknown error'}`")
+            return
+        restored_runtime = get_session_runtime_config(restored_session, ch.id)
+        restored_model = get_model_for_engine(
+            restored_session["engine"],
+            runtime_config=restored_runtime,
+            ch_id=ch.id,
+        )
+        stat = get_diff_stat(restored_session["cwd"])
+        intent = str(snapshot.get("intent") or snapshot.get("official_task") or restored_session["description"]).strip()
+        await ch.send(
+            f"♻️ Restored unfinished session on `{restored_session['branch']}`\n"
+            f"🧠 `{restored_session['engine']}` (`{restored_model}`)\n"
+            f"📍 `{restored_session['cwd']}`\n"
+            f"📌 {truncate(intent, 300)}\n"
+            f"📊 {stat}\n"
+            "Send a follow-up to continue, `diff` for a quick peek, `review` for major changes, or `done` when finished."
         )
         return
 
@@ -3639,6 +4004,16 @@ async def on_message(message: discord.Message):
             out_tok = sess_usage.get("output_tokens", 0)
             if in_tok or out_tok:
                 sess_info += f" · {in_tok:,} in / {out_tok:,} out tokens"
+        else:
+            snapshot = load_unfinished_task_snapshot(ch.id)
+            if snapshot:
+                saved_engine = _normalize_engine_name(snapshot.get("engine"))
+                saved_model = str(snapshot.get("model") or "?").strip() or "?"
+                saved_branch = str(snapshot.get("branch") or "?").strip() or "?"
+                sess_info = (
+                    f"\n🧩 Saved unfinished session: **{saved_engine}** (`{saved_model}`) · "
+                    f"`{saved_branch}` · use `resume`"
+                )
         await ch.send(f"📍 `{cwd}`\n🌿 `{br}`{sess_info}\n"
                        f"```\n{st or '(clean)'}\n```")
         return
@@ -3753,16 +4128,19 @@ async def on_message(message: discord.Message):
 
     if lower in ("context clear", "resume clear", "clear context"):
         cleared = clear_resume_context(ch.id)
+        unfinished = clear_unfinished_task_snapshot(ch.id)
         queued = pop_queued_run_commands(ch.id)
-        if cleared or queued:
+        if cleared or unfinished or queued:
             parts = []
             if cleared:
                 parts.append("saved resume context")
+            if unfinished:
+                parts.append("saved unfinished task snapshot")
             if queued:
                 parts.append(f"{len(queued)} queued follow-up(s)")
             await ch.send(f"🧹 Cleared {' and '.join(parts)} for this channel.")
         else:
-            await ch.send("No saved resume context or queued follow-ups to clear.")
+            await ch.send("No saved resume context, unfinished task snapshot, or queued follow-ups to clear.")
         return
 
     if lower == "plan show":
@@ -4129,6 +4507,7 @@ async def on_message(message: discord.Message):
         if session:
             # Auto-commit current work before switching repos
             auto_commit(session["description"], session["turns"], cwd)
+            clear_unfinished_task_snapshot(ch.id)
             # Remove old worktree from previous repo
             remove_worktree(_canonical_repo(cwd), ch.id)
             # Create new worktree for the new repo
@@ -4162,6 +4541,7 @@ async def on_message(message: discord.Message):
         # Auto-commit current work before switching if we're mid-session
         if session:
             auto_commit(session["description"], session["turns"], cwd)
+            clear_unfinished_task_snapshot(ch.id)
         check = run_git(["git", "rev-parse", "--verify", branch_name], cwd)
         if check.returncode != 0:
             result = run_git(["git", "checkout", "-b", branch_name], cwd)
@@ -4813,27 +5193,26 @@ async def on_message(message: discord.Message):
             await discard_changes(session["branch"], cwd)
             _end_session(ch.id, cwd)
             await ch.send("⚠️ Previous session discarded.\n")
-        # Create worktree for the recovered branch
-        try:
-            wt_path = ensure_worktree(canonical, ch.id)
-        except Exception as e:
-            await ch.send(f"❌ Worktree creation failed: `{e}`")
-            return
-        run_git(["git", "checkout", branch], wt_path)
+        snapshot = load_unfinished_task_snapshot(ch.id)
+        if snapshot and str(snapshot.get("branch") or "").strip() == branch:
+            clear_unfinished_task_snapshot(ch.id)
         # Parse engine from branch name (auto/engine/slug-timestamp)
         parts = branch.split("/")
         engine = _normalize_engine_name(parts[1] if len(parts) >= 3 else get_default_engine(ch.id))
-        active_sessions[ch.id] = {
-            "branch": branch,
-            "engine": engine,
-            "description": "recovered session",
-            "turns": 0,
-            "phase": "working",
-            "cwd": wt_path,
-            "runtime_config": get_runtime_config(ch.id),
-        }
-        channel_cwd[ch.id] = wt_path
-        diff_stat = get_diff_stat(wt_path)
+        try:
+            restored = activate_session_on_branch(
+                ch.id,
+                canonical,
+                branch,
+                engine,
+                "recovered session",
+                runtime_config=get_runtime_config(ch.id),
+                turns=0,
+            )
+        except Exception as e:
+            await ch.send(f"❌ {e}")
+            return
+        diff_stat = get_diff_stat(restored["cwd"])
         await ch.send(f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n"
                        f"Send a follow-up, `diff` for a quick peek, `review` for major changes, or `done` when finished.")
         return
@@ -4896,6 +5275,9 @@ async def on_message(message: discord.Message):
     if not task:
         await ch.send("Give me a task to work on.")
         return
+
+    if not session:
+        clear_unfinished_task_snapshot(ch.id)
 
     # Clean up any leftover session
     if session:
