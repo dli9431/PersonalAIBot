@@ -2023,6 +2023,29 @@ def resolve_model_selector(
     return token, None
 
 
+def split_model_reasoning_selector(selector: str) -> tuple[str | None, str | None, str | None]:
+    """
+    Split `model ... [reasoning ...]` into separate selectors.
+    Returns (model_selector, reasoning_selector, error_message).
+    """
+    token = selector.strip()
+    if not token:
+        return None, None, "Provide a model name or number."
+    if token.lower().startswith("reasoning "):
+        return None, None, "Provide a model name or number before `reasoning`."
+    if re.search(r"\s+reasoning\s*$", token, flags=re.IGNORECASE):
+        return None, None, "Provide a reasoning level (name or number)."
+
+    parts = re.split(r"\s+reasoning\s+", token, maxsplit=1, flags=re.IGNORECASE)
+    model_selector = parts[0].strip()
+    reasoning_selector = parts[1].strip() if len(parts) > 1 else None
+    if not model_selector:
+        return None, None, "Provide a model name or number."
+    if len(parts) > 1 and not reasoning_selector:
+        return None, None, "Provide a reasoning level (name or number)."
+    return model_selector, reasoning_selector, None
+
+
 def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, str | None]:
     """
     Resolve reasoning effort for an engine.
@@ -2883,8 +2906,8 @@ HELP_TEXT_2 = """**Branches:**
 `engine global` — show global default config
 `claude models` · `codex models` — list available models (numbered)
 `claude model <n|name>` · `codex model <n|name>` — set model for this channel
-`engine claude|codex` · `engine claude model <n|name>` · `engine codex model <n|name>` — set this channel
-`engine global claude|codex` · `engine global claude|codex model <n|name>` — set global default
+`engine claude|codex` · `engine claude model <n|name> [reasoning <n|level>]` · `engine codex model <n|name> [reasoning <n|level>]` — set this channel
+`engine global claude|codex` · `engine global claude|codex model <n|name> [reasoning <n|level>]` — set global default
 `claude reasoning [n|level]` · `codex reasoning [n|level]` — set reasoning for this channel
 `engine claude reasoning <n|level>` · `engine codex reasoning <n|level>` — set this channel
 `engine global claude|codex reasoning <n|level>` — set global default reasoning
@@ -4129,39 +4152,63 @@ async def on_message(message: discord.Message):
         target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
         if not selector:
             await ch.send(
-                "Usage: `engine claude model <n|name>`, `engine codex model <n|name>`, "
-                "`engine global claude model <n|name>`, or `engine global codex model <n|name>`"
+                "Usage: `engine claude model <n|name> [reasoning <n|level>]`, "
+                "`engine codex model <n|name> [reasoning <n|level>]`, "
+                "`engine global claude model <n|name> [reasoning <n|level>]`, "
+                "or `engine global codex model <n|name> [reasoning <n|level>]`"
             )
             return
-        if target_engine == "claude":
-            models = await get_claude_models()
-            selected_model, err = resolve_model_selector(selector, models)
-            if err:
-                await ch.send(f"❌ {err}")
-                return
-            updated = update_runtime_config(
-                scope_ch_id,
-                default_engine="claude",
-                claude_model=selected_model,
-            )
-            await ch.send(
-                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **claude** — "
-                f"model `{updated['claude_model']}`"
-            )
-            return
-        models = get_codex_models()
-        selected_model, err = resolve_model_selector(selector, models)
+        model_selector, reasoning_selector, err = split_model_reasoning_selector(selector)
         if err:
             await ch.send(f"❌ {err}")
             return
-        updated = update_runtime_config(
-            scope_ch_id,
-            default_engine="codex",
-            codex_model=selected_model,
-        )
+        if target_engine == "claude":
+            models = await get_claude_models()
+            selected_model, err = resolve_model_selector(model_selector or "", models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            updates: dict[str, str | None] = {
+                "default_engine": "claude",
+                "claude_model": selected_model,
+            }
+            if reasoning_selector is not None:
+                selected_effort, err = resolve_reasoning_selector(reasoning_selector, "claude")
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                updates["claude_reasoning_effort"] = selected_effort
+            updated = update_runtime_config(scope_ch_id, **updates)
+            details = f"model `{updated['claude_model']}`"
+            if reasoning_selector is not None:
+                details += f" · reasoning `{format_reasoning_effort(updated['claude_reasoning_effort'])}`"
+            await ch.send(
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **claude** — "
+                f"{details}"
+            )
+            return
+        models = get_codex_models()
+        selected_model, err = resolve_model_selector(model_selector or "", models)
+        if err:
+            await ch.send(f"❌ {err}")
+            return
+        updates: dict[str, str | None] = {
+            "default_engine": "codex",
+            "codex_model": selected_model,
+        }
+        if reasoning_selector is not None:
+            selected_effort, err = resolve_reasoning_selector(reasoning_selector, "codex")
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            updates["codex_reasoning_effort"] = selected_effort
+        updated = update_runtime_config(scope_ch_id, **updates)
+        details = f"model `{updated['codex_model']}`"
+        if reasoning_selector is not None:
+            details += f" · reasoning `{format_reasoning_effort(updated['codex_reasoning_effort'])}`"
         await ch.send(
             f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **codex** — "
-            f"model `{updated['codex_model']}`"
+            f"{details}"
         )
         return
 
@@ -4276,9 +4323,10 @@ async def on_message(message: discord.Message):
     if lower.startswith("engine "):
         await ch.send(
             "Usage: `engine`, `engine global`, `engine claude`, `engine codex`, "
-            "`engine claude model <n|name>`, `engine codex model <n|name>`, "
+            "`engine claude model <n|name> [reasoning <n|level>]`, "
+            "`engine codex model <n|name> [reasoning <n|level>]`, "
             "`engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
-            "`engine global claude|codex`, `engine global claude|codex model <n|name>`, "
+            "`engine global claude|codex`, `engine global claude|codex model <n|name> [reasoning <n|level>]`, "
             "or `engine global claude|codex reasoning <n|level>`"
         )
         return
@@ -4299,8 +4347,8 @@ async def on_message(message: discord.Message):
             f"**Claude models** (this channel: `{current_model}` · global default: `{global_model}`):\n"
             f"{listing}\n\n"
             "Switch this channel with `claude model <n|name>` or "
-            "`engine claude model <n|name>`. "
-            "Switch global default with `engine global claude model <n|name>`."
+            "`engine claude model <n|name> [reasoning <n|level>]`. "
+            "Switch global default with `engine global claude model <n|name> [reasoning <n|level>]`."
         )
         return
     if lower in ("codex models", "cx models"):
@@ -4320,8 +4368,8 @@ async def on_message(message: discord.Message):
             f"**Codex models** (this channel: `{current_model}` · global default: `{global_model}`):\n"
             f"{listing}\n\n"
             "Switch this channel with `codex model <n|name>` or "
-            "`engine codex model <n|name>`. "
-            "Switch global default with `engine global codex model <n|name>`."
+            "`engine codex model <n|name> [reasoning <n|level>]`. "
+            "Switch global default with `engine global codex model <n|name> [reasoning <n|level>]`."
         )
         return
 
