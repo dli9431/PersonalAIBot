@@ -281,10 +281,10 @@ pr main               → open a GitHub PR targeting main
 | `codex models` / `cx models` | List available Codex models (numbered) |
 | `claude model <n\|name>` | Set this channel's Claude model by number or name (e.g. `1`, `opus`, `sonnet`) |
 | `codex model <n\|name>` | Set this channel's Codex model by number or name |
-| `engine claude model <n\|name>` | Set this channel default engine to Claude and choose model by number or name |
-| `engine codex model <n\|name>` | Set this channel default engine to Codex and choose model by number or name |
-| `engine global claude model <n\|name>` | Set global default engine to Claude and choose model by number or name |
-| `engine global codex model <n\|name>` | Set global default engine to Codex and choose model by number or name |
+| `engine claude model <n\|name> [reasoning <n\|level>]` | Set this channel default engine to Claude, choose model by number or name, and optionally set reasoning in the same command |
+| `engine codex model <n\|name> [reasoning <n\|level>]` | Set this channel default engine to Codex, choose model by number or name, and optionally set reasoning in the same command |
+| `engine global claude model <n\|name> [reasoning <n\|level>]` | Set global default engine to Claude, choose model by number or name, and optionally set reasoning in the same command |
+| `engine global codex model <n\|name> [reasoning <n\|level>]` | Set global default engine to Codex, choose model by number or name, and optionally set reasoning in the same command |
 | `claude reasoning [n\|level]` | View/set this channel's Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
 | `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set this channel's Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
 | `engine claude reasoning <n\|level>` | Set this channel default engine to Claude and set reasoning effort |
