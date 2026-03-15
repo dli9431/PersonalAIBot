@@ -2009,6 +2009,238 @@ def build_major_change_review(path: str | None = None, session: dict | None = No
     return entries
 
 
+def _truncate_inline_text(text: str, limit: int = 80) -> str:
+    clean = _collapse_whitespace(text)
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _summary_file_path(file_label: str) -> str:
+    if " -> " in file_label:
+        return file_label.split(" -> ", 1)[1].strip() or file_label
+    return file_label
+
+
+def _summary_file_kind(file_label: str) -> str:
+    ext = pathlib.Path(_summary_file_path(file_label)).suffix.lower()
+    if ext == ".py":
+        return "Python file"
+    if ext in {".md", ".rst"}:
+        return "documentation file"
+    if ext == ".sh":
+        return "shell script"
+    if ext == ".json":
+        return "JSON file"
+    if ext == ".toml":
+        return "TOML file"
+    if ext in {".yml", ".yaml"}:
+        return "YAML file"
+    if ext == ".txt":
+        return "text file"
+    return "file"
+
+
+def _summary_is_doc_file(file_label: str) -> bool:
+    return pathlib.Path(_summary_file_path(file_label)).suffix.lower() in {".md", ".rst", ".txt"}
+
+
+def _summary_looks_like_command(token: str) -> bool:
+    clean = token.strip().lower()
+    if not clean or len(clean) > 40:
+        return False
+    if "/" in clean or "." in clean:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9:_ -]*", clean))
+
+
+def _summary_target_from_text(text: str, file_label: str) -> str | None:
+    clean = _collapse_whitespace(text)
+    if not clean:
+        return None
+
+    match = re.search(r'lower\s*==\s*["\']([^"\']{1,30})["\']', clean)
+    if match:
+        return f"the `{match.group(1).strip()}` command handling"
+
+    match = re.match(r"^(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", clean)
+    if match:
+        return f"the `{match.group(1)}` function"
+
+    match = re.match(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\b", clean)
+    if match:
+        return f"the `{match.group(1)}` class"
+
+    match = re.match(r"^#{1,6}\s+(.+?)\s*$", clean)
+    if match:
+        return f"the `{_truncate_inline_text(match.group(1), 60)}` section"
+
+    match = re.match(r"([A-Z][A-Z0-9_]{2,})\s*=", clean)
+    if match:
+        return f"the `{match.group(1)}` setting"
+
+    inline_codes = [_collapse_whitespace(token) for token in re.findall(r"`([^`]{1,60})`", clean)]
+    for token in inline_codes:
+        if _summary_looks_like_command(token):
+            suffix = " docs" if _summary_is_doc_file(file_label) else ""
+            return f"the `{token}` command{suffix}"
+    if inline_codes:
+        return f"the `{_truncate_inline_text(inline_codes[0], 50)}` reference"
+
+    if _summary_is_doc_file(file_label):
+        stripped = clean.strip(" |-")
+        if stripped and len(stripped) <= 70:
+            return f"the `{_truncate_inline_text(stripped, 50)}` section"
+
+    return None
+
+
+def _summary_target_for_unit(unit: dict) -> str | None:
+    file_label = str(unit.get("file") or "(unknown file)")
+    changed_lines: list[str] = []
+    changed_lines.extend(str(unit.get("after") or "").splitlines())
+    changed_lines.extend(str(unit.get("before") or "").splitlines())
+
+    for line in changed_lines:
+        target = _summary_target_from_text(line, file_label)
+        if target and target.endswith("command handling"):
+            return target
+
+    hunk_context = str(unit.get("hunk_context") or "")
+    target = _summary_target_from_text(hunk_context, file_label)
+    if target:
+        return target
+
+    for line in changed_lines:
+        target = _summary_target_from_text(line, file_label)
+        if target:
+            return target
+    return None
+
+
+def _summary_clause_for_unit(unit: dict) -> str | None:
+    kind = str(unit.get("kind") or "hunk")
+    file_label = str(unit.get("file") or "(unknown file)")
+
+    if kind == "rename":
+        before_path = _truncate_inline_text(str(unit.get("before") or "").strip() or str(unit.get("before_path") or "").strip(), 60)
+        after_path = _truncate_inline_text(str(unit.get("after") or "").strip() or str(unit.get("after_path") or "").strip(), 60)
+        if before_path and after_path and before_path != after_path:
+            return f"renamed this file from `{before_path}` to `{after_path}`"
+        return "renamed this file"
+
+    if kind == "binary":
+        return "updated the binary contents"
+
+    if kind == "new_file":
+        return "added this new file"
+
+    if kind == "deleted_file":
+        return "removed this file"
+
+    if kind == "metadata":
+        before_text = str(unit.get("before") or "").strip()
+        after_text = str(unit.get("after") or "").strip()
+        if before_text.startswith("mode ") and after_text.startswith("mode "):
+            return f"changed the file mode from `{before_text[5:]}` to `{after_text[5:]}`"
+        return "changed file metadata"
+
+    target = _summary_target_for_unit(unit)
+    before_text = str(unit.get("before") or "").strip()
+    after_text = str(unit.get("after") or "").strip()
+    if before_text and after_text:
+        verb = "updated"
+    elif after_text:
+        verb = "added"
+    else:
+        verb = "removed"
+
+    if target:
+        return f"{verb} {target}"
+
+    if verb == "added":
+        return f"added content to this {_summary_file_kind(file_label)}"
+    if verb == "removed":
+        return f"removed content from this {_summary_file_kind(file_label)}"
+    return f"updated part of this {_summary_file_kind(file_label)}"
+
+
+def _build_file_change_description(item: dict) -> str:
+    file_label = str(item["file"])
+    rename_from = str(item.get("rename_from") or "").strip()
+    rename_to = str(item.get("rename_to") or "").strip()
+    renamed = bool(rename_from and rename_to and rename_from != rename_to)
+    new_file = bool(item.get("new_file") and not item.get("deleted_file"))
+    deleted_file = bool(item.get("deleted_file") and not item.get("new_file"))
+    binary = bool(item.get("binary"))
+    metadata_only = bool(item.get("metadata_only") and not item.get("hunks") and not binary)
+    added = int(item.get("added") or 0)
+    removed = int(item.get("removed") or 0)
+    hunks = int(item.get("hunks") or 0)
+    file_kind = _summary_file_kind(file_label)
+
+    if renamed:
+        overview = (
+            "Renamed this "
+            f"{file_kind} from `{_truncate_inline_text(rename_from, 60)}` "
+            f"to `{_truncate_inline_text(rename_to, 60)}`."
+        )
+    elif new_file:
+        overview = f"Added this {file_kind}."
+    elif deleted_file:
+        overview = f"Removed this {file_kind}."
+    elif binary and not hunks:
+        overview = f"Updated this {file_kind} with binary changes."
+    elif metadata_only:
+        overview = f"Adjusted metadata for this {file_kind}."
+    else:
+        overview = f"Updated this {file_kind}."
+
+    clauses = _clean_string_list(item.get("clauses"))
+    redundant = {
+        "renamed this file",
+        "added this new file",
+        "removed this file",
+        "updated the binary contents",
+        "changed file metadata",
+    }
+    clauses = [clause for clause in clauses if clause not in redundant]
+    if renamed:
+        clauses = [clause for clause in clauses if not clause.startswith("renamed this file")]
+
+    generic_prefixes = (
+        "updated part of this ",
+        "added content to this ",
+        "removed content from this ",
+    )
+    specific_clauses = [clause for clause in clauses if not clause.startswith(generic_prefixes)]
+    if specific_clauses:
+        clauses = specific_clauses
+
+    if clauses:
+        selected = clauses[:3]
+        if len(selected) == 1:
+            detail = selected[0]
+        else:
+            detail = "; ".join(selected[:-1]) + f"; and {selected[-1]}"
+        return f"{overview} Notable changes: {detail}."
+
+    fallback_bits: list[str] = []
+    if added or removed:
+        if added and removed:
+            fallback_bits.append(f"+{added}/-{removed}")
+        elif added:
+            fallback_bits.append(f"+{added}")
+        else:
+            fallback_bits.append(f"-{removed}")
+    if hunks and not binary:
+        area_label = "edit area" if hunks == 1 else "edit areas"
+        fallback_bits.append(f"{hunks} {area_label}")
+    if fallback_bits:
+        return f"{overview[:-1]} ({', '.join(fallback_bits)})."
+    return overview
+
+
 def build_change_summary_lines(path: str | None = None, session: dict | None = None) -> list[str]:
     review_units = _collect_review_units(path)
     if not review_units:
@@ -2034,6 +2266,7 @@ def build_change_summary_lines(path: str | None = None, session: dict | None = N
                 "hunks": 0,
                 "added": 0,
                 "removed": 0,
+                "clauses": [],
             },
         )
 
@@ -2041,6 +2274,12 @@ def build_change_summary_lines(path: str | None = None, session: dict | None = N
             summary["new_file"] = True
         if after_path == "/dev/null":
             summary["deleted_file"] = True
+
+        clause = _summary_clause_for_unit(unit)
+        if clause:
+            clauses = summary["clauses"]
+            if clause not in clauses:
+                clauses.append(clause)
 
         if kind == "rename":
             rename_from = str(unit.get("before") or "").strip() or before_path
@@ -2096,54 +2335,7 @@ def build_change_summary_lines(path: str | None = None, session: dict | None = N
 
     for item in summaries:
         file_label = str(item["file"])
-        renamed = bool(item["rename_from"] and item["rename_to"] and item["rename_from"] != item["rename_to"])
-        new_file = bool(item["new_file"] and not item["deleted_file"])
-        deleted_file = bool(item["deleted_file"] and not item["new_file"])
-        binary = bool(item["binary"])
-        metadata_only = bool(item["metadata_only"] and not item["hunks"] and not binary)
-        added = int(item["added"])
-        removed = int(item["removed"])
-        hunks = int(item["hunks"])
-
-        if binary and not hunks:
-            action = "binary updated"
-        elif metadata_only and not renamed and not new_file and not deleted_file:
-            action = "metadata updated"
-        elif new_file:
-            action = "added"
-        elif deleted_file:
-            action = "removed"
-        elif renamed:
-            action = "renamed"
-        else:
-            action = "updated"
-
-        qualifiers: list[str] = []
-        if renamed and action != "renamed":
-            qualifiers.append("renamed")
-        if binary and action != "binary updated":
-            qualifiers.append("binary")
-        if metadata_only and action != "metadata updated":
-            qualifiers.append("metadata")
-
-        metrics: list[str] = []
-        if added or removed:
-            if added and removed:
-                metrics.append(f"+{added}/-{removed}")
-            elif added:
-                metrics.append(f"+{added}")
-            else:
-                metrics.append(f"-{removed}")
-        if hunks and not binary:
-            metrics.append(f"{hunks} change block(s)")
-
-        detail = action
-        if qualifiers:
-            detail += f" ({', '.join(qualifiers)})"
-        if metrics:
-            detail += f" ({', '.join(metrics)})"
-
-        lines.append(f"- `{file_label}`: {detail}")
+        lines.append(f"- `{file_label}`: {_build_file_change_description(item)}")
 
     return lines
 
@@ -2221,9 +2413,9 @@ async def send_change_summary(
     current_len = 0
 
     for raw_line in lines:
-        line = truncate(raw_line.replace("\n", " "), 350).replace("\n", " ")
+        line = _truncate_inline_text(raw_line.replace("\n", " "), 500)
         line_len = len(line) + 1
-        if current_lines and current_len + line_len > 1700:
+        if current_lines and current_len + line_len > 1800:
             chunks.append("\n".join(current_lines))
             current_lines = [line]
             current_len = line_len
@@ -3312,7 +3504,7 @@ Type follow-ups freely — engine keeps context
 `context clear` — forget saved timeout context, unfinished snapshot, and queued follow-ups (`resume clear` / `clear context`)
 
 **Ending a session:**
-`done` — show short change summary + push prompt
+`done` — show descriptive per-file summary + push prompt
 `yes` / `push` — commit + push, then merge · `no` / `discard` — discard
 `abort` — discard immediately · `skip` — skip merge step
 
@@ -3731,7 +3923,7 @@ async def on_message(message: discord.Message):
         await ch.send("No active session to review. Start a task or use `repo <n> review`.")
         return
 
-    # ── Session: done → show short change summary and prompt ──────────────
+    # ── Session: done → show descriptive per-file summary and prompt ─────
     if lower == "done" and session:
         lines = build_change_summary_lines(cwd, session=session)
         await send_change_summary(ch, f"Change summary on `{session['branch']}`", lines)
