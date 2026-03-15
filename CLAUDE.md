@@ -1,65 +1,205 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Project Overview
 
-A Discord bot that delegates coding tasks to AI CLI tools (Claude Code and OpenAI Codex) with automated git workflow management. Designed for mobile-first use via Discord. Single-file Python application (`bot.py`, ~1873 lines).
+This repo is a self-hosted Discord bot that delegates coding tasks to Claude Code or OpenAI Codex CLI, streams results back into Discord, and manages the surrounding git workflow.
+
+Current shape of the project:
+
+- Main app: `bot.py` (single-file Python application, currently about 4.8k lines)
+- Entry script: `start.sh`
+- Python deps: `discord.py`, `python-dotenv`
+- Runtime expectation: Python 3.11+
+- Primary user documentation: `README.md`
+
+There is no build step, test suite, formatter, or linter configured in the repo.
 
 ## Running
 
 ```bash
-pip install discord.py python-dotenv
-cp env.example .env   # then fill in required values
-python bot.py
-# or use start.sh which activates the venv automatically
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp env.example .env
+python3 bot.py
 ```
 
-External CLIs required: `@anthropic-ai/claude-code` and `@openai/codex` (npm global installs), `gh` (GitHub CLI), Node.js 22+.
+Or:
 
-No build step, test suite, or linter is configured.
+```bash
+bash start.sh
+```
+
+Required external tools:
+
+- `claude`
+- `codex`
+- `gh` for PR creation
+
+The project is intended for Linux or WSL2. Codex sandbox settings come from `~/.codex/config.toml`; see `codex-config-example.toml`.
+
+## Configuration
+
+Required `.env` values:
+
+- `DISCORD_TOKEN`
+- `ALLOWED_USER_ID`
+- `REPO_PATH`
+
+Important optional values:
+
+- Branch settings: `BRANCH_PREFIX`, `MAIN_BRANCH`, `DEV_BRANCH`, `PROTECTED_BRANCHES`
+- Engine defaults: `DEFAULT_ENGINE`, `ENGINE_TIMEOUT`
+- Context persistence: `CONTEXT_MAX_CHARS`, `PLAN_CONTEXT_MAX_CHARS`
+- Claude settings: `CLAUDE_MODEL`, `CLAUDE_REASONING_EFFORT`, `CLAUDE_ALLOWED_TOOLS`, `CLAUDE_DENIED_TOOLS`
+- Codex settings: `CODEX_MODEL`, `CODEX_REASONING_EFFORT`
+- Multi-repo support: `GIT_PROJECTS`
+- State file override: `BOT_STATE_FILE`
+
+Runtime config is persisted in `.bot_state.json` and can diverge from `.env` because the bot supports global and per-channel overrides from Discord commands.
 
 ## Architecture
 
-**bot.py** is the entire application, structured as:
+`bot.py` is organized into these major areas:
 
-1. **Config & State** (~lines 29-110) — Environment variables via `python-dotenv`. `GIT_PROJECTS` list of (label, path) tuples for multi-repo support. Per-channel state: `active_sessions`, `last_pushed`, `channel_cwd`, `branch_listing`. Stop events and running procs tracked for cancellation.
+1. Configuration and process/session state.
+2. Helpers for git, branch resolution, state persistence, runtime config, usage tracking, plan context, resume context, review formatting, and image downloads.
+3. Model discovery and login helpers for Claude and Codex.
+4. Engine runners:
+   - `run_claude_code()`
+   - `run_codex()`
+   - `run_engine()`
+5. Git workflow helpers:
+   - `create_branch()`
+   - `auto_commit()`
+   - `commit_and_push()`
+   - `discard_changes()`
+   - `merge_branch()`
+   - `create_pr()`
+6. Worktree helpers:
+   - `ensure_worktree()`
+   - `remove_worktree()`
+   - `_end_session()`
+7. Discord handlers, mainly `on_message()`, plus pinned help maintenance and slash `/help`.
 
-2. **Helpers** (~lines 113-493) — Auth check, slugify, `run_git(cmd, path)` with optional cwd override, `resolve_project`, `resolve_branch` (N ref lookup), `get_diff`/`get_diff_stat`, structured `review` parsing/formatting helpers (major changes with before/after/why), branch/protection helpers, ANSI stripping, image download helpers.
+## Key Runtime Behavior
 
-3. **Login Helpers** (~lines 495-579) — `login_codex()` and `login_claude()` run the respective CLI auth flows, streaming output to Discord. Both use a `_login_lock` dict to prevent concurrent logins.
+- Each Discord channel gets its own git worktree under `<repo>/.worktrees/ch-<channel_id>`.
+- Feature branches are created as `{BRANCH_PREFIX}/{engine}/{slug}-{timestamp}`.
+- Active sessions are tracked in `active_sessions`; running processes and cancellation state are tracked separately.
+- Follow-up prompts continue the prior engine session using Claude resume or Codex resume.
+- If a run times out, the bot saves resume context and automatically retries up to `MAX_AUTO_CONTINUES = 3`.
+- While a run is still active, `add:` and `queue:` save follow-up work for automatic resume after the current turn.
+- Planning mode is persisted per channel:
+  - `plan: <task>` stores planning output without editing files.
+  - `plan: do` later executes the saved plan in a new feature branch.
+- The bot records token usage per run and cumulative totals in `.bot_state.json`.
+- Protected branches are persisted and enforced beyond just `main` and `dev`.
+- Image attachments are downloaded to `/tmp/botimages/` and passed through to the engine.
 
-4. **Engine Runners** (~lines 581-767) — `run_claude_code()` and `run_codex()` execute CLIs as subprocesses with `cwd` param. `run_engine()` wraps both with auto-continue on timeout (up to 3 retries, `MAX_AUTO_CONTINUES=3`). `_run_with_live_output()` streams output to a Discord message, refreshing every `STATUS_REFRESH=5` seconds.
+## State And Persistence
 
-5. **Git Workflow** (~lines 769-863) — `create_branch` (`{BRANCH_PREFIX}/{engine}/{slug}-{timestamp % 100000}`), `auto_commit` (WIP save after each turn), `commit_and_push`, `discard_changes`, `merge_branch` (with conflict detection and branch cleanup), `create_pr` via `gh`.
+`.bot_state.json` may contain:
 
-6. **Discord Handlers** (~lines 865-1838) — `ensure_pinned_help` pins/updates help embeds. `on_ready`/`on_resumed` pin help to all accessible channels and send restart confirmation. `on_message` routes all commands.
+- `protected_branches`
+- `runtime_config`
+- `channel_runtime_configs`
+- `usage_stats`
+- `channels` and `last_active_channel`
+- saved resume contexts
+- queued follow-up commands
+- saved planning contexts
 
-## Key Patterns
+Be careful when changing serialization formats because there is migration-free persistence logic built around tolerant reads and overwrites.
 
-- **Dual-engine**: Prefix tasks with `claude:`/`cc:` or `codex:`/`cx:`/`openai:` to pick an engine, or use `DEFAULT_ENGINE` from `.env`.
-- **Iterative sessions**: Follow-up messages continue with `--resume` / `exec resume --last`. Sessions have phases: `"working"` → `"review"` → `"merge_target"` (when no dev branch) → cleared. Turn counter incremented each run, reflected in WIP commit messages.
-- **Review flow**: `review`/`done` shows structured major changes (before/after/why) → `yes`/`push`/`approve`/`lgtm`/`ship it` to commit+push+merge, or `no`/`discard`/`reject`/`nah` to abandon.
-- **No-change cleanup**: If the engine makes no file changes, the feature branch is deleted and no session is started.
-- **Multi-repo**: `GIT_PROJECTS` env var registers additional repos. `cwd <n>` switches the active repo per channel. All git ops accept an optional `path` param.
-- **Branch switching**: `branch switch <branch|N>` (or `switch <branch|N>`) mid-session auto-commits and checks out the target branch. `N` refs are populated by the `branches` command via `branch_listing` dict (cached per channel).
-- **Switchable cwd mid-session**: `cwd <n>` during an active session auto-commits current work and updates `session["cwd"]`.
-- **Protected branches**: Stored in `.bot_state.json`, survive restarts. Default: `MAIN_BRANCH` and `DEV_BRANCH`. Managed via `branch protect` commands.
-- **State persistence**: `.bot_state.json` stores protected branches and last active channel's cwd/branch. Restored on startup.
-- **Image attachments**: Saved to `/tmp/botimages/` and passed to both engines (Claude gets file paths, Codex gets `--image` flag).
-- **Run cancellation**: `stop` terminates the active subprocess (graceful kill, 5s timeout fallback).
-- **Tool sandboxing**: Claude Code runs with `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_DENIED_TOOLS` from env. Codex runs in workspace-write mode with network off (configured via `~/.codex/config.toml`).
-- **All git work happens on feature branches**, never directly on main/dev.
-- **Config uses `.env`** with sensible defaults. See `env.example` for all variables.
+## Current Command Surface
 
-## Discord Commands (handled in on_message)
+Task execution:
 
-**Task execution:** plain text, `claude: <task>`, `cc: <task>`, `codex: <task>`, `cx: <task>`, `openai: <task>`
-**Session control:** `stop`, `review`, `done`, `yes`/`push`/`approve`/`lgtm`/`ship it`, `no`/`discard`/`reject`/`nah`, `abort`, `skip`, `diff`, `undo`
-**Branch nav:** `branch switch <branch|N>`, `switch <branch|N>`, `cwd [n]`, `branches`, `branch delete <name|N> [local|remote|both] [force]`, `branch protect [list|add|remove|clear|reset]`
-**Git:** `merge <target>`, `merge src>tgt`, `merge src into tgt`, `pr <target>`, `pull [branch|N]`
-**Multi-repo:** `repos`, `repo <n> status|diff|review|commit [msg]|push|branches`
-**Recovery:** `recover`, `recover <id>`, `recover drop <id>`
-**Config:** `claude models`, `codex models` — list available (numbered); `claude model <n|name>`, `cc model <n|name>`, `codex model <n|name>`, `cx model <n|name>`, `engine claude`, `engine codex`, `engine claude model <n|name> [reasoning <n|level>]`, `engine codex model <n|name> [reasoning <n|level>]`, `engine`
-**Login:** `claude login`, `codex login`, `openai login`, `login both`
-**System:** `status`, `help`, `restart`
+- Plain text uses the channel default engine
+- `claude: <task>`, `cc: <task>`, `claude code: <task>`
+- `codex: <task>`, `cx: <task>`, `openai: <task>`
+
+Planning and recovery:
+
+- `plan: <task>`
+- `plan: do [extra instructions]`
+- `plan show`
+- `plan clear`
+- `context clear`
+- `recover`
+- `recover <id>`
+- `recover drop <id>`
+
+Session flow:
+
+- Follow-up plain text
+- `stop`
+- `add: <instruction>` / `queue: <instruction>`
+- `diff`
+- `review`
+- `done`
+- `yes` / `approve` / `push` / `lgtm` / `ship it`
+- `skip`
+- `no` / `discard` / `reject` / `nah`
+- `undo`
+- `abort`
+
+Repo and branch flow:
+
+- `repos`
+- `cwd` / `cwd <n>`
+- `repo <n> status|diff|review|commit [msg]|push|branches`
+- `branches`
+- `switch <branch|N>`
+- `branch switch <branch|N>`
+- `branch delete|del <name|N> [local|remote|both] [force]`
+- `branch protect [list|add|remove|clear|reset]`
+- `pull [branch|N]`
+- `merge <target>`
+- `merge src>tgt`
+- `merge src into tgt`
+- `pr <target>`
+
+Runtime configuration and diagnostics:
+
+- `engine`
+- `engine global`
+- `claude models`
+- `codex models`
+- `claude model <n|name>`
+- `codex model <n|name>`
+- `claude reasoning [n|level]`
+- `codex reasoning [n|level]`
+- `reasoning [n|level]`
+- `model <n|name>`
+- `usage`
+- `status`
+- `doctor`
+- `help`
+- `restart`
+- `claude login`, `codex login`, `openai login`, `login both`
+
+## Editing Notes
+
+- Most feature work lands in `bot.py`; keep related command/help/docs changes synchronized.
+- If you change command behavior, update:
+  - the help text in `bot.py`
+  - `README.md`
+  - this file if the workflow summary changes
+- Preserve the distinction between canonical repo paths and per-channel worktree paths.
+- Session cleanup is easy to break; check how your change interacts with `_end_session()`, branch checkout fallback, and worktree removal.
+- Runtime config changes must consider both global defaults and per-channel overrides.
+- Avoid assuming the README is fully current; verify against `bot.py`.
+
+## Validation
+
+There is no automated test suite in this repo. Minimum safe validation after code changes:
+
+```bash
+python3 -m py_compile bot.py
+```
+
+For workflow changes, also manually exercise the affected Discord command path.
