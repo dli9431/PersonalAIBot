@@ -139,8 +139,8 @@ Session flow:
 - `stop`
 - `add: <instruction>` / `queue: <instruction>`
 - `diff`
-- `review`
-- `done`
+- `review` (detailed before/after/why)
+- `done` (short change summary + push prompt)
 - `yes` / `approve` / `push` / `lgtm` / `ship it`
 - `skip`
 - `no` / `discard` / `reject` / `nah`

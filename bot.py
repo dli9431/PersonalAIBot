@@ -1831,12 +1831,15 @@ def _reason_for_review_unit(unit: dict, intent_summary: str) -> str:
     return f"Updated `{file_label}` ({source_label}) {intent_text}."
 
 
-def build_major_change_review(path: str | None = None, session: dict | None = None) -> list[dict]:
-    sections = _collect_unified_review_sections(path)
+def _collect_review_units(path: str | None = None) -> list[dict]:
     review_units: list[dict] = []
-    for source_label, diff_text in sections:
+    for source_label, diff_text in _collect_unified_review_sections(path):
         review_units.extend(_parse_unified_review_units(diff_text, source_label))
+    return review_units
 
+
+def build_major_change_review(path: str | None = None, session: dict | None = None) -> list[dict]:
+    review_units = _collect_review_units(path)
     intent_summary = _session_intent_summary(session)
     entries: list[dict] = []
     for unit in review_units:
@@ -1852,6 +1855,145 @@ def build_major_change_review(path: str | None = None, session: dict | None = No
             }
         )
     return entries
+
+
+def build_change_summary_lines(path: str | None = None, session: dict | None = None) -> list[str]:
+    review_units = _collect_review_units(path)
+    if not review_units:
+        return []
+
+    file_summaries: dict[str, dict] = {}
+
+    for unit in review_units:
+        file_label = str(unit.get("file") or "(unknown file)")
+        before_path = str(unit.get("before_path") or "").strip()
+        after_path = str(unit.get("after_path") or "").strip()
+        kind = str(unit.get("kind") or "hunk")
+        summary = file_summaries.setdefault(
+            file_label,
+            {
+                "file": file_label,
+                "rename_from": "",
+                "rename_to": "",
+                "new_file": False,
+                "deleted_file": False,
+                "binary": False,
+                "metadata_only": False,
+                "hunks": 0,
+                "added": 0,
+                "removed": 0,
+            },
+        )
+
+        if before_path == "/dev/null":
+            summary["new_file"] = True
+        if after_path == "/dev/null":
+            summary["deleted_file"] = True
+
+        if kind == "rename":
+            rename_from = str(unit.get("before") or "").strip() or before_path
+            rename_to = str(unit.get("after") or "").strip() or after_path
+            summary["rename_from"] = rename_from
+            summary["rename_to"] = rename_to
+            continue
+
+        if kind == "binary":
+            summary["binary"] = True
+            continue
+
+        if kind == "metadata":
+            summary["metadata_only"] = True
+            continue
+
+        if kind != "hunk":
+            continue
+
+        before_lines = len(str(unit.get("before") or "").splitlines())
+        after_lines = len(str(unit.get("after") or "").splitlines())
+        summary["metadata_only"] = False
+        summary["hunks"] += 1
+        summary["added"] += after_lines
+        summary["removed"] += before_lines
+
+    summaries = sorted(file_summaries.values(), key=lambda item: str(item["file"]).lower())
+    total_added = sum(int(item["added"]) for item in summaries)
+    total_removed = sum(int(item["removed"]) for item in summaries)
+    added_files = sum(1 for item in summaries if item["new_file"] and not item["deleted_file"])
+    removed_files = sum(1 for item in summaries if item["deleted_file"] and not item["new_file"])
+    renamed_files = sum(
+        1
+        for item in summaries
+        if item["rename_from"] and item["rename_to"] and item["rename_from"] != item["rename_to"]
+    )
+
+    headline_bits = [f"{len(summaries)} file(s) changed"]
+    if total_added or total_removed:
+        headline_bits.append(f"+{total_added}/-{total_removed}")
+    if added_files:
+        headline_bits.append(f"{added_files} added")
+    if removed_files:
+        headline_bits.append(f"{removed_files} removed")
+    if renamed_files:
+        headline_bits.append(f"{renamed_files} renamed")
+
+    lines = [f"Summary: {', '.join(headline_bits)}"]
+    intent_summary = _session_intent_summary(session)
+    if intent_summary:
+        lines.append(f"Request: {intent_summary}")
+    lines.append("")
+
+    for item in summaries:
+        file_label = str(item["file"])
+        renamed = bool(item["rename_from"] and item["rename_to"] and item["rename_from"] != item["rename_to"])
+        new_file = bool(item["new_file"] and not item["deleted_file"])
+        deleted_file = bool(item["deleted_file"] and not item["new_file"])
+        binary = bool(item["binary"])
+        metadata_only = bool(item["metadata_only"] and not item["hunks"] and not binary)
+        added = int(item["added"])
+        removed = int(item["removed"])
+        hunks = int(item["hunks"])
+
+        if binary and not hunks:
+            action = "binary updated"
+        elif metadata_only and not renamed and not new_file and not deleted_file:
+            action = "metadata updated"
+        elif new_file:
+            action = "added"
+        elif deleted_file:
+            action = "removed"
+        elif renamed:
+            action = "renamed"
+        else:
+            action = "updated"
+
+        qualifiers: list[str] = []
+        if renamed and action != "renamed":
+            qualifiers.append("renamed")
+        if binary and action != "binary updated":
+            qualifiers.append("binary")
+        if metadata_only and action != "metadata updated":
+            qualifiers.append("metadata")
+
+        metrics: list[str] = []
+        if added or removed:
+            if added and removed:
+                metrics.append(f"+{added}/-{removed}")
+            elif added:
+                metrics.append(f"+{added}")
+            else:
+                metrics.append(f"-{removed}")
+        if hunks and not binary:
+            metrics.append(f"{hunks} change block(s)")
+
+        detail = action
+        if qualifiers:
+            detail += f" ({', '.join(qualifiers)})"
+        if metrics:
+            detail += f" ({', '.join(metrics)})"
+
+        lines.append(f"- `{file_label}`: {detail}")
+
+    return lines
 
 
 def _format_review_entry_parts(entry: dict, index: int, total: int) -> list[str]:
@@ -1911,6 +2053,39 @@ async def send_major_change_review(
     total_blocks = len(blocks)
     for idx, block in enumerate(blocks, 1):
         await channel.send(f"**{title}** · part {idx}/{total_blocks}\n{block}")
+
+
+async def send_change_summary(
+    channel: discord.abc.Messageable,
+    title: str,
+    lines: list[str],
+) -> None:
+    if not lines:
+        await channel.send(f"**{title}**\n(no changes detected)")
+        return
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for raw_line in lines:
+        line = truncate(raw_line.replace("\n", " "), 350).replace("\n", " ")
+        line_len = len(line) + 1
+        if current_lines and current_len + line_len > 1700:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_len = line_len
+            continue
+        current_lines.append(line)
+        current_len += line_len
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        suffix = "" if total_chunks == 1 else f" · part {idx}/{total_chunks}"
+        await channel.send(f"**{title}**{suffix}\n{chunk}")
 
 
 def get_status_porcelain(path: str | None = None) -> list[str]:
@@ -2874,7 +3049,7 @@ Type follow-ups freely — engine keeps context
 `context clear` — forget saved timeout context and queued follow-ups (`resume clear` / `clear context`)
 
 **Ending a session:**
-`done` — show major-change review + push prompt
+`done` — show short change summary + push prompt
 `yes` / `push` — commit + push, then merge · `no` / `discard` — discard
 `abort` — discard immediately · `skip` — skip merge step
 
@@ -3191,11 +3366,11 @@ async def on_message(message: discord.Message):
         await ch.send("No active session to review. Start a task or use `repo <n> review`.")
         return
 
-    # ── Session: done → show major-change review and prompt ───────────────
+    # ── Session: done → show short change summary and prompt ──────────────
     if lower == "done" and session:
-        entries = build_major_change_review(cwd, session=session)
-        await send_major_change_review(ch, f"Major changes on `{session['branch']}`", entries)
-        if not entries:
+        lines = build_change_summary_lines(cwd, session=session)
+        await send_change_summary(ch, f"Change summary on `{session['branch']}`", lines)
+        if not lines:
             base = _base_branch(cwd)
             ahead = get_ahead_count(cwd)
             if ahead <= 0:
@@ -3203,7 +3378,7 @@ async def on_message(message: discord.Message):
                 return
             await ch.send(
                 f"ℹ️ Working tree clean but branch is {ahead} commit(s) ahead of `{base}`. "
-                "Continuing to review."
+                "Continuing to the push prompt."
             )
         session["phase"] = "review"
         dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
@@ -3249,7 +3424,7 @@ async def on_message(message: discord.Message):
                 _end_session(ch.id, cwd)
             return
         # If no session but maybe old-style pending
-        await ch.send("No session awaiting approval. Send `done` first to review changes.")
+        await ch.send("No session awaiting approval. Send `done` first to see the change summary.")
         return
 
     if lower == "skip" and session and session.get("phase") == "review":
