@@ -2059,6 +2059,147 @@ def _summary_looks_like_command(token: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9][a-z0-9:_ -]*", clean))
 
 
+def _summary_command_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw in re.findall(r"render\((?:'|\")([^'\"]{1,20})(?:'|\")\)", text):
+        clean = _collapse_whitespace(raw)
+        if clean and _summary_looks_like_command(clean) and clean not in tokens:
+            tokens.append(clean)
+    for raw in re.findall(r"`([^`]{1,40})`", text):
+        clean = _collapse_whitespace(raw)
+        if clean and _summary_looks_like_command(clean) and clean not in tokens:
+            tokens.append(clean)
+    return tokens[:4]
+
+
+def _summary_join_inline_codes(tokens: list[str]) -> str:
+    rendered = [f"`{_truncate_inline_text(token, 30)}`" for token in tokens if token]
+    if not rendered:
+        return ""
+    if len(rendered) == 1:
+        return rendered[0]
+    if len(rendered) == 2:
+        return f"{rendered[0]} and {rendered[1]}"
+    return ", ".join(rendered[:-1]) + f", and {rendered[-1]}"
+
+
+def _summary_join_phrases(parts: list[str]) -> str:
+    clean = [part for part in parts if part]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+    return ", ".join(clean[:-1]) + f", and {clean[-1]}"
+
+
+def _summary_definition_targets(text: str) -> list[tuple[str, str]]:
+    definitions: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in str(text or "").splitlines():
+        if line[:1].isspace():
+            continue
+        clean = _collapse_whitespace(line)
+        item: tuple[str, str] | None = None
+        match = re.match(r"^(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", clean)
+        if match:
+            item = ("function", match.group(1))
+        else:
+            match = re.match(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\b", clean)
+            if match:
+                item = ("class", match.group(1))
+        if item and item not in seen:
+            seen.add(item)
+            definitions.append(item)
+    return definitions[:4]
+
+
+def _summary_group_definitions(definitions: list[tuple[str, str]]) -> str | None:
+    if not definitions:
+        return None
+    kinds = {kind for kind, _ in definitions}
+    names = [f"`{_truncate_inline_text(name, 40)}`" for _, name in definitions]
+    if len(kinds) == 1:
+        kind = next(iter(kinds))
+        noun = kind if len(names) == 1 else f"{kind}s"
+        return f"the {_summary_join_phrases(names)} {noun}"
+    return f"the definitions for {_summary_join_phrases(names)}"
+
+
+def _summary_focus_from_line(line: str, file_label: str) -> str | None:
+    clean = _collapse_whitespace(line).strip()
+    if not clean:
+        return None
+
+    trivial = {
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        ",",
+        ":",
+        "return",
+        "pass",
+        "continue",
+        "break",
+        "else:",
+        "try:",
+        "finally:",
+    }
+    if clean in trivial or re.fullmatch(r"[\[\]{}(),.:]+", clean):
+        return None
+
+    command_tokens = _summary_command_tokens(clean)
+    if command_tokens:
+        rendered_tokens = _summary_join_inline_codes(command_tokens)
+        lowered = clean.lower()
+        looks_like_guidance = (
+            _summary_is_doc_file(file_label)
+            or "send(" in lowered
+            or "reply" in lowered
+            or "prompt" in lowered
+            or "follow-up" in lowered
+            or "follow up" in lowered
+            or "continue" in lowered
+            or "finished" in lowered
+            or "when done" in lowered
+        )
+        if looks_like_guidance:
+            if _summary_is_doc_file(file_label):
+                return f"documentation for {rendered_tokens}"
+            return f"guidance mentioning {rendered_tokens}"
+
+    if not clean.startswith(("def ", "async def ", "class ")):
+        call_names = [
+            name
+            for name in re.findall(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(", clean)
+            if name not in {"if", "for", "while", "return"}
+        ]
+        if call_names:
+            preferred = next(
+                (name for name in reversed(call_names) if name not in {"ch.send", "channel.send"}),
+                call_names[-1],
+            )
+            return f"a call to `{_truncate_inline_text(preferred, 40)}`"
+
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])?)\s*=", clean)
+    if match:
+        return f"the `{_truncate_inline_text(match.group(1), 40)}` assignment"
+
+    return None
+
+
+def _summary_focus_from_text(text: str, file_label: str) -> str | None:
+    for line in str(text or "").splitlines():
+        focus = _summary_focus_from_line(line, file_label)
+        if focus:
+            return focus
+    return None
+
+
 def _summary_target_from_text(text: str, file_label: str) -> str | None:
     clean = _collapse_whitespace(text)
     if not clean:
@@ -2108,7 +2249,7 @@ def _summary_target_for_unit(unit: dict) -> str | None:
 
     for line in changed_lines:
         target = _summary_target_from_text(line, file_label)
-        if target and target.endswith("command handling"):
+        if target and target.endswith(("command handling", " function", " class", " setting", " section")):
             return target
 
     hunk_context = str(unit.get("hunk_context") or "")
@@ -2159,6 +2300,55 @@ def _summary_clause_for_unit(unit: dict) -> str | None:
         verb = "added"
     else:
         verb = "removed"
+
+    before_definitions = _summary_definition_targets(before_text)
+    after_definitions = _summary_definition_targets(after_text)
+    added_definitions = [item for item in after_definitions if item not in before_definitions]
+    removed_definitions = [item for item in before_definitions if item not in after_definitions]
+    if verb == "added" and added_definitions:
+        grouped = _summary_group_definitions(added_definitions)
+        if grouped:
+            command_tokens = _summary_command_tokens(after_text)
+            if command_tokens:
+                return f"added {grouped} covering {_summary_join_inline_codes(command_tokens)}"
+            return f"added {grouped}"
+    if verb == "removed" and removed_definitions:
+        grouped = _summary_group_definitions(removed_definitions)
+        if grouped:
+            return f"removed {grouped}"
+
+    before_focus = _summary_focus_from_text(before_text, file_label)
+    after_focus = _summary_focus_from_text(after_text, file_label)
+
+    if (
+        target
+        and verb == "updated"
+        and before_focus
+        and after_focus
+        and before_focus != after_focus
+        and before_focus.startswith(("guidance ", "documentation "))
+        and after_focus.startswith(("guidance ", "documentation "))
+    ):
+        return f"changed {target} from {before_focus} to {after_focus}"
+
+    if (
+        target
+        and verb == "updated"
+        and before_focus
+        and after_focus
+        and before_focus.startswith(("guidance ", "documentation "))
+        and after_focus.startswith("a call to ")
+    ):
+        label = "guidance" if before_focus.startswith("guidance ") else "documentation"
+        return f"replaced inline {label} with {after_focus} in {target}"
+
+    focus = before_focus if verb == "removed" else after_focus or before_focus
+    if focus:
+        action = "changed" if verb == "updated" else verb
+        if target and focus != target:
+            prep = "from" if verb == "removed" else "in"
+            return f"{action} {focus} {prep} {target}"
+        return f"{action} {focus}"
 
     if target:
         return f"{verb} {target}"
@@ -2223,7 +2413,9 @@ def _build_file_change_description(item: dict) -> str:
         clauses = specific_clauses
 
     if clauses:
-        selected = clauses[:3]
+        indexed_clauses = list(enumerate(clauses))
+        indexed_clauses.sort(key=lambda pair: (_summary_clause_priority(pair[1]), pair[0]))
+        selected = [clause for _, clause in indexed_clauses[:3]]
         if len(selected) == 1:
             detail = selected[0]
         else:
@@ -2244,6 +2436,23 @@ def _build_file_change_description(item: dict) -> str:
     if fallback_bits:
         return f"{overview[:-1]} ({', '.join(fallback_bits)})."
     return overview
+
+
+def _summary_clause_priority(clause: str) -> int:
+    lower = clause.lower()
+    if "guidance " in lower or "documentation " in lower or "covering `" in clause:
+        return 0
+    if "command handling" in lower:
+        return 1
+    if " function" in lower or " class" in lower or "definitions for " in lower:
+        return 2
+    if " section" in lower or " setting" in lower:
+        return 3
+    if "call to " in lower:
+        return 4
+    if " assignment" in lower:
+        return 5
+    return 6
 
 
 def build_change_summary_lines(path: str | None = None, session: dict | None = None) -> list[str]:
@@ -2343,6 +2552,28 @@ def build_change_summary_lines(path: str | None = None, session: dict | None = N
         lines.append(f"- `{file_label}`: {_build_file_change_description(item)}")
 
     return lines
+
+
+def _review_action_prompt(cwd: str | None = None, *, bold: bool = False) -> str:
+    repo_path = cwd or REPO_PATH
+    dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], repo_path).returncode == 0
+
+    def render(token: str) -> str:
+        return f"**{token}**" if bold else f"`{token}`"
+
+    merge_hint = f"merge to `{DEV_BRANCH}`" if dev_exists else "choose a merge target"
+    return (
+        f"{render('yes')} to commit, push & {merge_hint}, "
+        f"{render('skip')} to push without merging, or {render('no')} to discard"
+    )
+
+
+def _working_session_guidance(cwd: str | None = None) -> str:
+    return (
+        "If the task is done, send `done` for the exact diff summary, then reply "
+        f"{_review_action_prompt(cwd)}. "
+        "Otherwise send a follow-up to keep iterating, `diff` for a quick peek, or `review` for major changes."
+    )
 
 
 def _format_review_entry_parts(entry: dict, index: int, total: int) -> list[str]:
@@ -3933,7 +4164,7 @@ async def on_message(message: discord.Message):
             f"📍 `{restored_session['cwd']}`\n"
             f"📌 {truncate(intent, 300)}\n"
             f"📊 {stat}\n"
-            "Send a follow-up to continue, `diff` for a quick peek, `review` for major changes, or `done` when finished."
+            f"{_working_session_guidance(restored_session['cwd'])}"
         )
         return
 
@@ -3961,12 +4192,7 @@ async def on_message(message: discord.Message):
                 "Continuing to the push prompt."
             )
         session["phase"] = "review"
-        dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], cwd).returncode == 0
-        merge_hint = f"merge to `{DEV_BRANCH}`" if dev_exists else "select a merge target"
-        await ch.send(
-            f"Reply **yes** to commit, push & {merge_hint}, "
-            f"**skip** to push without merging, or **no** to discard."
-        )
+        await ch.send(f"Reply {_review_action_prompt(cwd, bold=True)}.")
         return
 
     # ── Session: push approval ────────────────────────────────────────────
@@ -4544,9 +4770,7 @@ async def on_message(message: discord.Message):
                 auto_commit(exec_description, 1, cwd)
                 await send_engine_output_block(ch, label, output)
                 stat = get_diff_stat(cwd)
-                await ch.send(f"📊 {stat}\n"
-                              f"Send a follow-up to keep iterating, `diff` for a quick peek, `review` for major changes, "
-                              f"or `done` when finished.")
+                await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
                 return
             finally:
                 if clear_saved_plan and clear_plan_context(ch.id):
@@ -4779,7 +5003,7 @@ async def on_message(message: discord.Message):
             record_state(ch.id, cwd, branch_name)
             stat = get_diff_stat(cwd)
             await ch.send(
-                f"📊 {stat or 'clean'}\nContinue with a follow-up, run `review`, or `done` when finished."
+                f"📊 {stat or 'clean'}\n{_working_session_guidance(cwd)}"
             )
         else:
             record_state(ch.id, cwd, branch_name)
@@ -5433,8 +5657,9 @@ async def on_message(message: discord.Message):
             await ch.send(f"❌ {e}")
             return
         diff_stat = get_diff_stat(restored["cwd"])
-        await ch.send(f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n"
-                       f"Send a follow-up, `diff` for a quick peek, `review` for major changes, or `done` when finished.")
+        await ch.send(
+            f"♻️ Recovered session on `{branch}`\n📊 {diff_stat}\n{_working_session_guidance(restored['cwd'])}"
+        )
         return
 
     # ── Follow-up in active session ───────────────────────────────────────
@@ -5478,9 +5703,7 @@ async def on_message(message: discord.Message):
         auto_commit(session["description"], session["turns"], cwd)
         await send_engine_output_block(ch, label, output)
         stat = get_diff_stat(cwd)
-        await ch.send(f"📊 {stat}\n"
-                       f"Send another follow-up, `diff` for a quick peek, `review` for major changes, `undo` to revert, "
-                       f"or `done` when finished.")
+        await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
         return
 
     # ── New task → start a session ────────────────────────────────────────
@@ -5585,9 +5808,7 @@ async def on_message(message: discord.Message):
     auto_commit(task, 1, cwd)
     await send_engine_output_block(ch, label, output)
     stat = get_diff_stat(cwd)
-    await ch.send(f"📊 {stat}\n"
-                   f"Send a follow-up to keep iterating, `diff` for a quick peek, `review` for major changes, "
-                   f"or `done` when finished.")
+    await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
