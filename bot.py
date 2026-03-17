@@ -2061,6 +2061,10 @@ def _summary_looks_like_command(token: str) -> bool:
 
 def _summary_command_tokens(text: str) -> list[str]:
     tokens: list[str] = []
+    for raw in re.findall(r"render\((?:'|\")([^'\"]{1,20})(?:'|\")\)", text):
+        clean = _collapse_whitespace(raw)
+        if clean and _summary_looks_like_command(clean) and clean not in tokens:
+            tokens.append(clean)
     for raw in re.findall(r"`([^`]{1,40})`", text):
         clean = _collapse_whitespace(raw)
         if clean and _summary_looks_like_command(clean) and clean not in tokens:
@@ -2168,11 +2172,18 @@ def _summary_focus_from_line(line: str, file_label: str) -> str | None:
                 return f"documentation for {rendered_tokens}"
             return f"guidance mentioning {rendered_tokens}"
 
-    match = re.match(r"^(?:await\s+)?([A-Za-z_][A-Za-z0-9_\.]*)\s*\(", clean)
-    if match:
-        name = match.group(1)
-        if name not in {"if", "for", "while", "return"}:
-            return f"a call to `{_truncate_inline_text(name, 40)}`"
+    if not clean.startswith(("def ", "async def ", "class ")):
+        call_names = [
+            name
+            for name in re.findall(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(", clean)
+            if name not in {"if", "for", "while", "return"}
+        ]
+        if call_names:
+            preferred = next(
+                (name for name in reversed(call_names) if name not in {"ch.send", "channel.send"}),
+                call_names[-1],
+            )
+            return f"a call to `{_truncate_inline_text(preferred, 40)}`"
 
     match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])?)\s*=", clean)
     if match:
@@ -2319,6 +2330,17 @@ def _summary_clause_for_unit(unit: dict) -> str | None:
         and after_focus.startswith(("guidance ", "documentation "))
     ):
         return f"changed {target} from {before_focus} to {after_focus}"
+
+    if (
+        target
+        and verb == "updated"
+        and before_focus
+        and after_focus
+        and before_focus.startswith(("guidance ", "documentation "))
+        and after_focus.startswith("a call to ")
+    ):
+        label = "guidance" if before_focus.startswith("guidance ") else "documentation"
+        return f"replaced inline {label} with {after_focus} in {target}"
 
     focus = before_focus if verb == "removed" else after_focus or before_focus
     if focus:
