@@ -234,8 +234,13 @@ def _collapse_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def _sanitize_discord_text(text: str) -> str:
+    clean = strip_ansi(text or "")
+    return "".join(ch for ch in clean if ch in ("\n", "\t") or ord(ch) >= 32)
+
+
 def _sanitize_code_block_text(text: str) -> str:
-    clean = text or "(none)"
+    clean = _sanitize_discord_text(text or "(none)") or "(none)"
     return clean.replace("```", "'''")
 
 
@@ -2432,6 +2437,24 @@ async def send_change_summary(
         await channel.send(f"**{title}**{suffix}\n{chunk}")
 
 
+async def send_engine_output_block(
+    channel: discord.abc.Messageable,
+    title: str,
+    output: str,
+    *,
+    failure_notice: str | None = None,
+) -> None:
+    body = truncate(_sanitize_code_block_text(output or "(no output)"), 1800)
+    try:
+        await channel.send(f"**{title}:**\n```\n{body}\n```")
+    except (discord.Forbidden, discord.HTTPException):
+        notice = failure_notice or f"⚠️ {title} finished, but I couldn't post the engine output."
+        try:
+            await channel.send(notice)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
 def get_status_porcelain(path: str | None = None) -> list[str]:
     """Return git status --porcelain lines (empty if clean)."""
     raw = run_git(["git", "status", "--porcelain"], path).stdout.strip()
@@ -2790,7 +2813,7 @@ async def _run_with_live_output(
         # Final update to show completion
         elapsed = int(time.time() - start)
         try:
-            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the result below.")
         except discord.HTTPException:
             pass
 
@@ -2899,7 +2922,7 @@ async def _run_claude_streaming(
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the result below.")
         except discord.HTTPException:
             pass
 
@@ -4501,7 +4524,7 @@ async def on_message(message: discord.Message):
                         record_state(ch.id, canonical, current_branch(canonical) or branch)
                     remove_worktree(canonical, ch.id)
                     channel_cwd[ch.id] = canonical
-                    await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+                    await send_engine_output_block(ch, label, output)
                     msg = "ℹ️ No files changed — no session started."
                     if not base:
                         msg += " (Branch left checked out; no base branch found.)"
@@ -4519,7 +4542,7 @@ async def on_message(message: discord.Message):
                 }
 
                 auto_commit(exec_description, 1, cwd)
-                await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+                await send_engine_output_block(ch, label, output)
                 stat = get_diff_stat(cwd)
                 await ch.send(f"📊 {stat}\n"
                               f"Send a follow-up to keep iterating, `diff` for a quick peek, `review` for major changes, "
@@ -4563,7 +4586,12 @@ async def on_message(message: discord.Message):
             return
 
         save_plan_context(ch.id, cwd, engine, plan_request, output, runtime_config=runtime_config)
-        await ch.send(f"**{label} Plan:**\n```\n{truncate(output, 1800)}\n```")
+        await send_engine_output_block(
+            ch,
+            f"{label} Plan",
+            output,
+            failure_notice="⚠️ Planning finished, but I couldn't post the full plan output.",
+        )
         await ch.send("💾 Saved plan context. Run `plan: do` (or `plan do`) to execute it.")
         return
 
@@ -5448,7 +5476,7 @@ async def on_message(message: discord.Message):
 
         _absorb_usage_into_session(session, ch.id)
         auto_commit(session["description"], session["turns"], cwd)
-        await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+        await send_engine_output_block(ch, label, output)
         stat = get_diff_stat(cwd)
         await ch.send(f"📊 {stat}\n"
                        f"Send another follow-up, `diff` for a quick peek, `review` for major changes, `undo` to revert, "
@@ -5534,7 +5562,7 @@ async def on_message(message: discord.Message):
             record_state(ch.id, canonical, current_branch(canonical) or branch)
         remove_worktree(canonical, ch.id)
         channel_cwd[ch.id] = canonical
-        await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+        await send_engine_output_block(ch, label, output)
         msg = "ℹ️ No files changed — no session started."
         if not base:
             msg += " (Branch left checked out; no base branch found.)"
@@ -5555,7 +5583,7 @@ async def on_message(message: discord.Message):
     _absorb_usage_into_session(active_sessions[ch.id], ch.id)
 
     auto_commit(task, 1, cwd)
-    await ch.send(f"**{label}:**\n```\n{truncate(output, 1800)}\n```")
+    await send_engine_output_block(ch, label, output)
     stat = get_diff_stat(cwd)
     await ch.send(f"📊 {stat}\n"
                    f"Send a follow-up to keep iterating, `diff` for a quick peek, `review` for major changes, "
