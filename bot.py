@@ -2568,10 +2568,26 @@ def _review_action_prompt(cwd: str | None = None, *, bold: bool = False) -> str:
     )
 
 
+def _working_session_command_help(cwd: str | None = None) -> str:
+    repo_path = cwd or REPO_PATH
+    dev_exists = run_git(["git", "rev-parse", "--verify", DEV_BRANCH], repo_path).returncode == 0
+    merge_hint = f"merge to `{DEV_BRANCH}`" if dev_exists else "choose a merge target"
+    return "\n".join(
+        [
+            "**Next steps**",
+            "- `done`: show the current change summary again and switch to approval mode",
+            f"- after `done`, `yes`: commit, push, and {merge_hint}",
+            "- after `done`, `skip`: commit and push without merging",
+            "- after `done`, `no`: discard this session's changes",
+            "- still iterating: send a follow-up, `diff`, or `review`",
+        ]
+    )
+
+
 def _working_session_guidance(cwd: str | None = None) -> str:
     return (
-        "If the task is done, send `done` for the exact diff summary, then reply "
-        f"{_review_action_prompt(cwd)}. "
+        "If the task is done, send `done` to review the exact change summary and enter approval mode, "
+        f"then reply {_review_action_prompt(cwd)}. "
         "Otherwise send a follow-up to keep iterating, `diff` for a quick peek, or `review` for major changes."
     )
 
@@ -2666,6 +2682,19 @@ async def send_change_summary(
     for idx, chunk in enumerate(chunks, 1):
         suffix = "" if total_chunks == 1 else f" · part {idx}/{total_chunks}"
         await channel.send(f"**{title}**{suffix}\n{chunk}")
+
+
+async def send_working_session_wrapup(
+    channel: discord.abc.Messageable,
+    session: dict,
+    cwd: str | None = None,
+) -> None:
+    lines = build_change_summary_lines(cwd, session=session)
+    if lines:
+        await send_change_summary(channel, f"Current changes on `{session['branch']}`", lines)
+    else:
+        await channel.send(f"📊 {get_diff_stat(cwd) or 'clean'}")
+    await channel.send(_working_session_command_help(cwd))
 
 
 async def send_engine_output_block(
@@ -3044,7 +3073,7 @@ async def _run_with_live_output(
         # Final update to show completion
         elapsed = int(time.time() - start)
         try:
-            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the result below.")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -3153,7 +3182,7 @@ async def _run_claude_streaming(
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the result below.")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -5702,8 +5731,7 @@ async def on_message(message: discord.Message):
         _absorb_usage_into_session(session, ch.id)
         auto_commit(session["description"], session["turns"], cwd)
         await send_engine_output_block(ch, label, output)
-        stat = get_diff_stat(cwd)
-        await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
+        await send_working_session_wrapup(ch, session, cwd)
         return
 
     # ── New task → start a session ────────────────────────────────────────
@@ -5807,8 +5835,7 @@ async def on_message(message: discord.Message):
 
     auto_commit(task, 1, cwd)
     await send_engine_output_block(ch, label, output)
-    stat = get_diff_stat(cwd)
-    await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
+    await send_working_session_wrapup(ch, active_sessions[ch.id], cwd)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
