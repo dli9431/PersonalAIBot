@@ -3058,11 +3058,13 @@ async def _run_with_live_output(
             except discord.HTTPException:
                 pass
 
+    timed_out = False
     try:
         io_task = asyncio.gather(read_stdout(), read_stderr(), proc.wait())
         update_task = asyncio.create_task(live_update())
         await asyncio.wait_for(io_task, timeout=ENGINE_TIMEOUT)
     except asyncio.TimeoutError:
+        timed_out = True
         proc.kill()
         partial = b"".join(stdout_chunks).decode(errors="replace")
         raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
@@ -3070,10 +3072,12 @@ async def _run_with_live_output(
         done.set()
         update_task.cancel()
         running_procs.pop(ch.id, None)
-        # Final update to show completion
         elapsed = int(time.time() - start)
         try:
-            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+            if timed_out:
+                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+            else:
+                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -3169,12 +3173,14 @@ async def _run_claude_streaming(
                     except discord.HTTPException:
                         pass
 
+    timed_out = False
     try:
         await asyncio.wait_for(
             asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
             timeout=ENGINE_TIMEOUT,
         )
     except asyncio.TimeoutError:
+        timed_out = True
         proc.kill()
         partial = final_result or "".join(accumulated_text)
         raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
@@ -3182,7 +3188,10 @@ async def _run_claude_streaming(
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+            if timed_out:
+                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+            else:
+                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -4768,38 +4777,46 @@ async def on_message(message: discord.Message):
 
                 clear_saved_plan = True
 
-                # If no files changed, clean up the branch and skip starting a session.
-                if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
-                    canonical = _canonical_repo(cwd)
-                    base = _resolve_checkout_branch(canonical, avoid=branch)
-                    if base:
-                        run_git(["git", "branch", "-D", branch], canonical)
-                        record_state(ch.id, canonical, base)
-                    else:
-                        record_state(ch.id, canonical, current_branch(canonical) or branch)
-                    remove_worktree(canonical, ch.id)
-                    channel_cwd[ch.id] = canonical
+                try:
+                    # If no files changed, clean up the branch and skip starting a session.
+                    if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
+                        canonical = _canonical_repo(cwd)
+                        base = _resolve_checkout_branch(canonical, avoid=branch)
+                        if base:
+                            run_git(["git", "branch", "-D", branch], canonical)
+                            record_state(ch.id, canonical, base)
+                        else:
+                            record_state(ch.id, canonical, current_branch(canonical) or branch)
+                        remove_worktree(canonical, ch.id)
+                        channel_cwd[ch.id] = canonical
+                        await send_engine_output_block(ch, label, output)
+                        msg = "ℹ️ No files changed — no session started."
+                        if not base:
+                            msg += " (Branch left checked out; no base branch found.)"
+                        await ch.send(msg)
+                        return
+
+                    active_sessions[ch.id] = {
+                        "branch": branch,
+                        "engine": engine,
+                        "description": exec_description,
+                        "turns": 1,
+                        "phase": "working",
+                        "cwd": cwd,
+                        "runtime_config": dict(runtime_config),
+                    }
+
+                    auto_commit(exec_description, 1, cwd)
                     await send_engine_output_block(ch, label, output)
-                    msg = "ℹ️ No files changed — no session started."
-                    if not base:
-                        msg += " (Branch left checked out; no base branch found.)"
-                    await ch.send(msg)
-                    return
-
-                active_sessions[ch.id] = {
-                    "branch": branch,
-                    "engine": engine,
-                    "description": exec_description,
-                    "turns": 1,
-                    "phase": "working",
-                    "cwd": cwd,
-                    "runtime_config": dict(runtime_config),
-                }
-
-                auto_commit(exec_description, 1, cwd)
-                await send_engine_output_block(ch, label, output)
-                stat = get_diff_stat(cwd)
-                await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
+                    stat = get_diff_stat(cwd)
+                    await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
+                except Exception as exc:
+                    logger.exception("Error in post-run handling for plan execution")
+                    try:
+                        await ch.send(f"⚠️ Plan execution finished but hit an error posting results: `{exc}`\n"
+                                      "Your changes are on the branch — use `diff` or `review` to inspect.")
+                    except discord.HTTPException:
+                        pass
                 return
             finally:
                 if clear_saved_plan and clear_plan_context(ch.id):
@@ -5728,10 +5745,18 @@ async def on_message(message: discord.Message):
         if stop_event.is_set():
             return
 
-        _absorb_usage_into_session(session, ch.id)
-        auto_commit(session["description"], session["turns"], cwd)
-        await send_engine_output_block(ch, label, output)
-        await send_working_session_wrapup(ch, session, cwd)
+        try:
+            _absorb_usage_into_session(session, ch.id)
+            auto_commit(session["description"], session["turns"], cwd)
+            await send_engine_output_block(ch, label, output)
+            await send_working_session_wrapup(ch, session, cwd)
+        except Exception as exc:
+            logger.exception("Error in post-run handling for follow-up")
+            try:
+                await ch.send(f"⚠️ Follow-up finished but hit an error posting results: `{exc}`\n"
+                              "Your changes are on the branch — use `diff` or `review` to inspect.")
+            except discord.HTTPException:
+                pass
         return
 
     # ── New task → start a session ────────────────────────────────────────
@@ -5802,40 +5827,48 @@ async def on_message(message: discord.Message):
         _end_session(ch.id, cwd)
         return
 
-    # If no files changed, clean up the branch and skip starting a session
-    if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
-        canonical = _canonical_repo(cwd)
-        base = _resolve_checkout_branch(canonical, avoid=branch)
-        if base:
-            run_git(["git", "branch", "-D", branch], canonical)
-            record_state(ch.id, canonical, base)
-        else:
-            record_state(ch.id, canonical, current_branch(canonical) or branch)
-        remove_worktree(canonical, ch.id)
-        channel_cwd[ch.id] = canonical
+    try:
+        # If no files changed, clean up the branch and skip starting a session
+        if not run_git(["git", "status", "--porcelain"], cwd).stdout.strip() and get_ahead_count(cwd) == 0:
+            canonical = _canonical_repo(cwd)
+            base = _resolve_checkout_branch(canonical, avoid=branch)
+            if base:
+                run_git(["git", "branch", "-D", branch], canonical)
+                record_state(ch.id, canonical, base)
+            else:
+                record_state(ch.id, canonical, current_branch(canonical) or branch)
+            remove_worktree(canonical, ch.id)
+            channel_cwd[ch.id] = canonical
+            await send_engine_output_block(ch, label, output)
+            msg = "ℹ️ No files changed — no session started."
+            if not base:
+                msg += " (Branch left checked out; no base branch found.)"
+            await ch.send(msg)
+            return
+
+        # Create session
+        active_sessions[ch.id] = {
+            "branch": branch,
+            "engine": engine,
+            "description": task,
+            "turns": 1,
+            "phase": "working",
+            "cwd": cwd,
+            "runtime_config": dict(runtime_config),
+            "total_usage": {},
+        }
+        _absorb_usage_into_session(active_sessions[ch.id], ch.id)
+
+        auto_commit(task, 1, cwd)
         await send_engine_output_block(ch, label, output)
-        msg = "ℹ️ No files changed — no session started."
-        if not base:
-            msg += " (Branch left checked out; no base branch found.)"
-        await ch.send(msg)
-        return
-
-    # Create session
-    active_sessions[ch.id] = {
-        "branch": branch,
-        "engine": engine,
-        "description": task,
-        "turns": 1,
-        "phase": "working",
-        "cwd": cwd,
-        "runtime_config": dict(runtime_config),
-        "total_usage": {},
-    }
-    _absorb_usage_into_session(active_sessions[ch.id], ch.id)
-
-    auto_commit(task, 1, cwd)
-    await send_engine_output_block(ch, label, output)
-    await send_working_session_wrapup(ch, active_sessions[ch.id], cwd)
+        await send_working_session_wrapup(ch, active_sessions[ch.id], cwd)
+    except Exception as exc:
+        logger.exception("Error in post-run handling for new task")
+        try:
+            await ch.send(f"⚠️ Task finished but hit an error posting results: `{exc}`\n"
+                          "Your changes are on the branch — use `diff` or `review` to inspect.")
+        except discord.HTTPException:
+            pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
