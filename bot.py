@@ -4139,10 +4139,10 @@ async def on_message(message: discord.Message):
         saved_diff = str(snapshot.get("diff_stat") or "no changes").strip() or "no changes"
         saved_reason = str(snapshot.get("reason") or "timeout_exhausted").strip() or "timeout_exhausted"
         saved_turns = snapshot.get("turns")
-        auto_commit = snapshot.get("auto_commit") if isinstance(snapshot.get("auto_commit"), dict) else {}
-        auto_commit_subject = str(auto_commit.get("subject") or "").strip()
-        auto_commit_sha = str(auto_commit.get("sha") or "").strip()
-        auto_commit_created = auto_commit.get("created")
+        ac_snapshot = snapshot.get("auto_commit") if isinstance(snapshot.get("auto_commit"), dict) else {}
+        auto_commit_subject = str(ac_snapshot.get("subject") or "").strip()
+        auto_commit_sha = str(ac_snapshot.get("sha") or "").strip()
+        auto_commit_created = ac_snapshot.get("created")
         auto_commit_line = "Auto-commit: `(unknown)`"
         if auto_commit_subject or auto_commit_sha:
             auto_commit_line = "Auto-commit: "
