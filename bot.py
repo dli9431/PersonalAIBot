@@ -4772,7 +4772,13 @@ async def on_message(message: discord.Message):
 
                 if stop_event.is_set():
                     await discard_changes(branch, cwd)
+                    canonical = _canonical_repo(cwd)
                     _end_session(ch.id, cwd)
+                    # discard_changes can't delete the branch while the worktree has it
+                    # checked out (git checkout main silently fails inside the worktree).
+                    # Now that the worktree is gone, finish the deletion on the canonical repo.
+                    if not is_protected_branch(branch):
+                        run_git(["git", "branch", "-D", branch], canonical)
                     await ch.send(f"🗑️ Cleaned up branch `{branch}`.")
                     return
 
@@ -5825,7 +5831,13 @@ async def on_message(message: discord.Message):
 
     if stop_event.is_set():
         await discard_changes(branch, cwd)
+        canonical = _canonical_repo(cwd)
         _end_session(ch.id, cwd)
+        # discard_changes can't delete the branch while the worktree has it
+        # checked out (git checkout main silently fails inside the worktree).
+        # Now that the worktree is gone, finish the deletion on the canonical repo.
+        if not is_protected_branch(branch):
+            run_git(["git", "branch", "-D", branch], canonical)
         await ch.send(f"🗑️ Cleaned up branch `{branch}`.")
         return
 
