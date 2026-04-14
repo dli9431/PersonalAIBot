@@ -4773,6 +4773,7 @@ async def on_message(message: discord.Message):
                 if stop_event.is_set():
                     await discard_changes(branch, cwd)
                     _end_session(ch.id, cwd)
+                    await ch.send(f"🗑️ Cleaned up branch `{branch}`.")
                     return
 
                 clear_saved_plan = True
@@ -5825,6 +5826,7 @@ async def on_message(message: discord.Message):
     if stop_event.is_set():
         await discard_changes(branch, cwd)
         _end_session(ch.id, cwd)
+        await ch.send(f"🗑️ Cleaned up branch `{branch}`.")
         return
 
     try:
