@@ -4912,7 +4912,17 @@ async def on_message(message: discord.Message):
         if pull.returncode != 0:
             await ch.send(f"❌ Pull failed:\n```\n{pull.stderr.strip()}\n```")
             return
-        await ch.send(f"✅ `{branch}` is up to date.\n```\n{pull.stdout.strip() or pull.stderr.strip()}\n```")
+        detail = (pull.stdout.strip() or pull.stderr.strip()).strip()
+        already = "already up to date" in detail.lower()
+        header = (
+            f"✅ `{branch}` already up to date — nothing to pull."
+            if already
+            else f"✅ Pulled `{branch}` from remote."
+        )
+        if detail and not already:
+            await ch.send(f"{header}\n```\n{detail}\n```")
+        else:
+            await ch.send(header)
         return
 
     # ── Multi-repo commands ───────────────────────────────────────────────
