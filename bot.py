@@ -4,7 +4,7 @@ Discord → Claude Code / Codex CLI → Git bridge bot.
 
 Supports iterative sessions: send a task, review changes, send follow-ups,
 and only commit when you're satisfied. Uses --resume (Claude Code) and
-exec resume --last (Codex) for multi-turn context.
+explicit Codex thread resumes for multi-turn context.
 
 Designed to run on Linux (including WSL2).
 
@@ -56,11 +56,11 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 ).split()
 
 # Codex CLI
-CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.3-codex")
+CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.5")
 CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower() or None
 
 CLAUDE_REASONING_LEVELS = ("low", "medium", "high")
-CODEX_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
+CODEX_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
 CLAUDE_REASONING_OPTIONS = (*CLAUDE_REASONING_LEVELS, "default")
 CODEX_REASONING_OPTIONS = (*CODEX_REASONING_LEVELS, "default")
 
@@ -392,6 +392,9 @@ def _absorb_usage_into_session(session: dict, ch_id: int) -> None:
         return
     if _normalize_engine_name(last.get("engine")) != _normalize_engine_name(session.get("engine")):
         return
+    codex_thread_id = _clean_codex_thread_id(last.get("codex_thread_id"))
+    if _normalize_engine_name(session.get("engine")) == "codex" and codex_thread_id:
+        session["codex_thread_id"] = codex_thread_id
     total = session.setdefault("total_usage", {})
     for key in ("input_tokens", "output_tokens", "cache_read", "cache_write"):
         total[key] = total.get(key, 0) + last.get(key, 0)
@@ -646,6 +649,35 @@ def _coerce_text(value: object | None) -> str:
     return str(value)
 
 
+def _clean_codex_thread_id(value: object | None) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return ""
+    return text
+
+
+def _current_codex_thread_id(ch_id: int, *, include_saved: bool = True) -> str:
+    session = active_sessions.get(ch_id)
+    for source in (
+        session,
+        active_run_contexts.get(ch_id),
+        channel_last_usage.get(ch_id),
+    ):
+        if isinstance(source, dict):
+            thread_id = _clean_codex_thread_id(source.get("codex_thread_id"))
+            if thread_id:
+                return thread_id
+    if include_saved:
+        for source in (load_resume_context(ch_id), load_unfinished_task_snapshot(ch_id)):
+            if isinstance(source, dict):
+                thread_id = _clean_codex_thread_id(source.get("codex_thread_id"))
+                if thread_id:
+                    return thread_id
+    return ""
+
+
 def _tail_text(text: str, max_chars: int = CONTEXT_MAX_CHARS) -> str:
     if not text:
         return ""
@@ -784,6 +816,10 @@ def save_resume_context(
         "output_tail": _tail_text(_coerce_text(output)),
         "reason": reason,
     }
+    if _normalize_engine_name(engine) == "codex":
+        codex_thread_id = _current_codex_thread_id(ch_id, include_saved=False)
+        if codex_thread_id:
+            entry["codex_thread_id"] = codex_thread_id
     contexts[str(ch_id)] = entry
     _save_state(data)
 
@@ -876,6 +912,10 @@ def save_unfinished_task_snapshot(
     totals = _coerce_usage_totals((session or {}).get("total_usage"))
     if totals:
         entry["total_usage"] = totals
+    if _normalize_engine_name(engine) == "codex":
+        codex_thread_id = _current_codex_thread_id(ch_id)
+        if codex_thread_id:
+            entry["codex_thread_id"] = codex_thread_id
     if auto_commit:
         commit_entry = {
             key: value
@@ -2768,8 +2808,8 @@ def get_codex_models() -> list[tuple[str, int | None]]:
         ]
     except Exception:
         return [
-            ("gpt-5.3-codex", None), ("gpt-5.2-codex", None),
-            ("gpt-5.1-codex-max", None), ("gpt-5.2", None), ("gpt-5.1-codex-mini", None),
+            ("gpt-5.5", None), ("gpt-5.4", None),
+            ("gpt-5.4-mini", None), ("gpt-5.3-codex-spark", None),
         ]
 
 
@@ -2877,6 +2917,7 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
         return token, None
 
     aliases = {
+        "min": "minimal",
         "med": "medium",
         "max": "xhigh",
         "veryhigh": "xhigh",
@@ -3208,6 +3249,220 @@ async def _run_claude_streaming(
     return output
 
 
+def _codex_usage_totals(usage: dict) -> dict[str, int]:
+    return {
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        "cache_read": int(
+            usage.get("cached_input_tokens", usage.get("cache_read_input_tokens", 0)) or 0
+        ),
+        "cache_write": int(
+            usage.get("cache_creation_input_tokens", usage.get("cache_write_input_tokens", 0)) or 0
+        ),
+    }
+
+
+def _format_codex_activity(item: dict) -> str | None:
+    item_type = str(item.get("type") or "").strip()
+    if item_type == "command_execution":
+        command = str(item.get("command") or "").strip()
+        return f"cmd: {truncate(command, 120)}" if command else "cmd"
+    if item_type in {"file_change", "file_diff"}:
+        path = str(item.get("path") or item.get("file") or "").strip()
+        return f"file: {path}" if path else "file change"
+    if item_type in {"mcp_tool_call", "tool_call"}:
+        name = str(item.get("name") or item.get("tool") or item.get("tool_name") or "").strip()
+        server = str(item.get("server") or item.get("server_name") or "").strip()
+        label = f"{server}/{name}" if server and name else name or server
+        return f"tool: {label}" if label else "tool"
+    if item_type == "web_search":
+        query = str(item.get("query") or "").strip()
+        return f"web: {truncate(query, 120)}" if query else "web search"
+    if item_type == "error":
+        message = str(item.get("message") or item.get("error") or "").strip()
+        return f"error: {truncate(message, 120)}" if message else "error"
+    return None
+
+
+def _extract_codex_item_text(item: dict) -> str:
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    content = item.get("content")
+    if isinstance(content, list):
+        parts = [
+            str(part.get("text") or "").strip()
+            for part in content
+            if isinstance(part, dict) and str(part.get("text") or "").strip()
+        ]
+        if parts:
+            return "\n".join(parts)
+    message = item.get("message")
+    if isinstance(message, dict):
+        return _extract_codex_item_text(message)
+    return ""
+
+
+async def _run_codex_streaming(
+    cmd: list[str],
+    ch: discord.TextChannel,
+    label: str,
+    cwd: str | None = None,
+) -> str:
+    """Run Codex with --json, live-updating Discord from JSONL events."""
+    status_msg = await ch.send(f"⚙️ {label} started...")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd or REPO_PATH,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=10 * 1024 * 1024,
+    )
+    running_procs[ch.id] = proc
+
+    agent_messages: list[str] = []
+    raw_lines: list[str] = []
+    activity: list[str] = []
+    errors: list[str] = []
+    stderr_chunks: list[bytes] = []
+    result_usage: dict[str, int] = {}
+    codex_thread_id = ""
+    usage_accumulated = False
+    start = time.time()
+    last_edit_time = 0.0
+    last_content = ""
+
+    def remember_thread_id(value: object | None) -> None:
+        nonlocal codex_thread_id
+        thread_id = _clean_codex_thread_id(value)
+        if not thread_id:
+            return
+        codex_thread_id = thread_id
+        run_ctx = active_run_contexts.get(ch.id)
+        if isinstance(run_ctx, dict):
+            run_ctx["codex_thread_id"] = thread_id
+
+    def snapshot_usage() -> None:
+        nonlocal usage_accumulated
+        snapshot: dict[str, object] = {"engine": "codex"}
+        if codex_thread_id:
+            snapshot["codex_thread_id"] = codex_thread_id
+        snapshot.update(result_usage)
+        channel_last_usage[ch.id] = snapshot
+        if result_usage and not usage_accumulated:
+            _accumulate_global_usage("codex", result_usage)
+            usage_accumulated = True
+
+    async def read_stderr() -> None:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+
+    async def stream_stdout() -> None:
+        nonlocal last_edit_time, last_content, result_usage
+        async for raw_line in proc.stdout:
+            line_str = raw_line.decode(errors="replace").strip()
+            if not line_str:
+                continue
+            raw_lines.append(line_str)
+            try:
+                event = json.loads(line_str)
+            except json.JSONDecodeError:
+                agent_messages.append(line_str)
+                continue
+
+            event_type = str(event.get("type") or "").strip()
+            thread_obj = event.get("thread")
+            thread_id = event.get("thread_id") or event.get("threadId")
+            if not thread_id and isinstance(thread_obj, dict):
+                thread_id = thread_obj.get("id")
+            remember_thread_id(thread_id)
+
+            if event_type == "thread.started":
+                remember_thread_id(event.get("thread_id") or event.get("threadId"))
+            elif event_type in {"item.started", "item.completed"}:
+                item = event.get("item")
+                if isinstance(item, dict):
+                    item_activity = _format_codex_activity(item)
+                    if item_activity:
+                        activity.append(item_activity)
+                    item_type = str(item.get("type") or "").strip()
+                    if event_type == "item.completed" and (
+                        item_type in {"agent_message", "assistant_message", "message"}
+                        or item_type.endswith("_message")
+                    ):
+                        text = _extract_codex_item_text(item)
+                        if text:
+                            agent_messages.append(text)
+            elif event_type == "turn.completed":
+                usage = event.get("usage")
+                if isinstance(usage, dict):
+                    result_usage = _codex_usage_totals(usage)
+            elif event_type in {"turn.failed", "error"}:
+                err_obj = event.get("error")
+                if isinstance(err_obj, dict):
+                    message = str(err_obj.get("message") or err_obj).strip()
+                else:
+                    message = str(err_obj or event.get("message") or "").strip()
+                if message:
+                    errors.append(message)
+
+            now = time.time()
+            if now - last_edit_time >= STATUS_REFRESH:
+                elapsed = int(now - start)
+                display = "\n\n".join(agent_messages).strip()
+                activity_line = f"[activity: {' | '.join(activity[-5:])}]\n" if activity else ""
+                thread_line = f"[thread: {codex_thread_id}]\n" if codex_thread_id else ""
+                tail = strip_ansi(thread_line + activity_line + display).strip()
+                if len(tail) > 1400:
+                    tail = tail[-1400:]
+                new_content = f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(starting...)'}\n```"
+                if new_content != last_content:
+                    try:
+                        await status_msg.edit(content=new_content)
+                        last_content = new_content
+                        last_edit_time = now
+                    except discord.HTTPException:
+                        pass
+
+    timed_out = False
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
+            timeout=ENGINE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        snapshot_usage()
+        partial = "\n\n".join(agent_messages).strip() or "\n".join(raw_lines)
+        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
+    finally:
+        snapshot_usage()
+        running_procs.pop(ch.id, None)
+        elapsed = int(time.time() - start)
+        try:
+            if timed_out:
+                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+            else:
+                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+        except discord.HTTPException:
+            pass
+
+    stderr = b"".join(stderr_chunks).decode(errors="replace")
+    output = "\n\n".join(agent_messages).strip() or "\n".join(raw_lines).strip() or "(no output)"
+    if errors:
+        output += "\n\n⚠️ Codex error:\n" + "\n".join(errors[-3:])
+    if proc.returncode != 0 and stderr:
+        tail_lines = stderr.strip().split("\n")[-5:]
+        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail_lines)
+    return output
+
+
 async def run_claude_code(
     task: str,
     ch: discord.TextChannel,
@@ -3259,31 +3514,40 @@ async def run_codex(
     cwd: str | None = None,
     runtime_config: dict[str, str | None] | None = None,
 ) -> str:
-    """Run Codex CLI. If resume=True, uses exec resume --last for context."""
+    """Run Codex CLI. If resume=True, resumes the saved thread ID when available."""
     model = get_model_for_engine("codex", runtime_config=runtime_config, ch_id=ch.id)
     reasoning_effort = get_reasoning_for_engine("codex", runtime_config=runtime_config, ch_id=ch.id)
     if resume:
-        cmd = [
-            "codex", "exec", "resume", "--last",
-            "--full-auto",
-            "--model", model,
-        ]
-    else:
+        codex_thread_id = _current_codex_thread_id(ch.id)
+        run_ctx = active_run_contexts.get(ch.id)
+        if isinstance(run_ctx, dict) and codex_thread_id:
+            run_ctx["codex_thread_id"] = codex_thread_id
         cmd = [
             "codex", "exec",
-            "--full-auto",
+            "--sandbox", "workspace-write",
+            "resume",
             "--model", model,
+            "--json",
+        ]
+        if not codex_thread_id:
+            cmd.append("--last")
+    else:
+        codex_thread_id = ""
+        cmd = [
+            "codex", "exec",
+            "--sandbox", "workspace-write",
+            "--model", model,
+            "--json",
         ]
     if reasoning_effort:
         cmd.extend(["-c", f"model_reasoning_effort=\"{reasoning_effort}\""])
     if images:
         cmd.extend(["--image", ",".join(images)])
+    if resume and codex_thread_id:
+        cmd.append(codex_thread_id)
     cmd.append(task)
 
-    output = await _run_with_live_output(cmd, ch, "Codex CLI", cwd=cwd)
-    channel_last_usage[ch.id] = {"engine": "codex"}
-    _accumulate_global_usage("codex", {})
-    return output
+    return await _run_codex_streaming(cmd, ch, "Codex CLI", cwd=cwd)
 
 
 MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
@@ -3659,6 +3923,7 @@ def activate_session_on_branch(
     turns: int = 1,
     followups: list[str] | None = None,
     total_usage: dict[str, int] | None = None,
+    codex_thread_id: str | None = None,
 ) -> dict:
     canonical = _canonical_repo(repo_path)
     if not pathlib.Path(canonical).exists():
@@ -3695,6 +3960,9 @@ def activate_session_on_branch(
     totals = _coerce_usage_totals(total_usage)
     if totals:
         session["total_usage"] = totals
+    clean_thread_id = _clean_codex_thread_id(codex_thread_id)
+    if session["engine"] == "codex" and clean_thread_id:
+        session["codex_thread_id"] = clean_thread_id
 
     active_sessions[ch_id] = session
     channel_cwd[ch_id] = wt_path
@@ -3722,6 +3990,7 @@ def restore_unfinished_session(ch_id: int) -> tuple[dict | None, str | None]:
     turns = snapshot.get("turns")
     total_usage = snapshot.get("total_usage")
     runtime_config = snapshot.get("runtime_config")
+    codex_thread_id = _clean_codex_thread_id(snapshot.get("codex_thread_id"))
 
     try:
         session = activate_session_on_branch(
@@ -3734,6 +4003,7 @@ def restore_unfinished_session(ch_id: int) -> tuple[dict | None, str | None]:
             turns=turns if isinstance(turns, int) else 1,
             followups=followups if isinstance(followups, list) else None,
             total_usage=total_usage if isinstance(total_usage, dict) else None,
+            codex_thread_id=codex_thread_id,
         )
     except Exception as exc:
         return None, str(exc)
@@ -4139,6 +4409,7 @@ async def on_message(message: discord.Message):
         saved_diff = str(snapshot.get("diff_stat") or "no changes").strip() or "no changes"
         saved_reason = str(snapshot.get("reason") or "timeout_exhausted").strip() or "timeout_exhausted"
         saved_turns = snapshot.get("turns")
+        saved_codex_thread_id = _clean_codex_thread_id(snapshot.get("codex_thread_id"))
         ac_snapshot = snapshot.get("auto_commit") if isinstance(snapshot.get("auto_commit"), dict) else {}
         auto_commit_subject = str(ac_snapshot.get("subject") or "").strip()
         auto_commit_sha = str(ac_snapshot.get("sha") or "").strip()
@@ -4166,6 +4437,8 @@ async def on_message(message: discord.Message):
         )
         if isinstance(saved_turns, int):
             details += f"Turns completed: `{saved_turns}`\n"
+        if saved_codex_thread_id:
+            details += f"Codex thread: `{saved_codex_thread_id}`\n"
         details += f"Diff: `{saved_diff}`\n{auto_commit_line}"
         await ch.send(details)
         output_tail = str(snapshot.get("output_tail") or "").strip()
@@ -4196,10 +4469,14 @@ async def on_message(message: discord.Message):
         )
         stat = get_diff_stat(restored_session["cwd"])
         intent = str(snapshot.get("intent") or snapshot.get("official_task") or restored_session["description"]).strip()
+        restored_thread_line = ""
+        if restored_session.get("codex_thread_id"):
+            restored_thread_line = f"🧵 Codex thread: `{restored_session['codex_thread_id']}`\n"
         await ch.send(
             f"♻️ Restored unfinished session on `{restored_session['branch']}`\n"
             f"🧠 `{restored_session['engine']}` (`{restored_model}`)\n"
             f"📍 `{restored_session['cwd']}`\n"
+            f"{restored_thread_line}"
             f"📌 {truncate(intent, 300)}\n"
             f"📊 {stat}\n"
             f"{_working_session_guidance(restored_session['cwd'])}"
@@ -4483,6 +4760,9 @@ async def on_message(message: discord.Message):
             out_tok = sess_usage.get("output_tokens", 0)
             if in_tok or out_tok:
                 sess_info += f" · {in_tok:,} in / {out_tok:,} out tokens"
+            codex_thread_id = _clean_codex_thread_id(session.get("codex_thread_id"))
+            if codex_thread_id:
+                sess_info += f" · thread `{codex_thread_id}`"
         else:
             snapshot = load_unfinished_task_snapshot(ch.id)
             if snapshot:
@@ -4493,6 +4773,9 @@ async def on_message(message: discord.Message):
                     f"\n🧩 Saved unfinished session: **{saved_engine}** (`{saved_model}`) · "
                     f"`{saved_branch}` · use `resume`"
                 )
+                codex_thread_id = _clean_codex_thread_id(snapshot.get("codex_thread_id"))
+                if codex_thread_id:
+                    sess_info += f" · thread `{codex_thread_id}`"
         await ch.send(f"📍 `{cwd}`\n🌿 `{br}`{sess_info}\n"
                        f"```\n{st or '(clean)'}\n```")
         return
@@ -4811,7 +5094,9 @@ async def on_message(message: discord.Message):
                         "phase": "working",
                         "cwd": cwd,
                         "runtime_config": dict(runtime_config),
+                        "total_usage": {},
                     }
+                    _absorb_usage_into_session(active_sessions[ch.id], ch.id)
 
                     auto_commit(exec_description, 1, cwd)
                     await send_engine_output_block(ch, label, output)

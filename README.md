@@ -95,8 +95,8 @@ CLAUDE_ALLOWED_TOOLS=Read Edit Write Grep Glob LS Bash(git\ diff) Bash(git\ stat
 CLAUDE_DENIED_TOOLS=Bash(rm\ *) Bash(sudo\ *) Bash(curl\ *) Bash(wget\ *) WebFetch
 
 # Codex CLI settings
-CODEX_MODEL=gpt-5.3-codex
-# Optional: low | medium | high | xhigh (unset = CLI default)
+CODEX_MODEL=gpt-5.5
+# Optional: minimal | low | medium | high | xhigh (unset = CLI default)
 CODEX_REASONING_EFFORT=
 ```
 
@@ -149,7 +149,7 @@ Use `plan show` to inspect saved plan context and `plan clear` to remove it manu
 
 ### Iterate
 
-Send follow-up messages freely — the engine keeps session context (`claude --continue`, `codex exec resume --last`).
+Send follow-up messages freely — the engine keeps session context (`claude --continue`, explicit Codex thread resume).
 If a run times out, the bot saves a short resume-context snapshot and injects it on the next engine resume.
 If the run still times out after all automatic retries, the bot also saves an unfinished session snapshot you can reopen with `resume` later (`resume show` to inspect it).
 Clear either snapshot with `context clear` if needed.
@@ -292,7 +292,7 @@ pr main               → open a GitHub PR targeting main
 | `engine global claude model <n\|name> [reasoning <n\|level>]` | Set global default engine to Claude, choose model by number or name, and optionally set reasoning in the same command |
 | `engine global codex model <n\|name> [reasoning <n\|level>]` | Set global default engine to Codex, choose model by number or name, and optionally set reasoning in the same command |
 | `claude reasoning [n\|level]` | View/set this channel's Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
-| `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set this channel's Codex reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=default`) |
+| `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set this channel's Codex reasoning by number or name (`1=minimal`, `2=low`, `3=medium`, `4=high`, `5=xhigh`, `6=default`) |
 | `engine claude reasoning <n\|level>` | Set this channel default engine to Claude and set reasoning effort |
 | `engine codex reasoning <n\|level>` | Set this channel default engine to Codex and set reasoning effort |
 | `engine global claude reasoning <n\|level>` | Set global default engine to Claude and set reasoning effort |

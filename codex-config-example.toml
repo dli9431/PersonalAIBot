@@ -1,6 +1,6 @@
 # ~/.codex/config.toml
 
-model = "gpt-5.3-codex"
+model = "gpt-5.5"
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
