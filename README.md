@@ -1,3 +1,7 @@
+Claude + Codex both have remote sessions now
+https://code.claude.com/docs/en/remote-control
+https://openai.com/index/work-with-codex-from-anywhere/
+
 # Discord → Claude Code / Codex CLI → Git Bridge
 
 Self-hosted Discord bot: send coding tasks from your phone, run them through
