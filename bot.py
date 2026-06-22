@@ -42,6 +42,8 @@ PROTECTED_BRANCHES_ENV = os.getenv("PROTECTED_BRANCHES", "")
 MAX_DIFF_CHARS = 1800
 REVIEW_MESSAGE_LIMIT = 1900
 REVIEW_CODE_CHUNK_LIMIT = 600
+PULL_SUMMARY_COMMIT_LIMIT = 5
+PULL_SUMMARY_FILE_LIMIT = 30
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
@@ -141,9 +143,13 @@ def slugify(text: str, max_len: int = 40) -> str:
     return (slug.strip("-")[:max_len].rstrip("-")) or "task"
 
 
-def run_git(cmd: list[str], path: str | None = None) -> subprocess.CompletedProcess:
+def run_git(
+    cmd: list[str],
+    path: str | None = None,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
-        cmd, cwd=path or REPO_PATH, capture_output=True, text=True, timeout=60,
+        cmd, cwd=path or REPO_PATH, capture_output=True, text=True, timeout=timeout,
     )
 
 
@@ -2781,6 +2787,106 @@ def get_diff_stat(path: str | None = None) -> str:
     return ", ".join(lines) or "no changes"
 
 
+def _rev_parse_head(path: str | None = None) -> str | None:
+    result = run_git(["git", "rev-parse", "--verify", "HEAD"], path)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _inline_code_text(text: str, limit: int = 120) -> str:
+    clean = _collapse_whitespace(_sanitize_discord_text(text).replace("`", "'"))
+    if len(clean) > limit:
+        clean = clean[: max(0, limit - 3)].rstrip() + "..."
+    return f"`{clean or '(unknown)'}`"
+
+
+def _format_pull_status_line(raw_line: str) -> str | None:
+    parts = raw_line.split("\t")
+    if len(parts) < 2:
+        return None
+
+    status = parts[0].strip()
+    code = status[:1]
+    labels = {
+        "A": "added",
+        "C": "copied",
+        "D": "deleted",
+        "M": "modified",
+        "R": "renamed",
+        "T": "type changed",
+        "U": "unmerged",
+        "X": "unknown",
+        "B": "pairing broken",
+    }
+    label = labels.get(code, status.lower() or "changed")
+
+    paths = [part.strip() for part in parts[1:] if part.strip()]
+    if code in {"R", "C"} and len(paths) >= 2:
+        return f"- {label} {_inline_code_text(paths[0])} -> {_inline_code_text(paths[1])}"
+    if paths:
+        return f"- {label} {_inline_code_text(paths[-1])}"
+    return None
+
+
+def build_pull_change_summary_lines(
+    before_rev: str | None,
+    after_rev: str | None,
+    path: str | None = None,
+) -> list[str]:
+    if not before_rev or not after_rev or before_rev == after_rev:
+        return []
+
+    lines: list[str] = []
+    count_result = run_git(["git", "rev-list", "--count", f"{before_rev}..{after_rev}"], path)
+    commit_count: int | None = None
+    if count_result.returncode == 0:
+        try:
+            commit_count = int(count_result.stdout.strip() or "0")
+        except ValueError:
+            commit_count = None
+
+    shortstat = run_git(["git", "diff", "--shortstat", before_rev, after_rev], path).stdout.strip()
+    headline_bits: list[str] = []
+    if commit_count is not None:
+        headline_bits.append(f"{commit_count} commit(s)")
+    if shortstat:
+        headline_bits.append(shortstat)
+    lines.append(f"Summary: {', '.join(headline_bits) if headline_bits else 'working tree updated'}")
+
+    log_limit = PULL_SUMMARY_COMMIT_LIMIT + 1
+    log_result = run_git(
+        ["git", "log", "--format=%h %s", f"--max-count={log_limit}", f"{before_rev}..{after_rev}"],
+        path,
+    )
+    commits = [line.strip() for line in log_result.stdout.splitlines() if line.strip()]
+    if commits:
+        lines.extend(["", "Commits:"])
+        for line in commits[:PULL_SUMMARY_COMMIT_LIMIT]:
+            lines.append(f"- {_inline_code_text(line, 160)}")
+        remaining = max(0, (commit_count or len(commits)) - PULL_SUMMARY_COMMIT_LIMIT)
+        if remaining:
+            lines.append(f"- ... and {remaining} more commit(s).")
+
+    status_result = run_git(
+        ["git", "diff", "--name-status", "--find-renames", before_rev, after_rev],
+        path,
+    )
+    files = [
+        formatted
+        for formatted in (_format_pull_status_line(line) for line in status_result.stdout.splitlines())
+        if formatted
+    ]
+    if files:
+        lines.extend(["", "Files:"])
+        lines.extend(files[:PULL_SUMMARY_FILE_LIMIT])
+        remaining = len(files) - PULL_SUMMARY_FILE_LIMIT
+        if remaining > 0:
+            lines.append(f"- ... and {remaining} more file(s).")
+
+    return lines
+
+
 def get_ahead_count(path: str | None = None) -> int:
     """How many commits HEAD is ahead of the base branch."""
     base = _base_branch(path)
@@ -4111,7 +4217,7 @@ HELP_TEXT_2 = """**Branches:**
 `status` — current branch and working tree
 `usage` — engine/session token usage + remaining limits (best effort)
 `branches` — list branches (use `N` references)
-`pull [branch|N]` — pull latest changes
+`pull [branch|N]` — pull latest changes with commit/file summary
 `doctor` — run CLI/repo diagnostics
 `help` — refresh pinned command reference
 
@@ -5188,24 +5294,55 @@ async def on_message(message: discord.Message):
         if not branch:
             await ch.send("❌ No base branch found to pull.")
             return
+        before_rev = _rev_parse_head(cwd)
+        pull_timeout = max(60, ENGINE_TIMEOUT)
         await ch.send(f"⏳ Pulling `{branch}` from remote...")
-        fetch = run_git(["git", "fetch", "origin", branch], cwd)
+        try:
+            fetch = run_git(["git", "fetch", "origin", branch], cwd, timeout=pull_timeout)
+        except subprocess.TimeoutExpired:
+            await ch.send(f"❌ Fetch timed out after {pull_timeout}s. Try again when the remote is responsive.")
+            return
         if fetch.returncode != 0:
-            await ch.send(f"❌ Fetch failed:\n```\n{fetch.stderr.strip()}\n```")
+            error = truncate(
+                _sanitize_code_block_text(fetch.stderr.strip() or fetch.stdout.strip() or "unknown error"),
+                1600,
+            )
+            await ch.send(f"❌ Fetch failed:\n```\n{error}\n```")
             return
-        pull = run_git(["git", "pull", "origin", branch], cwd)
+        try:
+            pull = run_git(["git", "pull", "origin", branch], cwd, timeout=pull_timeout)
+        except subprocess.TimeoutExpired:
+            await ch.send(f"❌ Pull timed out after {pull_timeout}s. Try again or pull locally if it is still running.")
+            return
         if pull.returncode != 0:
-            await ch.send(f"❌ Pull failed:\n```\n{pull.stderr.strip()}\n```")
+            error = truncate(
+                _sanitize_code_block_text(pull.stderr.strip() or pull.stdout.strip() or "unknown error"),
+                1600,
+            )
+            await ch.send(f"❌ Pull failed:\n```\n{error}\n```")
             return
+        after_rev = _rev_parse_head(cwd)
         detail = (pull.stdout.strip() or pull.stderr.strip()).strip()
-        already = "already up to date" in detail.lower()
+        already = (
+            bool(before_rev and after_rev and before_rev == after_rev)
+            or "already up to date" in detail.lower()
+        )
         header = (
             f"✅ `{branch}` already up to date — nothing to pull."
             if already
             else f"✅ Pulled `{branch}` from remote."
         )
-        if detail and not already:
-            await ch.send(f"{header}\n```\n{detail}\n```")
+        if already:
+            await ch.send(header)
+            return
+
+        lines = build_pull_change_summary_lines(before_rev, after_rev, cwd)
+        if lines:
+            await ch.send(header)
+            await send_change_summary(ch, f"Pulled changes from `{branch}`", lines)
+        elif detail:
+            body = truncate(_sanitize_code_block_text(detail), 1600)
+            await ch.send(f"{header}\n```\n{body}\n```")
         else:
             await ch.send(header)
         return

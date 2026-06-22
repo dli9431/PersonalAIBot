@@ -161,7 +161,7 @@ Repo and branch flow:
 - `branch switch <branch|N>`
 - `branch delete|del <name|N> [local|remote|both] [force]`
 - `branch protect [list|add|remove|clear|reset]`
-- `pull [branch|N]`
+- `pull [branch|N]` (reports a bounded commit/file summary)
 - `merge <target>`
 - `merge src>tgt`
 - `merge src into tgt`

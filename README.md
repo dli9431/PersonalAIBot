@@ -244,7 +244,7 @@ pr main               → open a GitHub PR targeting main
 | `merge src>tgt` | Explicit source and target |
 | `merge src into tgt` | Same as above |
 | `pr <target>` | Open a GitHub pull request |
-| `pull [branch\|N]` | Pull latest from remote (supports numbered branch refs from `branches`; defaults to resolved base: dev/main if present, else origin/HEAD or a fallback branch) |
+| `pull [branch\|N]` | Pull latest from remote and report a bounded commit/file summary (supports numbered branch refs from `branches`; defaults to resolved base: dev/main if present, else origin/HEAD or a fallback branch) |
 
 ### Branches
 
