@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-This repo is a self-hosted Discord bot that delegates coding tasks to Claude Code or OpenAI Codex CLI, streams results back into Discord, and manages the surrounding git workflow.
+This repo is a self-hosted Discord bot that delegates coding tasks to Claude Code, OpenAI Codex CLI, or Kimi Code CLI, streams results back into Discord, and manages the surrounding git workflow.
 
 Current shape of the project:
 
@@ -36,6 +36,7 @@ Required external tools:
 
 - `claude`
 - `codex`
+- `kimi`
 - `gh` for PR creation
 
 The project is intended for Linux or WSL2. Codex sandbox settings come from `~/.codex/config.toml`; see `codex-config-example.toml`.
@@ -55,6 +56,7 @@ Important optional values:
 - Context persistence: `CONTEXT_MAX_CHARS`, `PLAN_CONTEXT_MAX_CHARS`
 - Claude settings: `CLAUDE_MODEL`, `CLAUDE_REASONING_EFFORT`, `CLAUDE_ALLOWED_TOOLS`, `CLAUDE_DENIED_TOOLS`
 - Codex settings: `CODEX_MODEL`, `CODEX_REASONING_EFFORT`
+- Kimi settings: `KIMI_MODEL`, `KIMI_REASONING_EFFORT`
 - Multi-repo support: `GIT_PROJECTS`
 - State file override: `BOT_STATE_FILE`
 
@@ -66,10 +68,11 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 
 1. Configuration and process/session state.
 2. Helpers for git, branch resolution, state persistence, runtime config, usage tracking, plan context, resume context, review formatting, and image downloads.
-3. Model discovery and login helpers for Claude and Codex.
+3. Model discovery and login helpers for Claude, Codex, and Kimi.
 4. Engine runners:
    - `run_claude_code()`
    - `run_codex()`
+   - `run_kimi()`
    - `run_engine()`
 5. Git workflow helpers:
    - `create_branch()`
@@ -89,7 +92,7 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 - Each Discord channel gets its own git worktree under `<repo>/.worktrees/ch-<channel_id>`.
 - Feature branches are created as `{BRANCH_PREFIX}/{engine}/{slug}-{timestamp}`.
 - Active sessions are tracked in `active_sessions`; running processes and cancellation state are tracked separately.
-- Follow-up prompts continue the prior engine session using Claude resume or Codex resume.
+- Follow-up prompts continue the prior engine session using Claude resume, Kimi `-c` continue, or Codex resume.
 - If a run times out, the bot saves resume context and automatically retries up to `MAX_AUTO_CONTINUES = 3`.
 - If those retries are exhausted, the bot also persists an unfinished-session snapshot so `resume` can reopen the saved branch/worktree and restore the session state.
 - While a run is still active, `add:` and `queue:` save follow-up work for automatic resume after the current turn.
@@ -123,6 +126,7 @@ Task execution:
 - Plain text uses the channel default engine
 - `claude: <task>`, `cc: <task>`, `claude code: <task>`
 - `codex: <task>`, `cx: <task>`, `openai: <task>`
+- `kimi: <task>`, `km: <task>`
 
 Planning and recovery:
 
@@ -173,10 +177,13 @@ Runtime configuration and diagnostics:
 - `engine global`
 - `claude models`
 - `codex models`
+- `kimi models`
 - `claude model <n|name>`
 - `codex model <n|name>`
+- `kimi model <n|name>`
 - `claude reasoning [n|level]`
 - `codex reasoning [n|level]`
+- `kimi reasoning [n|level]`
 - `reasoning [n|level]`
 - `model <n|name>`
 - `usage`
@@ -184,7 +191,7 @@ Runtime configuration and diagnostics:
 - `doctor`
 - `help`
 - `restart`
-- `claude login`, `codex login`, `openai login`, `login both`
+- `claude login`, `codex login`, `openai login`, `kimi login`, `login both`
 
 ## Editing Notes
 

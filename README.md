@@ -2,16 +2,16 @@ Claude + Codex both have remote sessions now
 https://code.claude.com/docs/en/remote-control
 https://openai.com/index/work-with-codex-from-anywhere/
 
-# Discord → Claude Code / Codex CLI → Git Bridge
+# Discord → Claude Code / Codex CLI / Kimi Code CLI → Git Bridge
 
 Self-hosted Discord bot: send coding tasks from your phone, run them through
-Claude Code or Codex CLI on your local machine (Linux, or WSL on Windows),
+Claude Code, Codex CLI, or Kimi Code CLI on your local machine (Linux, or WSL on Windows),
 review major changes, push, and merge — all from Discord.
 
 > **Note:** This project replicates one specific workflow from GitHub Copilot —
 > the agent chat mode where you describe a task and it makes code changes for you.
 > It does **not** replace Copilot entirely, and it still requires an active
-> [Anthropic](https://anthropic.com) or [OpenAI](https://openai.com) subscription
+> [Anthropic](https://anthropic.com), [OpenAI](https://openai.com), or Kimi subscription
 > to use the underlying CLIs. This is a personal side project built for fun.
 > GitHub, please don't sue me.
 
@@ -29,9 +29,10 @@ curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | bash
 source ~/.bashrc && nvm install 22
 
 # AI CLIs
-npm install -g @anthropic-ai/claude-code @openai/codex
+npm install -g @anthropic-ai/claude-code @openai/codex @moonshot-ai/kimi-code
 claude        # authenticate (browser), then Ctrl+C
 codex         # authenticate (browser), then /exit
+kimi          # authenticate (/login → browser), then /exit
 
 # GitHub CLI (for PR creation)
 sudo apt update && sudo apt install gh
@@ -86,7 +87,7 @@ DEV_BRANCH=dev
 PROTECTED_BRANCHES=main,dev
 
 # Engine defaults
-DEFAULT_ENGINE=claude    # or codex
+DEFAULT_ENGINE=claude    # or codex, kimi
 ENGINE_TIMEOUT=300
 CONTEXT_MAX_CHARS=4000   # max chars saved for timeout resume context
 PLAN_CONTEXT_MAX_CHARS=12000  # max chars saved for plan + plan do/plan: do context
@@ -102,6 +103,11 @@ CLAUDE_DENIED_TOOLS=Bash(rm\ *) Bash(sudo\ *) Bash(curl\ *) Bash(wget\ *) WebFet
 CODEX_MODEL=gpt-5.5
 # Optional: minimal | low | medium | high | xhigh (unset = CLI default)
 CODEX_REASONING_EFFORT=
+
+# Kimi Code CLI settings
+KIMI_MODEL=kimi-code/k3
+# Optional: low | medium | high | xhigh | max (unset = CLI default)
+KIMI_REASONING_EFFORT=
 ```
 
 > **Note:** Use absolute paths (e.g. `/home/you/code`) not `~/code` in `.env`.
@@ -134,6 +140,8 @@ codex: refactor the database queries
 cc: fix the CSS on the navbar
 cx: add error handling to the API routes
 openai: add a loading spinner to the form
+kimi: add dark mode to the settings page
+km: rename the checkout button
 ```
 
 The bot creates a feature branch, runs the engine, and streams its output.
@@ -153,7 +161,7 @@ Use `plan show` to inspect saved plan context and `plan clear` to remove it manu
 
 ### Iterate
 
-Send follow-up messages freely — the engine keeps session context (`claude --continue`, explicit Codex thread resume).
+Send follow-up messages freely — the engine keeps session context (`claude --continue`, `kimi -c`, explicit Codex thread resume).
 If a run times out, the bot saves a short resume-context snapshot and injects it on the next engine resume.
 If the run still times out after all automatic retries, the bot also saves an unfinished session snapshot you can reopen with `resume` later (`resume show` to inspect it).
 Clear either snapshot with `context clear` if needed.
@@ -205,6 +213,7 @@ pr main               → open a GitHub PR targeting main
 | `<task>` | Run with this channel's default engine |
 | `claude: <task>` / `cc: <task>` / `claude code: <task>` | Run with Claude Code |
 | `codex: <task>` / `cx: <task>` / `openai: <task>` | Run with Codex CLI |
+| `kimi: <task>` / `km: <task>` | Run with Kimi Code CLI |
 | `plan: <task>` | Planning mode with this channel's default engine/model; saves plan context |
 | `plan: do [extra instructions]` / `plan do [extra instructions]` | Execute saved plan context with this channel's default engine/model, then clear it |
 
@@ -285,22 +294,29 @@ pr main               → open a GitHub PR targeting main
 |---------|-------------|
 | `engine` | Show this channel's engine/model/reasoning config (plus global defaults) and available models |
 | `engine global` | Show global default engine/model/reasoning config |
-| `engine claude` / `engine codex` | Set this channel's default engine only (keeps this channel's current model for that engine) |
-| `engine global claude` / `engine global codex` | Set global default engine only |
+| `engine claude` / `engine codex` / `engine kimi` | Set this channel's default engine only (keeps this channel's current model for that engine) |
+| `engine global claude` / `engine global codex` / `engine global kimi` | Set global default engine only |
 | `claude models` / `cc models` | List available Claude models (numbered) |
 | `codex models` / `cx models` | List available Codex models (numbered) |
+| `kimi models` / `km models` | List available Kimi models (numbered) |
 | `claude model <n\|name>` | Set this channel's Claude model by number or name (e.g. `1`, `opus`, `sonnet`) |
 | `codex model <n\|name>` | Set this channel's Codex model by number or name |
+| `kimi model <n\|name>` | Set this channel's Kimi model by number or name |
 | `engine claude model <n\|name> [reasoning <n\|level>]` | Set this channel default engine to Claude, choose model by number or name, and optionally set reasoning in the same command |
 | `engine codex model <n\|name> [reasoning <n\|level>]` | Set this channel default engine to Codex, choose model by number or name, and optionally set reasoning in the same command |
+| `engine kimi model <n\|name> [reasoning <n\|level>]` | Set this channel default engine to Kimi, choose model by number or name, and optionally set reasoning in the same command |
 | `engine global claude model <n\|name> [reasoning <n\|level>]` | Set global default engine to Claude, choose model by number or name, and optionally set reasoning in the same command |
 | `engine global codex model <n\|name> [reasoning <n\|level>]` | Set global default engine to Codex, choose model by number or name, and optionally set reasoning in the same command |
+| `engine global kimi model <n\|name> [reasoning <n\|level>]` | Set global default engine to Kimi, choose model by number or name, and optionally set reasoning in the same command |
 | `claude reasoning [n\|level]` | View/set this channel's Claude reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=default`) |
 | `codex reasoning [n\|level]` / `cx reasoning ...` / `openai reasoning ...` | View/set this channel's Codex reasoning by number or name (`1=minimal`, `2=low`, `3=medium`, `4=high`, `5=xhigh`, `6=default`) |
+| `kimi reasoning [n\|level]` / `km reasoning ...` | View/set this channel's Kimi reasoning by number or name (`1=low`, `2=medium`, `3=high`, `4=xhigh`, `5=max`, `6=default`) |
 | `engine claude reasoning <n\|level>` | Set this channel default engine to Claude and set reasoning effort |
 | `engine codex reasoning <n\|level>` | Set this channel default engine to Codex and set reasoning effort |
+| `engine kimi reasoning <n\|level>` | Set this channel default engine to Kimi and set reasoning effort |
 | `engine global claude reasoning <n\|level>` | Set global default engine to Claude and set reasoning effort |
 | `engine global codex reasoning <n\|level>` | Set global default engine to Codex and set reasoning effort |
+| `engine global kimi reasoning <n\|level>` | Set global default engine to Kimi and set reasoning effort |
 | `model <n\|name>` | Set model for this channel's default engine by number or name |
 | `default model <n\|name>` | Alias for `model <n\|name>` |
 | `reasoning [n\|level]` | View/set reasoning effort for this channel's default engine |
@@ -318,6 +334,7 @@ Global defaults and channel-scoped engine/model/reasoning selections are persist
 |---------|-------------|
 | `claude login` / `cc login` | Re-authenticate Claude Code |
 | `codex login` / `cx login` / `openai login` | Re-authenticate Codex CLI |
+| `kimi login` / `km login` | Re-authenticate Kimi Code CLI |
 | `login both` | Re-authenticate both |
 | `restart` | Restart the bot process |
 

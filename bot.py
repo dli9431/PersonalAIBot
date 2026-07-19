@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Discord → Claude Code / Codex CLI → Git bridge bot.
+Discord → Claude Code / Codex CLI / Kimi Code CLI → Git bridge bot.
 
 Supports iterative sessions: send a task, review changes, send follow-ups,
-and only commit when you're satisfied. Uses --resume (Claude Code) and
-explicit Codex thread resumes for multi-turn context.
+and only commit when you're satisfied. Uses --resume (Claude Code), -c
+(Kimi Code), and explicit Codex thread resumes for multi-turn context.
 
 Designed to run on Linux (including WSL2).
 
@@ -61,10 +61,16 @@ CLAUDE_DENIED_TOOLS = os.getenv("CLAUDE_DENIED_TOOLS",
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.5")
 CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower() or None
 
+# Kimi Code CLI
+KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-code/k3")
+KIMI_REASONING_EFFORT = os.getenv("KIMI_REASONING_EFFORT", "").strip().lower() or None
+
 CLAUDE_REASONING_LEVELS = ("low", "medium", "high")
 CODEX_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
+KIMI_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_REASONING_OPTIONS = (*CLAUDE_REASONING_LEVELS, "default")
 CODEX_REASONING_OPTIONS = (*CODEX_REASONING_LEVELS, "default")
+KIMI_REASONING_OPTIONS = (*KIMI_REASONING_LEVELS, "default")
 
 ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
@@ -435,8 +441,22 @@ def _set_protected_branches(branches: list[str], save: bool = True) -> None:
 
 
 def _normalize_engine_name(engine: object | None) -> str:
-    if isinstance(engine, str) and engine.strip().lower() == "codex":
+    if isinstance(engine, str):
+        normalized = engine.strip().lower()
+        if normalized == "codex":
+            return "codex"
+        if normalized == "kimi":
+            return "kimi"
+    return "claude"
+
+
+def _engine_name_from_token(token: str) -> str:
+    """Map a command token (cc/cx/openai/km/...) to a canonical engine name."""
+    normalized = token.strip().lower()
+    if normalized in ("codex", "cx", "openai"):
         return "codex"
+    if normalized in ("kimi", "km"):
+        return "kimi"
     return "claude"
 
 
@@ -455,8 +475,10 @@ def _global_runtime_config() -> dict[str, str | None]:
         "default_engine": _normalize_engine_name(DEFAULT_ENGINE),
         "claude_model": CLAUDE_MODEL,
         "codex_model": CODEX_MODEL,
+        "kimi_model": KIMI_MODEL,
         "claude_reasoning_effort": CLAUDE_REASONING_EFFORT,
         "codex_reasoning_effort": CODEX_REASONING_EFFORT,
+        "kimi_reasoning_effort": KIMI_REASONING_EFFORT,
     }
 
 
@@ -479,6 +501,10 @@ def _coerce_runtime_config(
         config.get("codex_model"),
         str(base.get("codex_model") or CODEX_MODEL),
     )
+    base["kimi_model"] = _normalize_model_name(
+        config.get("kimi_model"),
+        str(base.get("kimi_model") or KIMI_MODEL),
+    )
 
     if "claude_reasoning_effort" in config:
         base["claude_reasoning_effort"] = _normalize_reasoning_effort(
@@ -488,16 +514,23 @@ def _coerce_runtime_config(
         base["codex_reasoning_effort"] = _normalize_reasoning_effort(
             config.get("codex_reasoning_effort")
         )
+    if "kimi_reasoning_effort" in config:
+        base["kimi_reasoning_effort"] = _normalize_reasoning_effort(
+            config.get("kimi_reasoning_effort")
+        )
     return base
 
 
 def _apply_global_runtime_config(config: dict[str, str | None]) -> None:
-    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, KIMI_MODEL
+    global CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT, KIMI_REASONING_EFFORT
     DEFAULT_ENGINE = _normalize_engine_name(config.get("default_engine"))
     CLAUDE_MODEL = _normalize_model_name(config.get("claude_model"), CLAUDE_MODEL)
     CODEX_MODEL = _normalize_model_name(config.get("codex_model"), CODEX_MODEL)
+    KIMI_MODEL = _normalize_model_name(config.get("kimi_model"), KIMI_MODEL)
     CLAUDE_REASONING_EFFORT = _normalize_reasoning_effort(config.get("claude_reasoning_effort"))
     CODEX_REASONING_EFFORT = _normalize_reasoning_effort(config.get("codex_reasoning_effort"))
+    KIMI_REASONING_EFFORT = _normalize_reasoning_effort(config.get("kimi_reasoning_effort"))
 
 
 def get_runtime_config(ch_id: int | None = None) -> dict[str, str | None]:
@@ -1240,6 +1273,33 @@ def check_codex_cli() -> tuple[bool, str]:
         return False, "not installed — run: npm install -g @openai/codex"
 
 
+def check_kimi_cli() -> tuple[bool, str]:
+    """Check if kimi CLI is installed and has auth configured. Returns (ok, status)."""
+    try:
+        r = subprocess.run(["kimi", "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False, "not installed"
+        version = (r.stdout or r.stderr).strip().splitlines()[0]
+        home = pathlib.Path(os.environ.get("KIMI_CODE_HOME") or (pathlib.Path.home() / ".kimi-code"))
+        try:
+            oauth_dir = home / "oauth"
+            if oauth_dir.is_dir() and any(oauth_dir.iterdir()):
+                return True, f"{version} (OAuth)"
+            with open(home / "config.toml", "rb") as f:
+                config = tomllib.load(f)
+            providers = config.get("providers", {})
+            if any(
+                isinstance(p, dict) and str(p.get("api_key") or "").strip()
+                for p in providers.values()
+            ):
+                return True, f"{version} (API key)"
+        except Exception:
+            pass
+        return True, f"{version} (⚠️  no auth — run `kimi login`)"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, "not installed — install Kimi Code CLI"
+
+
 def _format_reset_at(ts: object) -> str | None:
     try:
         value = float(ts)
@@ -1529,6 +1589,9 @@ def parse_engine_and_task(content: str, default_engine: str) -> tuple[str, str]:
     for prefix in ("codex:", "cx:", "openai:"):
         if lower.startswith(prefix):
             return "codex", content[len(prefix):].strip()
+    for prefix in ("kimi:", "km:"):
+        if lower.startswith(prefix):
+            return "kimi", content[len(prefix):].strip()
     return _normalize_engine_name(default_engine), content
 
 
@@ -1542,7 +1605,9 @@ def get_model_for_engine(
     ch_id: int | None = None,
 ) -> str:
     config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
-    return str(config["codex_model"] if _normalize_engine_name(engine) == "codex" else config["claude_model"])
+    engine_name = _normalize_engine_name(engine)
+    key = {"codex": "codex_model", "kimi": "kimi_model"}.get(engine_name, "claude_model")
+    return str(config[key])
 
 
 def get_reasoning_for_engine(
@@ -1551,7 +1616,10 @@ def get_reasoning_for_engine(
     ch_id: int | None = None,
 ) -> str | None:
     config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
-    key = "codex_reasoning_effort" if _normalize_engine_name(engine) == "codex" else "claude_reasoning_effort"
+    engine_name = _normalize_engine_name(engine)
+    key = {"codex": "codex_reasoning_effort", "kimi": "kimi_reasoning_effort"}.get(
+        engine_name, "claude_reasoning_effort"
+    )
     value = config.get(key)
     return value if isinstance(value, str) and value else None
 
@@ -1561,7 +1629,11 @@ def get_session_runtime_config(session: dict, ch_id: int) -> dict[str, str | Non
 
 
 def get_engine_label(engine: str) -> str:
-    return "Codex CLI" if engine == "codex" else "Claude Code"
+    if engine == "codex":
+        return "Codex CLI"
+    if engine == "kimi":
+        return "Kimi Code"
+    return "Claude Code"
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -2919,6 +2991,24 @@ def get_codex_models() -> list[tuple[str, int | None]]:
         ]
 
 
+def get_kimi_models() -> list[tuple[str, str | None]]:
+    """Return available Kimi models as (alias, display_name) tuples from the CLI config."""
+    home = pathlib.Path(os.environ.get("KIMI_CODE_HOME") or (pathlib.Path.home() / ".kimi-code"))
+    try:
+        with open(home / "config.toml", "rb") as f:
+            data = tomllib.load(f)
+        return [
+            (alias, cfg.get("display_name") if isinstance(cfg, dict) else None)
+            for alias, cfg in data.get("models", {}).items()
+        ]
+    except Exception:
+        return [
+            ("kimi-code/k3", None),
+            ("kimi-code/kimi-for-coding", None),
+            ("kimi-code/kimi-for-coding-highspeed", None),
+        ]
+
+
 async def get_claude_models() -> list[tuple[str, str]]:
     """Return available Claude models as (id, display_name) tuples from the Anthropic API."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -3003,11 +3093,16 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
     if not token:
         return None, "Provide a reasoning level (name or number)."
 
-    options = CLAUDE_REASONING_OPTIONS if engine == "claude" else CODEX_REASONING_OPTIONS
+    if engine == "claude":
+        options = CLAUDE_REASONING_OPTIONS
+    elif engine == "kimi":
+        options = KIMI_REASONING_OPTIONS
+    else:
+        options = CODEX_REASONING_OPTIONS
+    label = {"claude": "Claude", "kimi": "Kimi"}.get(engine, "Codex")
     if token.isdigit():
         index = int(token)
         if index < 1 or index > len(options):
-            label = "Claude" if engine == "claude" else "Codex"
             return None, f"{label} reasoning number must be between 1 and {len(options)}."
         token = options[index - 1]
 
@@ -3020,6 +3115,12 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
         if token not in CLAUDE_REASONING_LEVELS:
             choices = "`, `".join(CLAUDE_REASONING_OPTIONS)
             return None, f"Claude reasoning must be a number `1-{len(CLAUDE_REASONING_OPTIONS)}` or one of `{choices}`."
+        return token, None
+
+    if engine == "kimi":
+        if token not in KIMI_REASONING_LEVELS:
+            choices = "`, `".join(KIMI_REASONING_OPTIONS)
+            return None, f"Kimi reasoning must be a number `1-{len(KIMI_REASONING_OPTIONS)}` or one of `{choices}`."
         return token, None
 
     aliases = {
@@ -3041,7 +3142,12 @@ def format_reasoning_effort(effort: str | None) -> str:
 
 
 def format_reasoning_options_numbered(engine: str) -> str:
-    options = CLAUDE_REASONING_OPTIONS if engine == "claude" else CODEX_REASONING_OPTIONS
+    if engine == "claude":
+        options = CLAUDE_REASONING_OPTIONS
+    elif engine == "kimi":
+        options = KIMI_REASONING_OPTIONS
+    else:
+        options = CODEX_REASONING_OPTIONS
     return "\n".join(f"{idx}. `{level}`" for idx, level in enumerate(options, start=1))
 
 
@@ -3130,6 +3236,48 @@ async def login_claude(ch: discord.TextChannel) -> None:
     else:
         combined = "\n".join(output_lines[-5:]) if output_lines else "(no output)"
         await ch.send(f"❌ Claude login failed (exit {proc.returncode}):\n```\n{combined}\n```")
+
+
+async def login_kimi(ch: discord.TextChannel) -> None:
+    """Run `kimi login`, relay the device-auth URL+code to Discord, wait for completion."""
+    await ch.send("🔑 Starting Kimi Code login...")
+
+    proc = await asyncio.create_subprocess_exec(
+        "kimi", "login",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    output_lines = []
+
+    async def read_stream(stream):
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = strip_ansi(line.decode()).strip()
+            if not text:
+                continue
+            output_lines.append(text)
+            await ch.send(f"```\n{text}\n```")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(read_stream(proc.stdout), read_stream(proc.stderr)),
+            timeout=120,
+        )
+        await proc.wait()
+    except asyncio.TimeoutError:
+        proc.kill()
+        await ch.send("⏰ Login timed out (120s). Try again.")
+        return
+
+    if proc.returncode == 0:
+        await ch.send("✅ Kimi Code login successful!")
+    else:
+        combined = "\n".join(output_lines[-5:]) if output_lines else "(no output)"
+        await ch.send(f"❌ Kimi login failed (exit {proc.returncode}):\n```\n{combined}\n```")
 
 
 # ── Engine runners ────────────────────────────────────────────────────────────
@@ -3569,6 +3717,161 @@ async def _run_codex_streaming(
     return output
 
 
+def _kimi_usage_totals(session_id: str, start_ms: int) -> dict[str, int]:
+    """Sum Kimi wire.jsonl usage.record events at/after start_ms. Zeros on any failure."""
+    totals = {"input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0}
+    if not session_id:
+        return totals
+    home = pathlib.Path(os.environ.get("KIMI_CODE_HOME") or (pathlib.Path.home() / ".kimi-code"))
+    try:
+        wires = list(home.glob(f"sessions/*/{session_id}/agents/main/wire.jsonl"))
+        for wire in wires:
+            with open(wire, "rb") as f:
+                for raw in f:
+                    try:
+                        event = json.loads(raw)
+                        if event.get("type") != "usage.record":
+                            continue
+                        if int(event.get("time") or 0) < start_ms:
+                            continue
+                        usage = event.get("usage") or {}
+                        totals["input_tokens"] += int(usage.get("inputOther") or 0)
+                        totals["output_tokens"] += int(usage.get("output") or 0)
+                        totals["cache_read"] += int(usage.get("inputCacheRead") or 0)
+                        totals["cache_write"] += int(usage.get("inputCacheCreation") or 0)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return totals
+
+
+async def _run_kimi_streaming(
+    cmd: list[str],
+    ch: discord.TextChannel,
+    label: str,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run Kimi Code with stream-json output, live-updating Discord as events arrive."""
+    status_msg = await ch.send(f"⚙️ {label} started...")
+
+    start_ms = int(time.time() * 1000)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd or REPO_PATH,
+        env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=10 * 1024 * 1024,  # 10MB – prevents "chunk longer than limit" on large JSON lines
+    )
+    running_procs[ch.id] = proc
+
+    accumulated_text: list[str] = []
+    tool_activity: list[str] = []
+    final_result: str | None = None
+    stderr_chunks: list[bytes] = []
+    kimi_session_id = ""
+    usage_accumulated = False
+    start = time.time()
+    last_edit_time = 0.0
+    last_content = ""
+
+    def snapshot_usage() -> None:
+        nonlocal usage_accumulated
+        totals = _kimi_usage_totals(kimi_session_id, start_ms)
+        channel_last_usage[ch.id] = {"engine": "kimi", **totals}
+        if not usage_accumulated:
+            _accumulate_global_usage("kimi", totals)
+            usage_accumulated = True
+
+    async def read_stderr() -> None:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+
+    async def stream_stdout() -> None:
+        nonlocal final_result, kimi_session_id, last_edit_time, last_content
+        async for raw_line in proc.stdout:
+            line_str = raw_line.decode(errors="replace").strip()
+            if not line_str:
+                continue
+            try:
+                event = json.loads(line_str)
+            except json.JSONDecodeError:
+                accumulated_text.append(line_str + "\n")
+                continue
+
+            role = event.get("role")
+            if role == "assistant":
+                content = event.get("content")
+                if isinstance(content, str) and content.strip():
+                    accumulated_text.append(content if content.endswith("\n") else content + "\n")
+                    final_result = content
+                for tool_call in event.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function")
+                    if isinstance(function, dict):
+                        name = str(function.get("name") or "").strip()
+                        if name:
+                            tool_activity.append(name)
+            elif role == "meta":
+                session_id = event.get("session_id")
+                if isinstance(session_id, str) and session_id.strip():
+                    kimi_session_id = session_id.strip()
+
+            now = time.time()
+            if now - last_edit_time >= STATUS_REFRESH:
+                elapsed = int(now - start)
+                display = "".join(accumulated_text)
+                tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
+                tail = strip_ansi(tool_line + display).strip()
+                if len(tail) > 1400:
+                    tail = tail[-1400:]
+                new_content = f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(starting...)'}\n```"
+                if new_content != last_content:
+                    try:
+                        await status_msg.edit(content=new_content)
+                        last_content = new_content
+                        last_edit_time = now
+                    except discord.HTTPException:
+                        pass
+
+    timed_out = False
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
+            timeout=ENGINE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        snapshot_usage()
+        partial = final_result or "".join(accumulated_text)
+        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
+    finally:
+        snapshot_usage()
+        running_procs.pop(ch.id, None)
+        elapsed = int(time.time() - start)
+        try:
+            if timed_out:
+                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+            else:
+                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+        except discord.HTTPException:
+            pass
+
+    stderr = b"".join(stderr_chunks).decode(errors="replace")
+    output = final_result or "".join(accumulated_text).strip() or "(no output)"
+    if proc.returncode != 0 and stderr:
+        tail_lines = stderr.strip().split("\n")[-5:]
+        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail_lines)
+    return output
+
 async def run_claude_code(
     task: str,
     ch: discord.TextChannel,
@@ -3656,6 +3959,42 @@ async def run_codex(
     return await _run_codex_streaming(cmd, ch, "Codex CLI", cwd=cwd)
 
 
+async def run_kimi(
+    task: str,
+    ch: discord.TextChannel,
+    resume: bool = False,
+    images: list[str] | None = None,
+    cwd: str | None = None,
+    runtime_config: dict[str, str | None] | None = None,
+) -> str:
+    """Run Kimi Code. If resume=True, uses -c to continue the last session in this cwd."""
+    model = get_model_for_engine("kimi", runtime_config=runtime_config, ch_id=ch.id)
+    reasoning_effort = get_reasoning_for_engine("kimi", runtime_config=runtime_config, ch_id=ch.id)
+    if images:
+        img_lines = "\n".join(f"- {p}" for p in images)
+        task = f"Examine the image(s) at the following path(s) using the Read tool:\n{img_lines}\n\n{task}"
+    # Kimi has no --append-system-prompt flag, so prepend the same implement-mandate
+    # that run_claude_code passes via --append-system-prompt.
+    task = (
+        "You MUST implement changes, not just read or analyze files. "
+        "Do not stop after reading context — use Edit/Write tools to "
+        "make the requested code changes. If the task asks you to add, "
+        "modify, or fix something, you must edit the relevant files.\n\n"
+        + task
+    )
+    cmd = ["kimi"]
+    if resume:
+        cmd.append("-c")
+    cmd.extend(["-p", task, "--output-format", "stream-json", "-m", model])
+
+    env = None
+    if reasoning_effort:
+        env = dict(os.environ)
+        env["KIMI_MODEL_THINKING_EFFORT"] = reasoning_effort
+
+    return await _run_kimi_streaming(cmd, ch, "Kimi Code", cwd=cwd, env=env)
+
+
 MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
 
 
@@ -3669,7 +4008,12 @@ async def run_engine(
     stop_event: asyncio.Event | None = None,
     runtime_config: dict[str, str | None] | None = None,
 ) -> str:
-    runner = run_codex if engine == "codex" else run_claude_code
+    if engine == "codex":
+        runner = run_codex
+    elif engine == "kimi":
+        runner = run_kimi
+    else:
+        runner = run_claude_code
     run_config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch.id))
     run_id = f"{ch.id}-{time.time_ns()}"
 
@@ -4156,7 +4500,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 # ── Discord handlers ─────────────────────────────────────────────────────────
 
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
-`<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:`
+`<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:` · `kimi: <task>` / `km:`
 `plan: <task>` — planning mode with default engine/model (saves/extends plan context)
 `plan: do [extra instructions]` / `plan do [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
@@ -4203,13 +4547,13 @@ HELP_TEXT_2 = """**Branches:**
 **Config (channel-scoped by default):**
 `engine` — show this channel config (+ global default)
 `engine global` — show global default config
-`claude models` · `codex models` — list available models (numbered)
-`claude model <n|name>` · `codex model <n|name>` — set model for this channel
-`engine claude|codex` · `engine claude model <n|name> [reasoning <n|level>]` · `engine codex model <n|name> [reasoning <n|level>]` — set this channel
-`engine global claude|codex` · `engine global claude|codex model <n|name> [reasoning <n|level>]` — set global default
-`claude reasoning [n|level]` · `codex reasoning [n|level]` — set reasoning for this channel
-`engine claude reasoning <n|level>` · `engine codex reasoning <n|level>` — set this channel
-`engine global claude|codex reasoning <n|level>` — set global default reasoning
+`claude models` · `codex models` · `kimi models` — list available models (numbered)
+`claude model <n|name>` · `codex model <n|name>` · `kimi model <n|name>` — set model for this channel
+`engine claude|codex|kimi` · `engine claude model <n|name> [reasoning <n|level>]` · `engine codex model <n|name> [reasoning <n|level>]` · `engine kimi model <n|name> [reasoning <n|level>]` — set this channel
+`engine global claude|codex|kimi` · `engine global claude|codex|kimi model <n|name> [reasoning <n|level>]` — set global default
+`claude reasoning [n|level]` · `codex reasoning [n|level]` · `kimi reasoning [n|level]` — set reasoning for this channel
+`engine claude reasoning <n|level>` · `engine codex reasoning <n|level>` · `engine kimi reasoning <n|level>` — set this channel
+`engine global claude|codex|kimi reasoning <n|level>` — set global default reasoning
 `reasoning|default reasoning [n|level]` — view/set this channel default-engine reasoning
 `model|default model <n|name>` — set model for this channel default engine
 
@@ -4221,7 +4565,7 @@ HELP_TEXT_2 = """**Branches:**
 `doctor` — run CLI/repo diagnostics
 `help` — refresh pinned command reference
 
-**Login:** `claude|cc login` · `codex|cx|openai login` · `login both`
+**Login:** `claude|cc login` · `codex|cx|openai login` · `kimi|km login` · `login both`
 **System:** `restart`"""
 
 HELP_PIN_TITLE_1 = "Help (1/2)"
@@ -4314,19 +4658,22 @@ async def on_ready():
     ssh_ok = check_github_ssh()
     claude_ok, claude_status = check_claude_cli()
     codex_ok, codex_status = check_codex_cli()
+    kimi_ok, kimi_status = check_kimi_cli()
     global_config = get_runtime_config(None)
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user  : {ALLOWED_USER_ID}")
     print(f"   Default engine: {global_config['default_engine']} (global)")
     print(
         f"   Claude: {global_config['claude_model']} · "
-        f"Codex: {global_config['codex_model']} (global)"
+        f"Codex: {global_config['codex_model']} · "
+        f"Kimi: {global_config['kimi_model']} (global)"
     )
     print(f"   Channel runtime overrides: {len(CHANNEL_RUNTIME_CONFIGS)}")
     print(f"   gh CLI        : {'yes' if has_gh_cli() else 'no'}")
     print(f"   GitHub SSH    : {'yes' if ssh_ok else '⚠️  FAILED'}")
     print(f"   Claude CLI    : {claude_status}")
     print(f"   Codex CLI     : {codex_status}")
+    print(f"   Kimi CLI      : {kimi_status}")
     codex_trusted = _load_codex_trusted_dirs()
     print(f"   Project dirs  :")
     for label, path in GIT_PROJECTS:
@@ -4351,6 +4698,8 @@ async def on_ready():
         print(f"\n⚠️  Claude CLI unavailable: {claude_status}")
     if not codex_ok:
         print(f"\n⚠️  Codex CLI unavailable: {codex_status}")
+    if not kimi_ok:
+        print(f"\n⚠️  Kimi CLI unavailable: {kimi_status}")
     claude_untrusted = [path for _, path in GIT_PROJECTS
                         if not _is_claude_trusted(path)]
     if claude_untrusted and claude_ok:
@@ -4814,11 +5163,12 @@ async def on_message(message: discord.Message):
         return
 
     # ── Login commands ────────────────────────────────────────────────────
-    # Accepts: "claude login", "cc login", "codex login", "cx login", "login both"
+    # Accepts: "claude login", "cc login", "codex login", "cx login", "kimi login", "km login", "login both"
     _is_claude_login = lower in ("claude login", "cc login")
     _is_codex_login  = lower in ("codex login", "cx login", "openai login")
+    _is_kimi_login   = lower in ("kimi login", "km login")
     _is_both_login   = lower == "login both"
-    if _is_claude_login or _is_codex_login or _is_both_login:
+    if _is_claude_login or _is_codex_login or _is_kimi_login or _is_both_login:
         if _login_lock.get(ch.id):
             await ch.send("⏳ A login is already in progress in this channel.")
             return
@@ -4828,6 +5178,8 @@ async def on_message(message: discord.Message):
                 await login_claude(ch)
             if _is_codex_login or _is_both_login:
                 await login_codex(ch)
+            if _is_kimi_login:
+                await login_kimi(ch)
         finally:
             _login_lock.pop(ch.id, None)
         return
@@ -4890,13 +5242,15 @@ async def on_message(message: discord.Message):
         ssh_ok = check_github_ssh()
         claude_ok, claude_status = check_claude_cli()
         codex_ok, codex_status = check_codex_cli()
+        kimi_ok, kimi_status = check_kimi_cli()
         codex_trusted = _load_codex_trusted_dirs()
 
         await ch.send(
             "🩺 **Diagnostics**\n"
             f"GitHub SSH: {'✅ OK' if ssh_ok else '⚠️ FAILED'}\n"
             f"Claude CLI: {'✅' if claude_ok else '⚠️'} {claude_status}\n"
-            f"Codex CLI: {'✅' if codex_ok else '⚠️'} {codex_status}"
+            f"Codex CLI: {'✅' if codex_ok else '⚠️'} {codex_status}\n"
+            f"Kimi CLI: {'✅' if kimi_ok else '⚠️'} {kimi_status}"
         )
 
         project_lines = []
@@ -4927,6 +5281,8 @@ async def on_message(message: discord.Message):
             fix_lines.append("Claude CLI unavailable: install/login Claude Code.")
         if not codex_ok:
             fix_lines.append("Codex CLI unavailable: install/login Codex CLI.")
+        if not kimi_ok:
+            fix_lines.append("Kimi CLI unavailable: install/login Kimi Code CLI.")
         if claude_ok:
             claude_untrusted = [path for _, path in GIT_PROJECTS if not _is_claude_trusted(path)]
             if claude_untrusted:
@@ -5624,7 +5980,7 @@ async def on_message(message: discord.Message):
         return
 
     engine_model_match = re.match(
-        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai)\s+model(?:\s+(.+))?$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km)\s+model(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
@@ -5633,13 +5989,15 @@ async def on_message(message: discord.Message):
         scope_ch_id = None if scope_token in ("global", "default") else ch.id
         engine_token = engine_model_match.group(2).lower()
         selector = (engine_model_match.group(3) or "").strip()
-        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        target_engine = _engine_name_from_token(engine_token)
         if not selector:
             await ch.send(
                 "Usage: `engine claude model <n|name> [reasoning <n|level>]`, "
                 "`engine codex model <n|name> [reasoning <n|level>]`, "
+                "`engine kimi model <n|name> [reasoning <n|level>]`, "
                 "`engine global claude model <n|name> [reasoning <n|level>]`, "
-                "or `engine global codex model <n|name> [reasoning <n|level>]`"
+                "`engine global codex model <n|name> [reasoning <n|level>]`, "
+                "or `engine global kimi model <n|name> [reasoning <n|level>]`"
             )
             return
         model_selector, reasoning_selector, err = split_model_reasoning_selector(selector)
@@ -5671,6 +6029,31 @@ async def on_message(message: discord.Message):
                 f"{details}"
             )
             return
+        if target_engine == "kimi":
+            models = get_kimi_models()
+            selected_model, err = resolve_model_selector(model_selector or "", models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            updates: dict[str, str | None] = {
+                "default_engine": "kimi",
+                "kimi_model": selected_model,
+            }
+            if reasoning_selector is not None:
+                selected_effort, err = resolve_reasoning_selector(reasoning_selector, "kimi")
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                updates["kimi_reasoning_effort"] = selected_effort
+            updated = update_runtime_config(scope_ch_id, **updates)
+            details = f"model `{updated['kimi_model']}`"
+            if reasoning_selector is not None:
+                details += f" · reasoning `{format_reasoning_effort(updated['kimi_reasoning_effort'])}`"
+            await ch.send(
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **kimi** — "
+                f"{details}"
+            )
+            return
         models = get_codex_models()
         selected_model, err = resolve_model_selector(model_selector or "", models)
         if err:
@@ -5697,7 +6080,7 @@ async def on_message(message: discord.Message):
         return
 
     engine_reasoning_match = re.match(
-        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km)\s+reasoning(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
@@ -5706,11 +6089,12 @@ async def on_message(message: discord.Message):
         scope_ch_id = None if scope_token in ("global", "default") else ch.id
         engine_token = engine_reasoning_match.group(2).lower()
         selector = (engine_reasoning_match.group(3) or "").strip()
-        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        target_engine = _engine_name_from_token(engine_token)
         if not selector:
             await ch.send(
                 "Usage: `engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
-                "`engine global claude reasoning <n|level>`, or `engine global codex reasoning <n|level>`"
+                "`engine kimi reasoning <n|level>`, `engine global claude reasoning <n|level>`, "
+                "`engine global codex reasoning <n|level>`, or `engine global kimi reasoning <n|level>`"
             )
             return
         selected_effort, err = resolve_reasoning_selector(selector, target_engine)
@@ -5728,6 +6112,17 @@ async def on_message(message: discord.Message):
                 f"reasoning `{format_reasoning_effort(updated['claude_reasoning_effort'])}`"
             )
             return
+        if target_engine == "kimi":
+            updated = update_runtime_config(
+                scope_ch_id,
+                default_engine="kimi",
+                kimi_reasoning_effort=selected_effort,
+            )
+            await ch.send(
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **kimi** — "
+                f"reasoning `{format_reasoning_effort(updated['kimi_reasoning_effort'])}`"
+            )
+            return
         updated = update_runtime_config(
             scope_ch_id,
             default_engine="codex",
@@ -5740,7 +6135,7 @@ async def on_message(message: discord.Message):
         return
 
     engine_only_match = re.match(
-        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai)$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km)$",
         content,
         flags=re.IGNORECASE,
     )
@@ -5748,7 +6143,7 @@ async def on_message(message: discord.Message):
         scope_token = (engine_only_match.group(1) or "").lower()
         scope_ch_id = None if scope_token in ("global", "default") else ch.id
         engine_token = engine_only_match.group(2).lower()
-        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        target_engine = _engine_name_from_token(engine_token)
         updated = update_runtime_config(scope_ch_id, default_engine=target_engine)
         model = get_model_for_engine(target_engine, runtime_config=updated)
         effort = get_reasoning_for_engine(target_engine, runtime_config=updated)
@@ -5765,8 +6160,10 @@ async def on_message(message: discord.Message):
         config = global_config if show_global else channel_config
         claude_models = await get_claude_models()
         codex_models = get_codex_models()
+        kimi_models = get_kimi_models()
         claude_list = " · ".join(f"`{mid}`" for mid, _ in claude_models)
         codex_list = " · ".join(f"`{slug}`" for slug, _ in codex_models)
+        kimi_list = " · ".join(f"`{alias}`" for alias, _ in kimi_models)
 
         if show_global:
             body = (
@@ -5774,7 +6171,9 @@ async def on_message(message: discord.Message):
                 f"Claude: model `{config['claude_model']}` · reasoning "
                 f"`{format_reasoning_effort(config['claude_reasoning_effort'])}`\n"
                 f"Codex: model `{config['codex_model']}` · reasoning "
-                f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n\n"
+                f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n"
+                f"Kimi: model `{config['kimi_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['kimi_reasoning_effort'])}`\n\n"
             )
         else:
             scope_note = (
@@ -5785,38 +6184,47 @@ async def on_message(message: discord.Message):
                 f"Claude: model `{config['claude_model']}` · reasoning "
                 f"`{format_reasoning_effort(config['claude_reasoning_effort'])}`\n"
                 f"Codex: model `{config['codex_model']}` · reasoning "
-                f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n\n"
+                f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n"
+                f"Kimi: model `{config['kimi_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['kimi_reasoning_effort'])}`\n\n"
                 f"Global default: **{global_config['default_engine']}**\n"
                 f"Claude: model `{global_config['claude_model']}` · reasoning "
                 f"`{format_reasoning_effort(global_config['claude_reasoning_effort'])}`\n"
                 f"Codex: model `{global_config['codex_model']}` · reasoning "
-                f"`{format_reasoning_effort(global_config['codex_reasoning_effort'])}`\n\n"
+                f"`{format_reasoning_effort(global_config['codex_reasoning_effort'])}`\n"
+                f"Kimi: model `{global_config['kimi_model']}` · reasoning "
+                f"`{format_reasoning_effort(global_config['kimi_reasoning_effort'])}`\n\n"
             )
 
         await ch.send(
             body
             + f"**Available models:**\n"
             + f"Claude: {claude_list}\n"
-            + f"Codex: {codex_list}\n\n"
+            + f"Codex: {codex_list}\n"
+            + f"Kimi: {kimi_list}\n\n"
             + f"**Reasoning levels (name or number):**\n"
             + f"Claude:\n{format_reasoning_options_numbered('claude')}\n"
-            + f"Codex:\n{format_reasoning_options_numbered('codex')}"
+            + f"Codex:\n{format_reasoning_options_numbered('codex')}\n"
+            + f"Kimi:\n{format_reasoning_options_numbered('kimi')}"
         )
         return
 
     if lower.startswith("engine "):
         await ch.send(
-            "Usage: `engine`, `engine global`, `engine claude`, `engine codex`, "
+            "Usage: `engine`, `engine global`, `engine claude`, `engine codex`, `engine kimi`, "
             "`engine claude model <n|name> [reasoning <n|level>]`, "
             "`engine codex model <n|name> [reasoning <n|level>]`, "
+            "`engine kimi model <n|name> [reasoning <n|level>]`, "
             "`engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
-            "`engine global claude|codex`, `engine global claude|codex model <n|name> [reasoning <n|level>]`, "
-            "or `engine global claude|codex reasoning <n|level>`"
+            "`engine kimi reasoning <n|level>`, "
+            "`engine global claude|codex|kimi`, "
+            "`engine global claude|codex|kimi model <n|name> [reasoning <n|level>]`, "
+            "or `engine global claude|codex|kimi reasoning <n|level>`"
         )
         return
 
     # ── Model listing ────────────────────────────────────────────────────
-    # Accepts: "claude models", "cc models", "codex models", "cx models"
+    # Accepts: "claude models", "cc models", "codex models", "cx models", "kimi models", "km models"
     if lower in ("claude models", "cc models"):
         channel_config = get_runtime_config(ch.id)
         current_model = get_model_for_engine("claude", runtime_config=channel_config)
@@ -5856,12 +6264,32 @@ async def on_message(message: discord.Message):
             "Switch global default with `engine global codex model <n|name> [reasoning <n|level>]`."
         )
         return
+    if lower in ("kimi models", "km models"):
+        channel_config = get_runtime_config(ch.id)
+        current_model = get_model_for_engine("kimi", runtime_config=channel_config)
+        global_model = get_model_for_engine("kimi")
+        models = get_kimi_models()
+        listing = "\n".join(
+            f"{idx}. {'▶ ' if alias == current_model else ''}`{alias}`"
+            + (f" ({display_name})" if display_name and display_name != alias else "")
+            for idx, (alias, display_name) in enumerate(models, start=1)
+        )
+        await ch.send(
+            f"**Kimi models** (this channel: `{current_model}` · global default: `{global_model}`):\n"
+            f"{listing}\n\n"
+            "Switch this channel with `kimi model <n|name>` or "
+            "`engine kimi model <n|name> [reasoning <n|level>]`. "
+            "Switch global default with `engine global kimi model <n|name> [reasoning <n|level>]`."
+        )
+        return
 
     # ── Model change ─────────────────────────────────────────────────────
-    # Accepts: "claude model <n|name>", "cc model <n|name>", "codex model <n|name>", "cx model <n|name>"
+    # Accepts: "claude model <n|name>", "cc model <n|name>", "codex model <n|name>", "cx model <n|name>",
+    #          "kimi model <n|name>", "km model <n|name>"
     _model_prefixes = {
         "claude model ": "claude", "cc model ": "claude",
         "codex model ": "codex",   "cx model ": "codex",
+        "kimi model ": "kimi",     "km model ": "kimi",
     }
     for _pfx, _engine in _model_prefixes.items():
         if lower.startswith(_pfx):
@@ -5871,7 +6299,8 @@ async def on_message(message: discord.Message):
                 await ch.send(
                     f"Usage: `{_pfx.strip()} <n|name>`\n"
                     f"This channel — Claude: `{channel_config['claude_model']}` · "
-                    f"Codex: `{channel_config['codex_model']}`"
+                    f"Codex: `{channel_config['codex_model']}` · "
+                    f"Kimi: `{channel_config['kimi_model']}`"
                 )
                 return
             if _engine == "claude":
@@ -5882,6 +6311,14 @@ async def on_message(message: discord.Message):
                     return
                 updated = update_runtime_config(ch.id, claude_model=selected_model)
                 await ch.send(f"✅ This channel Claude model set to `{updated['claude_model']}`")
+            elif _engine == "kimi":
+                models = get_kimi_models()
+                selected_model, err = resolve_model_selector(selector, models)
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                updated = update_runtime_config(ch.id, kimi_model=selected_model)
+                await ch.send(f"✅ This channel Kimi model set to `{updated['kimi_model']}`")
             else:
                 models = get_codex_models()
                 selected_model, err = resolve_model_selector(selector, models)
@@ -5894,16 +6331,17 @@ async def on_message(message: discord.Message):
 
     # ── Reasoning change (engine-specific) ─────────────────────────────
     # Accepts: "claude reasoning [n|level]", "cc reasoning [n|level]",
-    #          "codex reasoning [n|level]", "cx reasoning [n|level]", "openai reasoning [n|level]"
+    #          "codex reasoning [n|level]", "cx reasoning [n|level]", "openai reasoning [n|level]",
+    #          "kimi reasoning [n|level]", "km reasoning [n|level]"
     reasoning_match = re.match(
-        r"^(claude|cc|codex|cx|openai)\s+reasoning(?:\s+(.+))?$",
+        r"^(claude|cc|codex|cx|openai|kimi|km)\s+reasoning(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
     if reasoning_match:
         engine_token = reasoning_match.group(1).lower()
         selector = (reasoning_match.group(2) or "").strip()
-        target_engine = "claude" if engine_token in ("claude", "cc") else "codex"
+        target_engine = _engine_name_from_token(engine_token)
         channel_config = get_runtime_config(ch.id)
         if not selector:
             if target_engine == "claude":
@@ -5912,6 +6350,13 @@ async def on_message(message: discord.Message):
                     f"`{format_reasoning_effort(channel_config['claude_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('claude')}\n"
                     "Set with `claude reasoning <n|level>`"
+                )
+            elif target_engine == "kimi":
+                await ch.send(
+                    f"Kimi reasoning (this channel): "
+                    f"`{format_reasoning_effort(channel_config['kimi_reasoning_effort'])}`\n"
+                    f"Levels:\n{format_reasoning_options_numbered('kimi')}\n"
+                    "Set with `kimi reasoning <n|level>`"
                 )
             else:
                 await ch.send(
@@ -5930,6 +6375,13 @@ async def on_message(message: discord.Message):
             await ch.send(
                 "✅ This channel Claude reasoning set to "
                 f"`{format_reasoning_effort(updated['claude_reasoning_effort'])}`"
+            )
+            return
+        if target_engine == "kimi":
+            updated = update_runtime_config(ch.id, kimi_reasoning_effort=selected_effort)
+            await ch.send(
+                "✅ This channel Kimi reasoning set to "
+                f"`{format_reasoning_effort(updated['kimi_reasoning_effort'])}`"
             )
             return
         updated = update_runtime_config(ch.id, codex_reasoning_effort=selected_effort)
@@ -5957,21 +6409,14 @@ async def on_message(message: discord.Message):
                 current = str(channel_config["codex_model"])
                 current_reasoning = format_reasoning_effort(channel_config["codex_reasoning_effort"])
             else:
-                current = None
-                current_reasoning = None
-            if current:
-                await ch.send(
-                    f"Usage: `{prefix} <n|name>`\n"
-                    f"This channel default engine: `{default_engine}` · Current model: `{current}` · "
-                    f"Current reasoning: `{current_reasoning}`\n"
-                    f"Use `claude model <n|name>` / `codex model <n|name>` to set explicitly."
-                )
-            else:
-                await ch.send(
-                    f"Usage: `{prefix} <n|name>`\n"
-                    f"Default engine is `{default_engine}`. "
-                    "Use `claude model <n|name>` or `codex model <n|name>`."
-                )
+                current = str(channel_config["kimi_model"])
+                current_reasoning = format_reasoning_effort(channel_config["kimi_reasoning_effort"])
+            await ch.send(
+                f"Usage: `{prefix} <n|name>`\n"
+                f"This channel default engine: `{default_engine}` · Current model: `{current}` · "
+                f"Current reasoning: `{current_reasoning}`\n"
+                "Use `claude model <n|name>` / `codex model <n|name>` / `kimi model <n|name>` to set explicitly."
+            )
             return
         if default_engine == "claude":
             models = await get_claude_models()
@@ -5997,9 +6442,15 @@ async def on_message(message: discord.Message):
                 f"model set to `{updated['codex_model']}`"
             )
             return
+        models = get_kimi_models()
+        selected_model, err = resolve_model_selector(new_model, models)
+        if err:
+            await ch.send(f"❌ {err}")
+            return
+        updated = update_runtime_config(ch.id, kimi_model=selected_model)
         await ch.send(
-            f"❌ Default engine is `{default_engine}`. "
-            "Use `claude model <n|name>` or `codex model <n|name>`."
+            "✅ This channel default engine is **kimi** — "
+            f"model set to `{updated['kimi_model']}`"
         )
         return
 
@@ -6028,8 +6479,9 @@ async def on_message(message: discord.Message):
             else:
                 await ch.send(
                     f"Usage: `{prefix} <n|level>`\n"
-                    f"Default engine is `{default_engine}`. "
-                    "Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
+                    f"This channel default engine: `kimi` · Current reasoning: "
+                    f"`{format_reasoning_effort(channel_config['kimi_reasoning_effort'])}`\n"
+                    f"Levels:\n{format_reasoning_options_numbered('kimi')}"
                 )
             return
         if default_engine == "claude":
@@ -6054,9 +6506,14 @@ async def on_message(message: discord.Message):
                 f"`{format_reasoning_effort(updated['codex_reasoning_effort'])}`"
             )
             return
+        selected_effort, err = resolve_reasoning_selector(new_effort, "kimi")
+        if err:
+            await ch.send(f"❌ {err}")
+            return
+        updated = update_runtime_config(ch.id, kimi_reasoning_effort=selected_effort)
         await ch.send(
-            f"❌ Default engine is `{default_engine}`. "
-            "Use `claude reasoning <n|level>` or `codex reasoning <n|level>`."
+            "✅ This channel default engine is **kimi** — reasoning set to "
+            f"`{format_reasoning_effort(updated['kimi_reasoning_effort'])}`"
         )
         return
 
@@ -6150,7 +6607,7 @@ async def on_message(message: discord.Message):
     # ── Follow-up in active session ───────────────────────────────────────
     if session and session.get("phase") != "review":
         engine = session["engine"]
-        label = "Claude Code" if engine == "claude" else "Codex CLI"
+        label = get_engine_label(engine)
         session_runtime_config = get_session_runtime_config(session, ch.id)
         session_model = get_model_for_engine(engine, runtime_config=session_runtime_config, ch_id=ch.id)
         session["turns"] += 1
@@ -6221,7 +6678,7 @@ async def on_message(message: discord.Message):
         cwd = _canonical_repo(cwd)  # reset to canonical after cleanup
         await ch.send("⚠️ Previous session discarded.\n")
 
-    label = "Claude Code" if engine == "claude" else "Codex CLI"
+    label = get_engine_label(engine)
     await ch.send(f"🧠 **{label}** (`{model}`) starting on `{cwd}`...\n> {truncate(task, 200)}"
                    + (f"\n📎 {len(images)} image(s) attached" if images else ""))
 
