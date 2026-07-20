@@ -221,7 +221,7 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `<follow-up>` | Continue with the same engine and the session's model/reasoning snapshot |
+| `<follow-up>` | Continue with the same engine and the session's model/reasoning snapshot (`yes`/`no` included — they only act as push/discard commands at the `done` prompt) |
 | `stop` | Cancel the currently running engine turn |
 | `add: <instruction>` / `queue: <instruction>` | Queue extra instructions during an in-progress run; bot resumes automatically after the current turn |
 | `diff` | Quick raw peek at current changes |

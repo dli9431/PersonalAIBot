@@ -4965,8 +4965,10 @@ async def on_message(message: discord.Message):
         await ch.send(f"Reply {_review_action_prompt(cwd, bold=True)}.")
         return
 
-    # ── Session: push approval ────────────────────────────────────────────
-    if lower in ("yes", "approve", "push", "lgtm", "ship it"):
+    # ── Session: push approval (only at the `done` prompt; otherwise it's a follow-up) ──
+    if lower in ("yes", "approve", "push", "lgtm", "ship it") and (
+        not session or session.get("phase") == "review"
+    ):
         if session and session.get("phase") == "review":
             await ch.send("⏳ Committing and pushing...")
             result = await commit_and_push(session["branch"], session["description"], cwd)
@@ -5057,8 +5059,10 @@ async def on_message(message: discord.Message):
         _end_session(ch.id, cwd)
         return
 
-    # ── Session: discard ──────────────────────────────────────────────────
-    if lower in ("no", "reject", "discard", "nah"):
+    # ── Session: discard (only at the `done` prompt; otherwise it's a follow-up) ──
+    if lower in ("no", "reject", "discard", "nah") and (
+        not session or session.get("phase") == "review"
+    ):
         if session and session.get("phase") == "review":
             base = await discard_changes(session["branch"], cwd)
             _end_session(ch.id, cwd)
