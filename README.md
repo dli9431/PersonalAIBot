@@ -88,7 +88,7 @@ PROTECTED_BRANCHES=main,dev
 
 # Engine defaults
 DEFAULT_ENGINE=claude    # or codex, kimi
-ENGINE_TIMEOUT=300
+ENGINE_TIMEOUT=300       # seconds without engine output before auto-resume
 CONTEXT_MAX_CHARS=4000   # max chars saved for timeout resume context
 PLAN_CONTEXT_MAX_CHARS=12000  # max chars saved for plan + plan do/plan: do context
 

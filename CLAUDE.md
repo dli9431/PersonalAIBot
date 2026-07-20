@@ -52,7 +52,7 @@ Required `.env` values:
 Important optional values:
 
 - Branch settings: `BRANCH_PREFIX`, `MAIN_BRANCH`, `DEV_BRANCH`, `PROTECTED_BRANCHES`
-- Engine defaults: `DEFAULT_ENGINE`, `ENGINE_TIMEOUT`
+- Engine defaults: `DEFAULT_ENGINE`, `ENGINE_TIMEOUT` (seconds without engine output before auto-resume)
 - Context persistence: `CONTEXT_MAX_CHARS`, `PLAN_CONTEXT_MAX_CHARS`
 - Claude settings: `CLAUDE_MODEL`, `CLAUDE_REASONING_EFFORT`, `CLAUDE_ALLOWED_TOOLS`, `CLAUDE_DENIED_TOOLS`
 - Codex settings: `CODEX_MODEL`, `CODEX_REASONING_EFFORT`
