@@ -4192,23 +4192,20 @@ def _commit_clause_for_unit(unit: dict) -> tuple[int, str] | None:
     clause = _summary_clause_for_unit(unit)
     if not clause:
         return None
-    generic_clauses = {
-        "renamed this file": f"renamed `{file_label}`",
-        "added this new file": f"added `{file_label}`",
-        "removed this file": f"removed `{file_label}`",
-        "updated the binary contents": f"updated binary contents in `{file_label}`",
-        "changed file metadata": f"changed metadata for `{file_label}`",
-        "updated part of this Python file": f"updated `{file_label}`",
-        "updated part of this documentation file": f"updated `{file_label}`",
-        "updated part of this file": f"updated `{file_label}`",
-        "added content to this Python file": f"added content to `{file_label}`",
-        "added content to this documentation file": f"added content to `{file_label}`",
-        "added content to this file": f"added content to `{file_label}`",
-        "removed content from this Python file": f"removed content from `{file_label}`",
-        "removed content from this documentation file": f"removed content from `{file_label}`",
-        "removed content from this file": f"removed content from `{file_label}`",
-    }
-    clause = generic_clauses.get(clause, clause)
+    if kind == "rename":
+        before_path = str(unit.get("before") or unit.get("before_path") or "").strip()
+        after_path = str(unit.get("after") or unit.get("after_path") or "").strip()
+        clause = f"renamed `{before_path}` to `{after_path}`"
+    elif clause in {"added this new file"} or clause.startswith("added content to this "):
+        clause = f"added `{file_label}`"
+    elif clause in {"removed this file"} or clause.startswith("removed content from this "):
+        clause = f"removed `{file_label}`"
+    elif clause.startswith("updated part of this "):
+        clause = f"updated `{file_label}`"
+    elif clause == "updated the binary contents":
+        clause = f"updated binary contents in `{file_label}`"
+    elif clause == "changed file metadata":
+        clause = f"changed metadata for `{file_label}`"
     return 3 + _summary_clause_priority(clause), clause
 
 
@@ -4241,7 +4238,7 @@ def build_commit_description(path: str | None = None) -> str:
             if len(selected) == 1:
                 return selected[0]
             if len(selected) == 2:
-                return f"{selected[0]} and {selected[1]}"
+                return f"{selected[0]}; {selected[1]}"
             return f"{selected[0]}; {selected[1]}; and {selected[2]}"
 
         summary = join_selected().replace("`", "")
