@@ -3285,6 +3285,43 @@ async def login_kimi(ch: discord.TextChannel) -> None:
 STATUS_REFRESH = 5  # seconds between live status updates
 
 
+async def _wait_with_inactivity_timeout(
+    awaitable,
+    activity_event: asyncio.Event,
+    timeout: float,
+) -> None:
+    """Wait for completion, resetting the timeout whenever process output arrives."""
+    completion_task = asyncio.ensure_future(awaitable)
+    try:
+        while not completion_task.done():
+            activity_event.clear()
+            activity_task = asyncio.create_task(activity_event.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {completion_task, activity_task},
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not activity_task.done():
+                    activity_task.cancel()
+                await asyncio.gather(activity_task, return_exceptions=True)
+
+            if completion_task in done:
+                break
+            if activity_task in done or activity_event.is_set():
+                continue
+            if completion_task.done():
+                break
+            raise asyncio.TimeoutError
+
+        await completion_task
+    finally:
+        if not completion_task.done():
+            completion_task.cancel()
+            await asyncio.gather(completion_task, return_exceptions=True)
+
+
 async def _run_with_live_output(
     cmd: list[str],
     ch: discord.TextChannel,
@@ -3307,6 +3344,7 @@ async def _run_with_live_output(
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
     live_chunks: list[bytes] = []
+    activity_event = asyncio.Event()
     done = asyncio.Event()
     start = time.time()
 
@@ -3315,6 +3353,7 @@ async def _run_with_live_output(
             chunk = await proc.stdout.read(4096)
             if not chunk:
                 break
+            activity_event.set()
             stdout_chunks.append(chunk)
             live_chunks.append(chunk)
 
@@ -3323,6 +3362,7 @@ async def _run_with_live_output(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
+            activity_event.set()
             stderr_chunks.append(chunk)
             live_chunks.append(chunk)
 
@@ -3357,7 +3397,7 @@ async def _run_with_live_output(
     try:
         io_task = asyncio.gather(read_stdout(), read_stderr(), proc.wait())
         update_task = asyncio.create_task(live_update())
-        await asyncio.wait_for(io_task, timeout=ENGINE_TIMEOUT)
+        await _wait_with_inactivity_timeout(io_task, activity_event, ENGINE_TIMEOUT)
     except asyncio.TimeoutError:
         timed_out = True
         proc.kill()
@@ -3370,7 +3410,10 @@ async def _run_with_live_output(
         elapsed = int(time.time() - start)
         try:
             if timed_out:
-                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+                await status_msg.edit(
+                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
+                    f"({elapsed}s total) — auto-resuming..."
+                )
             else:
                 await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
@@ -3409,6 +3452,7 @@ async def _run_claude_streaming(
     tool_activity: list[str] = []
     final_result: str | None = None
     stderr_chunks: list[bytes] = []
+    activity_event = asyncio.Event()
     result_usage: dict = {}
     start = time.time()
     last_edit_time = 0.0
@@ -3419,11 +3463,13 @@ async def _run_claude_streaming(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
+            activity_event.set()
             stderr_chunks.append(chunk)
 
     async def stream_stdout() -> None:
         nonlocal final_result, last_edit_time, last_content
         async for raw_line in proc.stdout:
+            activity_event.set()
             line_str = raw_line.decode(errors="replace").strip()
             if not line_str:
                 continue
@@ -3470,9 +3516,10 @@ async def _run_claude_streaming(
 
     timed_out = False
     try:
-        await asyncio.wait_for(
+        await _wait_with_inactivity_timeout(
             asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
-            timeout=ENGINE_TIMEOUT,
+            activity_event,
+            ENGINE_TIMEOUT,
         )
     except asyncio.TimeoutError:
         timed_out = True
@@ -3484,7 +3531,10 @@ async def _run_claude_streaming(
         elapsed = int(time.time() - start)
         try:
             if timed_out:
-                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+                await status_msg.edit(
+                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
+                    f"({elapsed}s total) — auto-resuming..."
+                )
             else:
                 await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
@@ -3581,6 +3631,7 @@ async def _run_codex_streaming(
     activity: list[str] = []
     errors: list[str] = []
     stderr_chunks: list[bytes] = []
+    activity_event = asyncio.Event()
     result_usage: dict[str, int] = {}
     codex_thread_id = ""
     usage_accumulated = False
@@ -3614,11 +3665,13 @@ async def _run_codex_streaming(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
+            activity_event.set()
             stderr_chunks.append(chunk)
 
     async def stream_stdout() -> None:
         nonlocal last_edit_time, last_content, result_usage
         async for raw_line in proc.stdout:
+            activity_event.set()
             line_str = raw_line.decode(errors="replace").strip()
             if not line_str:
                 continue
@@ -3685,9 +3738,10 @@ async def _run_codex_streaming(
 
     timed_out = False
     try:
-        await asyncio.wait_for(
+        await _wait_with_inactivity_timeout(
             asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
-            timeout=ENGINE_TIMEOUT,
+            activity_event,
+            ENGINE_TIMEOUT,
         )
     except asyncio.TimeoutError:
         timed_out = True
@@ -3701,7 +3755,10 @@ async def _run_codex_streaming(
         elapsed = int(time.time() - start)
         try:
             if timed_out:
-                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+                await status_msg.edit(
+                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
+                    f"({elapsed}s total) — auto-resuming..."
+                )
             else:
                 await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
@@ -3772,6 +3829,7 @@ async def _run_kimi_streaming(
     tool_activity: list[str] = []
     final_result: str | None = None
     stderr_chunks: list[bytes] = []
+    activity_event = asyncio.Event()
     kimi_session_id = ""
     usage_accumulated = False
     start = time.time()
@@ -3791,11 +3849,13 @@ async def _run_kimi_streaming(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
+            activity_event.set()
             stderr_chunks.append(chunk)
 
     async def stream_stdout() -> None:
         nonlocal final_result, kimi_session_id, last_edit_time, last_content
         async for raw_line in proc.stdout:
+            activity_event.set()
             line_str = raw_line.decode(errors="replace").strip()
             if not line_str:
                 continue
@@ -3843,9 +3903,10 @@ async def _run_kimi_streaming(
 
     timed_out = False
     try:
-        await asyncio.wait_for(
+        await _wait_with_inactivity_timeout(
             asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
-            timeout=ENGINE_TIMEOUT,
+            activity_event,
+            ENGINE_TIMEOUT,
         )
     except asyncio.TimeoutError:
         timed_out = True
@@ -3859,7 +3920,10 @@ async def _run_kimi_streaming(
         elapsed = int(time.time() - start)
         try:
             if timed_out:
-                await status_msg.edit(content=f"⏰ {label} timed out ({elapsed}s) — auto-resuming...")
+                await status_msg.edit(
+                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
+                    f"({elapsed}s total) — auto-resuming..."
+                )
             else:
                 await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
@@ -4050,7 +4114,8 @@ async def run_engine(
                     return "(stopped)"
                 auto_commit(0, cwd)  # save any partial work
                 await ch.send(
-                    f"⏳ Timed out — saved context and auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})..."
+                    f"⏳ No engine output for {ENGINE_TIMEOUT}s — saved context and "
+                    f"auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})..."
                 )
                 try:
                     resume_task = build_resume_prompt("continue where you left off", ch.id, cwd, engine)
