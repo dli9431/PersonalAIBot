@@ -4048,7 +4048,7 @@ async def run_engine(
             for attempt in range(1, MAX_AUTO_CONTINUES + 1):
                 if stop_event and stop_event.is_set():
                     return "(stopped)"
-                auto_commit(raw_task, 0, cwd)  # save any partial work
+                auto_commit(0, cwd)  # save any partial work
                 await ch.send(
                     f"⏳ Timed out — saved context and auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})..."
                 )
@@ -4068,7 +4068,7 @@ async def run_engine(
                     continue
             if output is None:
                 head_before = _head_commit_snapshot(cwd).get("sha")
-                auto_commit(raw_task, 0, cwd)
+                auto_commit(0, cwd)
                 auto_commit_info = _head_commit_snapshot(cwd)
                 if head_before:
                     auto_commit_info["created"] = auto_commit_info.get("sha") != head_before
@@ -4155,7 +4155,115 @@ def create_branch(
     return branch
 
 
-def auto_commit(description: str, turn: int, path: str | None = None) -> None:
+def _commit_clause_for_unit(unit: dict) -> tuple[int, str] | None:
+    kind = str(unit.get("kind") or "hunk")
+    file_label = str(unit.get("file") or "(unknown file)")
+    if kind == "hunk":
+        before_text = str(unit.get("before") or "")
+        after_text = str(unit.get("after") or "")
+        before_definitions = _summary_definition_targets(before_text)
+        after_definitions = _summary_definition_targets(after_text)
+        added_definitions = [item for item in after_definitions if item not in before_definitions]
+        removed_definitions = [item for item in before_definitions if item not in after_definitions]
+        updated_definitions = [item for item in after_definitions if item in before_definitions]
+
+        definition_actions: list[str] = []
+        for verb, definitions in (
+            ("added", added_definitions),
+            ("removed", removed_definitions),
+            ("updated", updated_definitions),
+        ):
+            grouped = _summary_group_definitions(definitions)
+            if grouped:
+                definition_actions.append(f"{verb} {grouped}")
+        if definition_actions:
+            priority = 0 if added_definitions or removed_definitions else 1
+            return priority, _summary_join_phrases(definition_actions)
+
+        hunk_target = _summary_target_from_text(str(unit.get("hunk_context") or ""), file_label)
+        if hunk_target:
+            if before_text and after_text:
+                return 2, f"updated {hunk_target}"
+            if after_text:
+                return 2, f"added changes to {hunk_target}"
+            if before_text:
+                return 2, f"removed changes from {hunk_target}"
+
+    clause = _summary_clause_for_unit(unit)
+    if not clause:
+        return None
+    generic_clauses = {
+        "renamed this file": f"renamed `{file_label}`",
+        "added this new file": f"added `{file_label}`",
+        "removed this file": f"removed `{file_label}`",
+        "updated the binary contents": f"updated binary contents in `{file_label}`",
+        "changed file metadata": f"changed metadata for `{file_label}`",
+        "updated part of this Python file": f"updated `{file_label}`",
+        "updated part of this documentation file": f"updated `{file_label}`",
+        "updated part of this file": f"updated `{file_label}`",
+        "added content to this Python file": f"added content to `{file_label}`",
+        "added content to this documentation file": f"added content to `{file_label}`",
+        "added content to this file": f"added content to `{file_label}`",
+        "removed content from this Python file": f"removed content from `{file_label}`",
+        "removed content from this documentation file": f"removed content from `{file_label}`",
+        "removed content from this file": f"removed content from `{file_label}`",
+    }
+    clause = generic_clauses.get(clause, clause)
+    return 3 + _summary_clause_priority(clause), clause
+
+
+def build_commit_description(path: str | None = None) -> str:
+    """Build a concise description of the changes currently staged for commit."""
+    diff = run_git(
+        ["git", "diff", "--cached", "--unified=0", "--find-renames", "--no-color"],
+        path,
+    ).stdout.strip()
+    units = _parse_unified_review_units(diff, "staged vs HEAD") if diff else []
+
+    descriptions: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for unit in units:
+        result = _commit_clause_for_unit(unit)
+        if not result:
+            continue
+        priority, clause = result
+        normalized = _collapse_whitespace(clause).rstrip(".")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        descriptions.append((priority, normalized))
+
+    if descriptions:
+        descriptions.sort(key=lambda item: item[0])
+        selected = [description for _, description in descriptions[:3]]
+
+        def join_selected() -> str:
+            if len(selected) == 1:
+                return selected[0]
+            if len(selected) == 2:
+                return f"{selected[0]} and {selected[1]}"
+            return f"{selected[0]}; {selected[1]}; and {selected[2]}"
+
+        summary = join_selected().replace("`", "")
+        while len(summary) > 160 and len(selected) > 1:
+            selected.pop()
+            summary = join_selected().replace("`", "")
+        summary = _truncate_inline_text(summary, 160)
+        return summary[:1].upper() + summary[1:]
+
+    changed_files = run_git(
+        ["git", "diff", "--cached", "--name-only", "--find-renames"],
+        path,
+    ).stdout.splitlines()
+    files = [file_name.strip() for file_name in changed_files if file_name.strip()]
+    if len(files) == 1:
+        return f"Update {files[0]}"
+    if files:
+        return f"Update {len(files)} files"
+    return "Update repository files"
+
+
+def auto_commit(turn: int, path: str | None = None) -> None:
     """Commit any pending changes as a WIP save after each engine turn."""
     cwd = path or REPO_PATH
     try:
@@ -4179,6 +4287,7 @@ def auto_commit(description: str, turn: int, path: str | None = None) -> None:
         return
 
     if status_res.stdout.strip():
+        description = build_commit_description(path)
         try:
             commit = run_git(["git", "commit", "-m", f"WIP (turn {turn}): {description}"], path)
         except Exception:
@@ -4194,11 +4303,12 @@ def auto_commit(description: str, turn: int, path: str | None = None) -> None:
             )
 
 
-async def commit_and_push(branch: str, description: str, path: str | None = None) -> str:
+async def commit_and_push(branch: str, path: str | None = None) -> str:
     # Commit any remaining uncommitted changes
     run_git(["git", "add", "."], path)
     status = run_git(["git", "status", "--porcelain"], path).stdout.strip()
     if status:
+        description = build_commit_description(path)
         run_git(["git", "commit", "-m", f"auto: {description}"], path)
     push = run_git(["git", "push", "-u", "origin", branch], path)
     if push.returncode == 0:
@@ -4971,7 +5081,7 @@ async def on_message(message: discord.Message):
     ):
         if session and session.get("phase") == "review":
             await ch.send("⏳ Committing and pushing...")
-            result = await commit_and_push(session["branch"], session["description"], cwd)
+            result = await commit_and_push(session["branch"], cwd)
             await ch.send(result)
             if "✅" in result:
                 last_pushed[ch.id] = session["branch"]
@@ -5007,7 +5117,7 @@ async def on_message(message: discord.Message):
 
     if lower == "skip" and session and session.get("phase") == "review":
         await ch.send("⏳ Committing and pushing (skip merge)...")
-        result = await commit_and_push(session["branch"], session["description"], cwd)
+        result = await commit_and_push(session["branch"], cwd)
         await ch.send(result)
         canonical = _canonical_repo(cwd)
         if "✅" in result:
@@ -5564,7 +5674,7 @@ async def on_message(message: discord.Message):
                     }
                     _absorb_usage_into_session(active_sessions[ch.id], ch.id)
 
-                    auto_commit(exec_description, 1, cwd)
+                    auto_commit(1, cwd)
                     await send_engine_output_block(ch, label, output)
                     stat = get_diff_stat(cwd)
                     await ch.send(f"📊 {stat}\n{_working_session_guidance(cwd)}")
@@ -5795,7 +5905,7 @@ async def on_message(message: discord.Message):
         label, path = proj
         if session:
             # Auto-commit current work before switching repos
-            auto_commit(session["description"], session["turns"], cwd)
+            auto_commit(session["turns"], cwd)
             clear_unfinished_task_snapshot(ch.id)
             # Remove old worktree from previous repo
             remove_worktree(_canonical_repo(cwd), ch.id)
@@ -5829,7 +5939,7 @@ async def on_message(message: discord.Message):
         branch_name = resolve_branch(branch_ref, ch.id, cwd) or branch_ref
         # Auto-commit current work before switching if we're mid-session
         if session:
-            auto_commit(session["description"], session["turns"], cwd)
+            auto_commit(session["turns"], cwd)
             clear_unfinished_task_snapshot(ch.id)
         check = run_git(["git", "rev-parse", "--verify", branch_name], cwd)
         if check.returncode != 0:
@@ -6647,7 +6757,7 @@ async def on_message(message: discord.Message):
 
         try:
             _absorb_usage_into_session(session, ch.id)
-            auto_commit(session["description"], session["turns"], cwd)
+            auto_commit(session["turns"], cwd)
             await send_engine_output_block(ch, label, output)
             await send_working_session_wrapup(ch, session, cwd)
         except Exception as exc:
@@ -6766,7 +6876,7 @@ async def on_message(message: discord.Message):
         }
         _absorb_usage_into_session(active_sessions[ch.id], ch.id)
 
-        auto_commit(task, 1, cwd)
+        auto_commit(1, cwd)
         await send_engine_output_block(ch, label, output)
         await send_working_session_wrapup(ch, active_sessions[ch.id], cwd)
     except Exception as exc:
