@@ -34,7 +34,7 @@ Required environment variables live in `.env`:
 Important optional configuration:
 
 - Branching: `BRANCH_PREFIX`, `MAIN_BRANCH`, `DEV_BRANCH`, `PROTECTED_BRANCHES`
-- Engine defaults: `DEFAULT_ENGINE`, `ENGINE_TIMEOUT`
+- Engine defaults: `DEFAULT_ENGINE`; engine turns have no inactivity deadline
 - Context persistence: `CONTEXT_MAX_CHARS`, `PLAN_CONTEXT_MAX_CHARS`
 - Claude runtime: `CLAUDE_MODEL`, `CLAUDE_REASONING_EFFORT`, `CLAUDE_ALLOWED_TOOLS`, `CLAUDE_DENIED_TOOLS`
 - Codex runtime: `CODEX_MODEL`, `CODEX_REASONING_EFFORT`
@@ -50,7 +50,7 @@ Codex sandbox and approval settings are read from `~/.codex/config.toml`, not fr
 1. Configuration and in-memory state for sessions, running subprocesses, per-channel cwd, per-channel runtime config, and usage tracking.
 2. Helper functions for git operations, branch resolution, state persistence, plan/resume context, model selection, trust checks, diff/review formatting, and image handling.
 3. Login helpers for Claude, Codex, and Kimi CLI auth flows.
-4. Engine runners that stream live output to Discord, support timeout auto-resume, and capture token usage.
+4. Engine runners that stream live output and quiet-run heartbeats to Discord, wait until completion or explicit cancellation, and capture token usage.
 5. Git workflow helpers for feature branch creation, WIP auto-commits, push, merge, discard, PR creation, and worktree lifecycle.
 6. Discord handlers, mostly inside `on_message`, which implement the command surface.
 
