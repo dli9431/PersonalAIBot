@@ -146,6 +146,19 @@ km: rename the checkout button
 
 The bot creates a feature branch, runs the engine, and streams its output.
 
+### Run multiple agents
+
+Start tasks in separate Discord channels or threads. Each channel/thread is an independent
+agent with its own engine session, unique feature branch, and git worktree, so agents can run
+at the same time without sharing a checkout or overwriting one another's files. Use `agents`
+from any channel to see all currently running or reviewable agents.
+
+Merges into the same repository are serialized and performed in disposable integration
+worktrees. If two agents make genuinely incompatible edits to the same lines, the target and
+other agents remain untouched; the bot syncs the latest target into the conflicting agent's
+worktree and asks that agent to reconcile the marked files. You can also run `sync [target]`
+before review (`dev` is the default target).
+
 You can also plan first, then execute:
 
 ```
@@ -224,6 +237,7 @@ pr main               → open a GitHub PR targeting main
 | `<follow-up>` | Continue with the same engine and the session's model/reasoning snapshot (`yes`/`no` included — they only act as push/discard commands at the `done` prompt) |
 | `stop` | Cancel the currently running engine turn |
 | `add: <instruction>` / `queue: <instruction>` | Queue extra instructions during an in-progress run; bot resumes automatically after the current turn |
+| `sync [target]` | Merge the latest target (default: `DEV_BRANCH`) into only this agent worktree; conflicts stay isolated for an agent follow-up |
 | `diff` | Quick raw peek at current changes |
 | `review` | Detailed major-change review (before/after/why) |
 | `undo` | Discard uncommitted working-tree changes in the active session |
@@ -249,7 +263,7 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `merge <target>` | Merge current/last-pushed branch into target |
+| `merge <target>` | Merge current/last-pushed branch into target through a serialized, disposable integration worktree |
 | `merge src>tgt` | Explicit source and target |
 | `merge src into tgt` | Same as above |
 | `pr <target>` | Open a GitHub pull request |
@@ -322,6 +336,7 @@ pr main               → open a GitHub PR targeting main
 | `reasoning [n\|level]` | View/set reasoning effort for this channel's default engine |
 | `default reasoning [n\|level]` | Alias for `reasoning [n\|level]` |
 | `status` | Current branch and working tree |
+| `agents` / `agent status` | List concurrent agents across Discord channels and threads |
 | `usage` | Show cumulative token usage per engine (all-time runs, input/output/cache tokens), plus live remaining usage-limit status for Claude/Codex (best effort), and current session token count when available |
 | `doctor` | Run diagnostics for SSH, CLI auth, trust, and repo health |
 | `help` | Show command reference (pinned) |
@@ -353,7 +368,7 @@ Bot:   [shows descriptive per-file summary]
 Bot:   Reply yes to commit & push, no to discard.
 
 You:   yes
-Bot:   ✅ Pushed to auto/claude/add-a-dark-mode-toggle-38291
+Bot:   ✅ Pushed to auto/claude/add-a-dark-mode-toggle-34567890-a1b2c3d4e5
 Bot:   ✅ Merged → dev
 
 # Later, release dev to main:

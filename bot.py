@@ -136,6 +136,9 @@ branch_listing: dict[int, list[str]] = {}
 CHANNEL_RUNTIME_CONFIGS: dict[int, dict] = {}
 # channel_id → token usage dict from last engine run (includes "engine")
 channel_last_usage: dict[int, dict] = {}
+# canonical repo path → lock for shared integration operations. Engine runs stay
+# concurrent in channel worktrees; only merges into a shared target serialize.
+_repo_integration_locks: dict[str, asyncio.Lock] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -370,10 +373,17 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    temp_path = STATE_FILE.with_name(
+        f".{STATE_FILE.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
     try:
-        STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
+        temp_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+        os.replace(temp_path, STATE_FILE)
     except OSError:
-        pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _accumulate_global_usage(engine: str, usage: dict) -> None:
@@ -4196,8 +4206,13 @@ def create_branch(
     engine: str,
     path: str | None = None,
     base_branch: str | None = None,
+    agent_id: int | str | None = None,
 ) -> str:
-    branch = f"{BRANCH_PREFIX}/{engine}/{slugify(task)}-{int(time.time()) % 100000}"
+    # Same-engine agents can start identical tasks in the same second. Add the
+    # channel/thread identity and a nonce so their branches cannot collide.
+    agent_key = re.sub(r"[^a-zA-Z0-9]+", "", str(agent_id or os.getpid()))[-8:] or "agent"
+    nonce = f"{time.time_ns():x}"[-10:]
+    branch = f"{BRANCH_PREFIX}/{engine}/{slugify(task)}-{agent_key}-{nonce}"
     # Prefer the provided base branch (for saved plan execution), else resolve fallback.
     preferred_base = (base_branch or "").strip()
     base = None
@@ -4380,6 +4395,8 @@ async def commit_and_push(branch: str, path: str | None = None) -> str:
 
 async def discard_changes(branch: str, path: str | None = None) -> str | None:
     canonical = _canonical_repo(path or REPO_PATH)
+    # A failed agent sync may leave an in-progress merge in this worktree.
+    run_git(["git", "merge", "--abort"], path)
     run_git(["git", "checkout", "."], path)
     run_git(["git", "clean", "-fd"], path)
     target = _resolve_checkout_branch(canonical, avoid=branch)
@@ -4416,58 +4433,155 @@ def _missing_branch_error(msg: str) -> bool:
     return ("branch" in low and "not found" in low) or ("remote ref does not exist" in low)
 
 
+def sync_agent_branch(source: str, target: str, path: str) -> tuple[bool, str]:
+    """Merge the latest target into one agent worktree.
+
+    A clean sync commits normally. A content conflict remains only in this
+    agent's worktree so its next engine turn can resolve the marked files.
+    """
+    canonical = _canonical_repo(path)
+    fetch = run_git(["git", "fetch", "origin", target], canonical)
+    if fetch.returncode != 0:
+        msg = (fetch.stderr or fetch.stdout or "fetch failed").strip()
+        return False, f"❌ Could not fetch `{target}`:\n```\n{truncate(msg, 500)}\n```"
+
+    target_ref = f"origin/{target}"
+    if run_git(
+        ["git", "rev-parse", "--verify", f"{target_ref}^{{commit}}"], canonical
+    ).returncode != 0:
+        return False, f"❌ Target branch `{target}` not found on `origin`."
+    if current_branch(path) != source:
+        return False, f"❌ Agent worktree is not on its expected branch `{source}`."
+
+    merge = run_git(["git", "merge", target_ref, "--no-edit"], path)
+    if merge.returncode == 0:
+        return True, f"✅ Synced `{source}` with the latest `{target}` in this agent worktree."
+
+    conflicts = run_git(
+        ["git", "diff", "--name-only", "--diff-filter=U"], path
+    ).stdout.splitlines()
+    conflict_files = [file_name.strip() for file_name in conflicts if file_name.strip()]
+    if not conflict_files:
+        msg = (merge.stderr or merge.stdout or "merge failed").strip()
+        run_git(["git", "merge", "--abort"], path)
+        return False, f"❌ Could not sync `{target}`:\n```\n{truncate(msg, 500)}\n```"
+
+    listing = ", ".join(f"`{name}`" for name in conflict_files[:8])
+    if len(conflict_files) > 8:
+        listing += f", and {len(conflict_files) - 8} more"
+    return False, (
+        f"⚠️ Latest `{target}` is staged for reconciliation only in this agent worktree.\n"
+        f"Conflicting files: {listing}\n"
+        "Send a follow-up asking the agent to resolve the integration conflicts, then review again. "
+        "Use `abort` to discard the agent branch instead."
+    )
+
+
 async def merge_branch(source: str, target: str, path: str | None = None) -> str:
-    # Merge on the canonical repo to avoid "branch checked out in another worktree" errors
     canonical = _canonical_repo(path or REPO_PATH)
-    run_git(["git", "fetch", "--all"], canonical)
-    run_git(["git", "checkout", target], canonical)
-    run_git(["git", "pull", "--ff-only"], canonical)
+    lock_key = str(pathlib.Path(canonical).resolve())
+    lock = _repo_integration_locks.setdefault(lock_key, asyncio.Lock())
 
-    merge = run_git(["git", "merge", source, "--no-ff",
-                      "-m", f"merge {source} into {target}"], canonical)
-    if merge.returncode != 0:
-        msg = merge.stdout or merge.stderr or "unknown error"
-        run_git(["git", "merge", "--abort"], canonical)
-        return (f"❌ Merge conflict `{source}` → `{target}`:\n"
-                f"```\n{truncate(msg, 500)}\n```\nAborted. Resolve at desktop.")
+    # Agents edit concurrently, but integrations into the same repository are
+    # intentionally one-at-a-time. The merge happens in a disposable detached
+    # worktree, leaving the canonical checkout and agent worktrees untouched.
+    async with lock:
+        fetch = run_git(["git", "fetch", "origin", "--prune"], canonical)
+        if fetch.returncode != 0:
+            msg = (fetch.stderr or fetch.stdout or "fetch failed").strip()
+            return f"❌ Could not refresh `origin` before merging:\n```\n{truncate(msg, 500)}\n```"
 
-    push = run_git(["git", "push", "origin", target], canonical)
-    if push.returncode != 0:
-        return f"❌ Merged locally but push failed:\n```\n{push.stderr[-500:]}\n```"
+        source_ref = source
+        if run_git(
+            ["git", "rev-parse", "--verify", f"{source_ref}^{{commit}}"], canonical
+        ).returncode != 0:
+            source_ref = f"origin/{source}"
+        if run_git(
+            ["git", "rev-parse", "--verify", f"{source_ref}^{{commit}}"], canonical
+        ).returncode != 0:
+            return f"❌ Source branch `{source}` not found locally or on `origin`."
 
-    result = f"✅ Merged `{source}` → `{target}` and pushed."
+        target_ref = f"origin/{target}"
+        if run_git(
+            ["git", "rev-parse", "--verify", f"{target_ref}^{{commit}}"], canonical
+        ).returncode != 0:
+            target_ref = target
+        if run_git(
+            ["git", "rev-parse", "--verify", f"{target_ref}^{{commit}}"], canonical
+        ).returncode != 0:
+            return f"❌ Target branch `{target}` not found locally or on `origin`."
 
-    # Clean up: delete the feature branch locally and remotely after merging
-    if source.startswith(f"{BRANCH_PREFIX}/"):
-        if is_protected_branch(source):
-            result += f"\n🛡️ Protected branch; skipping delete for `{source}`."
-        else:
-            # If source is checked out in this channel's worktree, detach first so delete can succeed.
-            _detach_if_worktree_on_branch(source, path)
-            local_delete = run_git(["git", "branch", "-D", source], canonical)
-            remote_delete = run_git(["git", "push", "origin", "--delete", source], canonical)
-            local_msg = (local_delete.stderr or local_delete.stdout or "").strip()
-            remote_msg = (remote_delete.stderr or remote_delete.stdout or "").strip()
-            local_ok = local_delete.returncode == 0 or _missing_branch_error(local_msg)
-            remote_ok = remote_delete.returncode == 0 or _missing_branch_error(remote_msg)
-            if local_ok and remote_ok:
-                result += f"\n🗑️ Deleted branch `{source}`."
+        integration_path = str(
+            _worktree_base(canonical)
+            / f".integrate-{slugify(target, 20)}-{os.getpid()}-{time.time_ns()}"
+        )
+        added = run_git(
+            ["git", "worktree", "add", "--detach", integration_path, target_ref],
+            canonical,
+        )
+        if added.returncode != 0:
+            msg = (added.stderr or added.stdout or "worktree creation failed").strip()
+            return f"❌ Could not create an isolated integration worktree:\n```\n{truncate(msg, 500)}\n```"
+
+        try:
+            merge = run_git([
+                "git", "merge", source_ref, "--no-ff",
+                "-m", f"merge {source} into {target}",
+            ], integration_path)
+            if merge.returncode != 0:
+                msg = merge.stdout or merge.stderr or "unknown error"
+                run_git(["git", "merge", "--abort"], integration_path)
+                return (
+                    f"❌ Integration conflict `{source}` → `{target}`:\n"
+                    f"```\n{truncate(msg, 500)}\n```\n"
+                    "The target and all agent worktrees are unchanged; the source branch was kept."
+                )
+
+            push = run_git(
+                ["git", "push", "origin", f"HEAD:refs/heads/{target}"],
+                integration_path,
+            )
+            if push.returncode != 0:
+                msg = (push.stderr or push.stdout or "push failed").strip()
+                return (
+                    "❌ Isolated merge completed, but the target changed before it could be pushed. "
+                    "No agent worktree was modified; retry the merge.\n"
+                    f"```\n{truncate(msg, 500)}\n```"
+                )
+        finally:
+            run_git(["git", "worktree", "remove", integration_path, "--force"], canonical)
+            run_git(["git", "worktree", "prune"], canonical)
+
+        result = f"✅ Merged `{source}` → `{target}` in isolation and pushed."
+
+        # Delete an integrated feature branch only after the target push succeeds.
+        if source.startswith(f"{BRANCH_PREFIX}/"):
+            if is_protected_branch(source):
+                result += f"\n🛡️ Protected branch; skipping delete for `{source}`."
             else:
-                if not local_ok:
-                    result += (
-                        f"\n⚠️ Local delete failed for `{source}`:\n"
-                        f"```\n{truncate(local_msg or 'unknown error', 200)}\n```"
-                    )
-                if not remote_ok:
-                    result += (
-                        f"\n⚠️ Remote delete failed for `{source}`:\n"
-                        f"```\n{truncate(remote_msg or 'unknown error', 200)}\n```"
-                    )
+                _detach_if_worktree_on_branch(source, path)
+                local_delete = run_git(["git", "branch", "-D", source], canonical)
+                remote_delete = run_git(["git", "push", "origin", "--delete", source], canonical)
+                local_msg = (local_delete.stderr or local_delete.stdout or "").strip()
+                remote_msg = (remote_delete.stderr or remote_delete.stdout or "").strip()
+                local_ok = local_delete.returncode == 0 or _missing_branch_error(local_msg)
+                remote_ok = remote_delete.returncode == 0 or _missing_branch_error(remote_msg)
+                if local_ok and remote_ok:
+                    result += f"\n🗑️ Deleted branch `{source}`."
+                else:
+                    if not local_ok:
+                        result += (
+                            f"\n⚠️ Local delete failed for `{source}`:\n"
+                            f"```\n{truncate(local_msg or 'unknown error', 200)}\n```"
+                        )
+                    if not remote_ok:
+                        result += (
+                            f"\n⚠️ Remote delete failed for `{source}`:\n"
+                            f"```\n{truncate(remote_msg or 'unknown error', 200)}\n```"
+                        )
 
-    # Pull the target branch so the local repo stays up to date
-    run_git(["git", "pull", "--ff-only"], canonical)
-
-    return result
+        run_git(["git", "fetch", "origin", target], canonical)
+        return result
 
 
 # ── Worktree helpers ──────────────────────────────────────────────────────
@@ -4673,6 +4787,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 `<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:` · `kimi: <task>` / `km:`
+Use separate Discord channels/threads to run agents concurrently; `agents` lists them
 `plan: <task>` — planning mode with default engine/model (saves/extends plan context)
 `plan: do [extra instructions]` / `plan do [extra instructions]` — execute saved plan context, then clear it
 `plan show` — show saved plan context · `plan clear` / `clear plan` — clear saved plan context
@@ -4681,6 +4796,7 @@ HELP_TEXT_1_TEMPLATE = """**Starting a session:**
 Type follow-ups freely — engine keeps context
 `stop` — cancel the current run
 `add: <instruction>` / `queue: <instruction>` — queue work during an active run (auto-resumes after finish)
+`sync [target]` — bring latest target (default: dev) into only this agent worktree
 `switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — quick raw peek · `review` — major changes (before/after/why) · `undo` — discard uncommitted changes
@@ -4731,6 +4847,7 @@ HELP_TEXT_2 = """**Branches:**
 
 **Info:**
 `status` — current branch and working tree
+`agents` — list concurrent agents across Discord channels/threads
 `usage` — engine/session token usage + remaining limits (best effort)
 `branches` — list branches (use `N` references)
 `pull [branch|N]` — pull latest changes with commit/file summary
@@ -4979,6 +5096,43 @@ async def on_message(message: discord.Message):
             await ch.send("No active run to stop.")
         return
 
+    # ── Concurrent agent overview (available even while this channel runs) ────
+    if lower in ("agents", "agent status"):
+        agent_ids = sorted(set(active_sessions) | set(active_run_contexts))
+        if not agent_ids:
+            await ch.send(
+                "No active agents. Start tasks in separate Discord channels or threads to run them concurrently."
+            )
+            return
+        lines = [f"🤖 **Active agents ({len(agent_ids)})**"]
+        for agent_id in agent_ids:
+            agent_session = active_sessions.get(agent_id) or {}
+            run_ctx = active_run_contexts.get(agent_id) or {}
+            engine = _normalize_engine_name(run_ctx.get("engine") or agent_session.get("engine"))
+            branch = str(agent_session.get("branch") or "").strip()
+            agent_cwd = str(
+                run_ctx.get("cwd") or agent_session.get("cwd") or channel_cwd.get(agent_id) or ""
+            ).strip()
+            if not branch and agent_cwd and pathlib.Path(agent_cwd).exists():
+                branch = current_branch(agent_cwd)
+            if run_ctx:
+                state = "running"
+            elif agent_session.get("phase") == "review":
+                state = "awaiting approval"
+            else:
+                state = "ready for follow-up"
+            description = str(
+                run_ctx.get("task") or agent_session.get("description") or ""
+            ).strip()
+            line = f"• <#{agent_id}> · **{engine}** · {state}"
+            if branch:
+                line += f" · `{branch}`"
+            if description:
+                line += f"\n  {truncate(description, 140)}"
+            lines.append(line)
+        await ch.send(truncate("\n".join(lines), 1900))
+        return
+
     # ── Queue follow-up while run is active ───────────────────────────────
     proc = running_procs.get(ch.id)
     run_in_progress = bool(proc and proc.returncode is None)
@@ -5153,9 +5307,16 @@ async def on_message(message: discord.Message):
                     await ch.send(f"⏳ Merging into `{DEV_BRANCH}`...")
                     merge_result = await merge_branch(session["branch"], DEV_BRANCH, cwd)
                     await ch.send(merge_result)
-                    record_state(ch.id, canonical, DEV_BRANCH)
-                    await ch.send("`pr main` to create a PR to main")
-                    _end_session(ch.id, cwd)
+                    if merge_result.startswith("✅"):
+                        _end_session(ch.id, cwd)
+                        record_state(ch.id, canonical)
+                        await ch.send("`pr main` to create a PR to main")
+                    else:
+                        session["phase"] = "working"
+                        _, sync_result = sync_agent_branch(
+                            session["branch"], DEV_BRANCH, cwd
+                        )
+                        await ch.send(sync_result)
                 else:
                     branches = [b for b in run_git(
                         ["git", "branch", "--sort=-committerdate", "--format=%(refname:short)"], canonical
@@ -5227,8 +5388,13 @@ async def on_message(message: discord.Message):
         await ch.send(f"⏳ Merging into `{target}`...")
         merge_result = await merge_branch(session["branch"], target, cwd)
         await ch.send(merge_result)
-        record_state(ch.id, canonical, target)
-        _end_session(ch.id, cwd)
+        if merge_result.startswith("✅"):
+            _end_session(ch.id, cwd)
+            record_state(ch.id, canonical)
+        else:
+            session["phase"] = "working"
+            _, sync_result = sync_agent_branch(session["branch"], target, cwd)
+            await ch.send(sync_result)
         return
 
     # ── Session: discard (only at the `done` prompt; otherwise it's a follow-up) ──
@@ -5273,6 +5439,7 @@ async def on_message(message: discord.Message):
 
     # ── Session: undo (revert uncommitted changes from last run) ──────────
     if lower == "undo" and session:
+        run_git(["git", "merge", "--abort"], cwd)
         run_git(["git", "checkout", "."], cwd)
         run_git(["git", "clean", "-fd"], cwd)
         session["turns"] = max(0, session["turns"] - 1)
@@ -5283,6 +5450,23 @@ async def on_message(message: discord.Message):
         return
 
     # ── Merge commands ────────────────────────────────────────────────────
+    if lower == "sync" or lower.startswith("sync "):
+        if not session:
+            await ch.send("`sync [target]` requires an active agent session.")
+            return
+        target_input = content[4:].strip() or DEV_BRANCH
+        target = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}.get(
+            target_input.lower(), target_input
+        )
+        if target == session["branch"]:
+            await ch.send(f"❌ Agent and target are the same branch: `{target}`")
+            return
+        await ch.send(f"⏳ Syncing this agent with the latest `{target}`...")
+        _, sync_result = sync_agent_branch(session["branch"], target, cwd)
+        session["phase"] = "working"
+        await ch.send(sync_result)
+        return
+
     if lower.startswith("merge "):
         aliases = {"dev": DEV_BRANCH, "main": MAIN_BRANCH}
         target_str = content[6:].strip()  # preserve original case
@@ -5322,8 +5506,14 @@ async def on_message(message: discord.Message):
             await ch.send(f"❌ Source and target are the same branch: `{src}`")
             return
         await ch.send(f"⏳ Merging `{src}` → `{tgt}`...")
-        await ch.send(await merge_branch(src, tgt, cwd))
-        record_state(ch.id, cwd, tgt)
+        merge_result = await merge_branch(src, tgt, cwd)
+        await ch.send(merge_result)
+        if merge_result.startswith("✅") and session and src == session.get("branch"):
+            canonical = _canonical_repo(cwd)
+            _end_session(ch.id, cwd)
+            record_state(ch.id, canonical)
+        else:
+            record_state(ch.id, cwd)
         return
 
     # ── PR commands ───────────────────────────────────────────────────────
@@ -5663,6 +5853,7 @@ async def on_message(message: discord.Message):
                         engine,
                         cwd,
                         base_branch=plan_branch if plan_branch_exists else None,
+                        agent_id=ch.id,
                     )
                 except Exception as e:
                     await ch.send(f"❌ Branch creation failed: `{e}`")
@@ -6758,7 +6949,7 @@ async def on_message(message: discord.Message):
         snapshot = load_unfinished_task_snapshot(ch.id)
         if snapshot and str(snapshot.get("branch") or "").strip() == branch:
             clear_unfinished_task_snapshot(ch.id)
-        # Parse engine from branch name (auto/engine/slug-timestamp)
+        # Parse engine from branch name (auto/engine/slug-agent-nonce)
         parts = branch.split("/")
         engine = _normalize_engine_name(parts[1] if len(parts) >= 3 else get_default_engine(ch.id))
         try:
@@ -6865,7 +7056,7 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        branch = create_branch(task, engine, cwd)
+        branch = create_branch(task, engine, cwd, agent_id=ch.id)
     except Exception as e:
         await ch.send(f"❌ Branch creation failed: `{e}`")
         remove_worktree(_canonical_repo(cwd), ch.id)
