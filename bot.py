@@ -44,6 +44,7 @@ REVIEW_MESSAGE_LIMIT = 1900
 REVIEW_CODE_CHUNK_LIMIT = 600
 PULL_SUMMARY_COMMIT_LIMIT = 5
 PULL_SUMMARY_FILE_LIMIT = 30
+GIT_NETWORK_TIMEOUT = 300  # fetch/pull deadline; engine turns themselves do not expire
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "claude")
 
@@ -72,7 +73,6 @@ CLAUDE_REASONING_OPTIONS = (*CLAUDE_REASONING_LEVELS, "default")
 CODEX_REASONING_OPTIONS = (*CODEX_REASONING_LEVELS, "default")
 KIMI_REASONING_OPTIONS = (*KIMI_REASONING_LEVELS, "default")
 
-ENGINE_TIMEOUT = int(os.getenv("ENGINE_TIMEOUT", "300"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
 PLAN_CONTEXT_MAX_CHARS = int(os.getenv("PLAN_CONTEXT_MAX_CHARS", "12000"))
 
@@ -1189,13 +1189,19 @@ def build_resume_prompt(
         status_lines = get_status_porcelain(cwd)
         status_known = True
 
+    reason = str(ctx.get("reason") or "resume").strip()
+    timeout_resume = reason.startswith("timeout")
     lines = [
-        "You are resuming after a timeout. The engine may have lost context.",
+        (
+            "You are resuming after an interrupted run. The engine may have lost context."
+            if timeout_resume
+            else "You are continuing a prior run with saved context."
+        ),
         "Use the saved context below to continue accurately.",
         f"Original task: {ctx.get('task', '').strip()}",
         f"Repo: {ctx.get('cwd', '').strip()}",
         f"Branch: {ctx.get('branch', '').strip()}",
-        f"Saved diff at timeout: {saved_diff}" if saved_diff else "",
+        f"Saved diff: {saved_diff}" if saved_diff else "",
         f"Current diff now: {current_diff}" if current_diff else "",
     ]
     if snapshot:
@@ -1218,7 +1224,7 @@ def build_resume_prompt(
     if output_tail.strip():
         lines.append("Last output (tail; may not reflect applied changes):")
         lines.append(output_tail.strip())
-    lines.append("Important: timeout output can claim changes that did not persist. "
+    lines.append("Important: prior output can claim changes that did not persist. "
                  "Treat the repo status above as the source of truth.")
     lines.append("Current request:")
     lines.append(task.strip())
@@ -3295,41 +3301,21 @@ async def login_kimi(ch: discord.TextChannel) -> None:
 STATUS_REFRESH = 5  # seconds between live status updates
 
 
-async def _wait_with_inactivity_timeout(
-    awaitable,
-    activity_event: asyncio.Event,
-    timeout: float,
-) -> None:
-    """Wait for completion, resetting the timeout whenever process output arrives."""
-    completion_task = asyncio.ensure_future(awaitable)
-    try:
-        while not completion_task.done():
-            activity_event.clear()
-            activity_task = asyncio.create_task(activity_event.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    {completion_task, activity_task},
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            finally:
-                if not activity_task.done():
-                    activity_task.cancel()
-                await asyncio.gather(activity_task, return_exceptions=True)
-
-            if completion_task in done:
-                break
-            if activity_task in done or activity_event.is_set():
-                continue
-            if completion_task.done():
-                break
-            raise asyncio.TimeoutError
-
-        await completion_task
-    finally:
-        if not completion_task.done():
-            completion_task.cancel()
-            await asyncio.gather(completion_task, return_exceptions=True)
+async def _stream_status_heartbeat(status_msg, label: str, start: float, render_tail) -> None:
+    """Keep a quiet engine run visibly alive without imposing a deadline."""
+    while True:
+        await asyncio.sleep(STATUS_REFRESH)
+        elapsed = int(time.time() - start)
+        tail = strip_ansi(render_tail()).strip()
+        if len(tail) > 1400:
+            tail = tail[-1400:]
+        try:
+            await status_msg.edit(
+                content=f"⏳ {label} working... ({elapsed}s)\n"
+                f"```\n{tail or '(waiting for output...)'}\n```"
+            )
+        except discord.HTTPException:
+            pass
 
 
 async def _run_with_live_output(
@@ -3354,7 +3340,6 @@ async def _run_with_live_output(
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
     live_chunks: list[bytes] = []
-    activity_event = asyncio.Event()
     done = asyncio.Event()
     start = time.time()
 
@@ -3363,7 +3348,6 @@ async def _run_with_live_output(
             chunk = await proc.stdout.read(4096)
             if not chunk:
                 break
-            activity_event.set()
             stdout_chunks.append(chunk)
             live_chunks.append(chunk)
 
@@ -3372,7 +3356,6 @@ async def _run_with_live_output(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
-            activity_event.set()
             stderr_chunks.append(chunk)
             live_chunks.append(chunk)
 
@@ -3403,29 +3386,18 @@ async def _run_with_live_output(
             except discord.HTTPException:
                 pass
 
-    timed_out = False
     try:
         io_task = asyncio.gather(read_stdout(), read_stderr(), proc.wait())
         update_task = asyncio.create_task(live_update())
-        await _wait_with_inactivity_timeout(io_task, activity_event, ENGINE_TIMEOUT)
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        partial = b"".join(stdout_chunks).decode(errors="replace")
-        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
+        await io_task
     finally:
         done.set()
         update_task.cancel()
+        await asyncio.gather(update_task, return_exceptions=True)
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            if timed_out:
-                await status_msg.edit(
-                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
-                    f"({elapsed}s total) — auto-resuming..."
-                )
-            else:
-                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -3462,24 +3434,24 @@ async def _run_claude_streaming(
     tool_activity: list[str] = []
     final_result: str | None = None
     stderr_chunks: list[bytes] = []
-    activity_event = asyncio.Event()
     result_usage: dict = {}
     start = time.time()
-    last_edit_time = 0.0
-    last_content = ""
+
+    def render_status_tail() -> str:
+        display = "".join(accumulated_text)
+        tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
+        return tool_line + display
 
     async def read_stderr() -> None:
         while True:
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
-            activity_event.set()
             stderr_chunks.append(chunk)
 
     async def stream_stdout() -> None:
-        nonlocal final_result, last_edit_time, last_content
+        nonlocal final_result
         async for raw_line in proc.stdout:
-            activity_event.set()
             line_str = raw_line.decode(errors="replace").strip()
             if not line_str:
                 continue
@@ -3507,46 +3479,18 @@ async def _run_claude_streaming(
                         "cache_write": usage_data.get("cache_creation_input_tokens", 0),
                     })
 
-            now = time.time()
-            if now - last_edit_time >= STATUS_REFRESH:
-                elapsed = int(now - start)
-                display = "".join(accumulated_text)
-                tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
-                tail = strip_ansi(tool_line + display).strip()
-                if len(tail) > 1400:
-                    tail = tail[-1400:]
-                new_content = f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(starting...)'}\n```"
-                if new_content != last_content:
-                    try:
-                        await status_msg.edit(content=new_content)
-                        last_content = new_content
-                        last_edit_time = now
-                    except discord.HTTPException:
-                        pass
-
-    timed_out = False
+    status_task = asyncio.create_task(
+        _stream_status_heartbeat(status_msg, label, start, render_status_tail)
+    )
     try:
-        await _wait_with_inactivity_timeout(
-            asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
-            activity_event,
-            ENGINE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        partial = final_result or "".join(accumulated_text)
-        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
+        await asyncio.gather(stream_stdout(), read_stderr(), proc.wait())
     finally:
+        status_task.cancel()
+        await asyncio.gather(status_task, return_exceptions=True)
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            if timed_out:
-                await status_msg.edit(
-                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
-                    f"({elapsed}s total) — auto-resuming..."
-                )
-            else:
-                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -3641,13 +3585,16 @@ async def _run_codex_streaming(
     activity: list[str] = []
     errors: list[str] = []
     stderr_chunks: list[bytes] = []
-    activity_event = asyncio.Event()
     result_usage: dict[str, int] = {}
     codex_thread_id = ""
     usage_accumulated = False
     start = time.time()
-    last_edit_time = 0.0
-    last_content = ""
+
+    def render_status_tail() -> str:
+        display = "\n\n".join(agent_messages).strip()
+        activity_line = f"[activity: {' | '.join(activity[-5:])}]\n" if activity else ""
+        thread_line = f"[thread: {codex_thread_id}]\n" if codex_thread_id else ""
+        return thread_line + activity_line + display
 
     def remember_thread_id(value: object | None) -> None:
         nonlocal codex_thread_id
@@ -3675,13 +3622,11 @@ async def _run_codex_streaming(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
-            activity_event.set()
             stderr_chunks.append(chunk)
 
     async def stream_stdout() -> None:
-        nonlocal last_edit_time, last_content, result_usage
+        nonlocal result_usage
         async for raw_line in proc.stdout:
-            activity_event.set()
             line_str = raw_line.decode(errors="replace").strip()
             if not line_str:
                 continue
@@ -3728,49 +3673,19 @@ async def _run_codex_streaming(
                 if message:
                     errors.append(message)
 
-            now = time.time()
-            if now - last_edit_time >= STATUS_REFRESH:
-                elapsed = int(now - start)
-                display = "\n\n".join(agent_messages).strip()
-                activity_line = f"[activity: {' | '.join(activity[-5:])}]\n" if activity else ""
-                thread_line = f"[thread: {codex_thread_id}]\n" if codex_thread_id else ""
-                tail = strip_ansi(thread_line + activity_line + display).strip()
-                if len(tail) > 1400:
-                    tail = tail[-1400:]
-                new_content = f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(starting...)'}\n```"
-                if new_content != last_content:
-                    try:
-                        await status_msg.edit(content=new_content)
-                        last_content = new_content
-                        last_edit_time = now
-                    except discord.HTTPException:
-                        pass
-
-    timed_out = False
+    status_task = asyncio.create_task(
+        _stream_status_heartbeat(status_msg, label, start, render_status_tail)
+    )
     try:
-        await _wait_with_inactivity_timeout(
-            asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
-            activity_event,
-            ENGINE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        snapshot_usage()
-        partial = "\n\n".join(agent_messages).strip() or "\n".join(raw_lines)
-        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
+        await asyncio.gather(stream_stdout(), read_stderr(), proc.wait())
     finally:
+        status_task.cancel()
+        await asyncio.gather(status_task, return_exceptions=True)
         snapshot_usage()
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            if timed_out:
-                await status_msg.edit(
-                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
-                    f"({elapsed}s total) — auto-resuming..."
-                )
-            else:
-                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -3839,12 +3754,14 @@ async def _run_kimi_streaming(
     tool_activity: list[str] = []
     final_result: str | None = None
     stderr_chunks: list[bytes] = []
-    activity_event = asyncio.Event()
     kimi_session_id = ""
     usage_accumulated = False
     start = time.time()
-    last_edit_time = 0.0
-    last_content = ""
+
+    def render_status_tail() -> str:
+        display = "".join(accumulated_text)
+        tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
+        return tool_line + display
 
     def snapshot_usage() -> None:
         nonlocal usage_accumulated
@@ -3859,13 +3776,11 @@ async def _run_kimi_streaming(
             chunk = await proc.stderr.read(4096)
             if not chunk:
                 break
-            activity_event.set()
             stderr_chunks.append(chunk)
 
     async def stream_stdout() -> None:
-        nonlocal final_result, kimi_session_id, last_edit_time, last_content
+        nonlocal final_result, kimi_session_id
         async for raw_line in proc.stdout:
-            activity_event.set()
             line_str = raw_line.decode(errors="replace").strip()
             if not line_str:
                 continue
@@ -3894,48 +3809,19 @@ async def _run_kimi_streaming(
                 if isinstance(session_id, str) and session_id.strip():
                     kimi_session_id = session_id.strip()
 
-            now = time.time()
-            if now - last_edit_time >= STATUS_REFRESH:
-                elapsed = int(now - start)
-                display = "".join(accumulated_text)
-                tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
-                tail = strip_ansi(tool_line + display).strip()
-                if len(tail) > 1400:
-                    tail = tail[-1400:]
-                new_content = f"⏳ {label} working... ({elapsed}s)\n```\n{tail or '(starting...)'}\n```"
-                if new_content != last_content:
-                    try:
-                        await status_msg.edit(content=new_content)
-                        last_content = new_content
-                        last_edit_time = now
-                    except discord.HTTPException:
-                        pass
-
-    timed_out = False
+    status_task = asyncio.create_task(
+        _stream_status_heartbeat(status_msg, label, start, render_status_tail)
+    )
     try:
-        await _wait_with_inactivity_timeout(
-            asyncio.gather(stream_stdout(), read_stderr(), proc.wait()),
-            activity_event,
-            ENGINE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        snapshot_usage()
-        partial = final_result or "".join(accumulated_text)
-        raise subprocess.TimeoutExpired(cmd, ENGINE_TIMEOUT, output=partial)
+        await asyncio.gather(stream_stdout(), read_stderr(), proc.wait())
     finally:
+        status_task.cancel()
+        await asyncio.gather(status_task, return_exceptions=True)
         snapshot_usage()
         running_procs.pop(ch.id, None)
         elapsed = int(time.time() - start)
         try:
-            if timed_out:
-                await status_msg.edit(
-                    content=f"⏰ {label} inactive for {ENGINE_TIMEOUT}s "
-                    f"({elapsed}s total) — auto-resuming..."
-                )
-            else:
-                await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
         except discord.HTTPException:
             pass
 
@@ -4069,9 +3955,6 @@ async def run_kimi(
     return await _run_kimi_streaming(cmd, ch, "Kimi Code", cwd=cwd, env=env)
 
 
-MAX_AUTO_CONTINUES = 3  # max times to auto-resume after timeout
-
-
 async def run_engine(
     engine: str,
     task: str,
@@ -4109,63 +3992,7 @@ async def run_engine(
         # Prevent stale usage from a previous run leaking into this turn/session.
         channel_last_usage[ch.id] = {"engine": engine}
 
-        output: str | None = None
-        timeout_output: object | None = None
-        try:
-            output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
-        except subprocess.TimeoutExpired as e:
-            if stop_event and stop_event.is_set():
-                return "(stopped)"
-            timeout_output = getattr(e, "output", None)
-            save_resume_context(ch.id, cwd, engine, raw_task, getattr(e, "output", None), reason="timeout")
-            # Auto-continue: resume the engine up to MAX_AUTO_CONTINUES times
-            for attempt in range(1, MAX_AUTO_CONTINUES + 1):
-                if stop_event and stop_event.is_set():
-                    return "(stopped)"
-                auto_commit(0, cwd)  # save any partial work
-                await ch.send(
-                    f"⏳ No engine output for {ENGINE_TIMEOUT}s — saved context and "
-                    f"auto-continuing ({attempt}/{MAX_AUTO_CONTINUES})..."
-                )
-                try:
-                    resume_task = build_resume_prompt("continue where you left off", ch.id, cwd, engine)
-                    output = await runner(
-                        resume_task,
-                        ch,
-                        resume=True,
-                        cwd=cwd,
-                        runtime_config=run_config,
-                    )
-                    break
-                except subprocess.TimeoutExpired as e2:
-                    timeout_output = getattr(e2, "output", None)
-                    save_resume_context(ch.id, cwd, engine, raw_task, getattr(e2, "output", None), reason="timeout")
-                    continue
-            if output is None:
-                head_before = _head_commit_snapshot(cwd).get("sha")
-                auto_commit(0, cwd)
-                auto_commit_info = _head_commit_snapshot(cwd)
-                if head_before:
-                    auto_commit_info["created"] = auto_commit_info.get("sha") != head_before
-                save_unfinished_task_snapshot(
-                    ch.id,
-                    cwd,
-                    engine,
-                    raw_task,
-                    timeout_output,
-                    runtime_config=run_config,
-                    auto_commit=auto_commit_info,
-                )
-                await ch.send(
-                    f"⏰ Still not finished after {MAX_AUTO_CONTINUES} retries. "
-                    "Saved an unfinished session snapshot. "
-                    "Send a follow-up to continue manually, `resume` to reopen it later, "
-                    "or `review`/`done` to inspect what's there."
-                )
-                return "(timed out — partial work auto-committed)"
-
-            if stop_event and stop_event.is_set():
-                return "(stopped)"
+        output = await runner(task, ch, resume, images, cwd=cwd, runtime_config=run_config)
 
         if stop_event and stop_event.is_set():
             return "(stopped)"
@@ -4800,8 +4627,8 @@ Type follow-ups freely — engine keeps context
 `switch <branch|N>` — save & switch branch (creates if new)
 `cwd <n>` — save & switch repo mid-session
 `diff` — quick raw peek · `review` — major changes (before/after/why) · `undo` — discard uncommitted changes
-`resume` — reopen a saved unfinished timeout session · `resume show` — inspect it
-`context clear` — forget saved timeout context, unfinished snapshot, and queued follow-ups (`resume clear` / `clear context`)
+`resume` — reopen a saved unfinished recovery session · `resume show` — inspect it
+`context clear` — forget saved resume context, unfinished snapshot, and queued follow-ups (`resume clear` / `clear context`)
 
 **Ending a session:**
 `done` — show descriptive per-file summary + push prompt
@@ -4824,7 +4651,7 @@ HELP_TEXT_2 = """**Branches:**
 `switch|branch switch <branch|N>` — switch branch (auto-commit if in session)
 
 **Recovery:**
-`resume` — reopen saved unfinished timeout session · `resume show` — inspect it
+`resume` — reopen saved unfinished recovery session · `resume show` — inspect it
 `recover` — list orphaned branches · `recover <id>` — resume
 `recover drop <id>` — delete orphaned branch
 
@@ -5044,7 +4871,7 @@ async def _send_restore_notice():
         saved_model = str(snapshot.get("model") or "?").strip() or "?"
         saved_branch = str(snapshot.get("branch") or "?").strip() or "?"
         await ch.send(
-            "🧩 Saved unfinished timeout session found.\n"
+            "🧩 Saved unfinished recovery session found.\n"
             f"Engine: `{saved_engine}` · Model: `{saved_model}`\n"
             f"Branch: `{saved_branch}`\n"
             "Use `resume` to reopen it or `resume show` to inspect the saved snapshot."
@@ -6018,7 +5845,7 @@ async def on_message(message: discord.Message):
             await ch.send("❌ No base branch found to pull.")
             return
         before_rev = _rev_parse_head(cwd)
-        pull_timeout = max(60, ENGINE_TIMEOUT)
+        pull_timeout = GIT_NETWORK_TIMEOUT
         await ch.send(f"⏳ Pulling `{branch}` from remote...")
         try:
             fetch = run_git(["git", "fetch", "origin", branch], cwd, timeout=pull_timeout)

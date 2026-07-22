@@ -52,7 +52,7 @@ Required `.env` values:
 Important optional values:
 
 - Branch settings: `BRANCH_PREFIX`, `MAIN_BRANCH`, `DEV_BRANCH`, `PROTECTED_BRANCHES`
-- Engine defaults: `DEFAULT_ENGINE`, `ENGINE_TIMEOUT` (seconds without engine output before auto-resume)
+- Engine defaults: `DEFAULT_ENGINE`; engine turns run until the CLI exits or the user sends `stop`
 - Context persistence: `CONTEXT_MAX_CHARS`, `PLAN_CONTEXT_MAX_CHARS`
 - Claude settings: `CLAUDE_MODEL`, `CLAUDE_REASONING_EFFORT`, `CLAUDE_ALLOWED_TOOLS`, `CLAUDE_DENIED_TOOLS`
 - Codex settings: `CODEX_MODEL`, `CODEX_REASONING_EFFORT`
@@ -95,8 +95,8 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 - A content conflict keeps the source session open and syncs the latest target into only that agent worktree for a follow-up resolution.
 - Active sessions are tracked in `active_sessions`; running processes and cancellation state are tracked separately.
 - Follow-up prompts continue the prior engine session using Claude resume, Kimi `-c` continue, or Codex resume.
-- If a run times out, the bot saves resume context and automatically retries up to `MAX_AUTO_CONTINUES = 3`.
-- If those retries are exhausted, the bot also persists an unfinished-session snapshot so `resume` can reopen the saved branch/worktree and restore the session state.
+- Engine runs have no inactivity deadline. Quiet, long-running tasks keep running and update their Discord status until the CLI exits or the user sends `stop`.
+- Legacy unfinished-session snapshots remain readable so `resume` can reopen a previously saved branch/worktree and restore the session state.
 - While a run is still active, `add:` and `queue:` save follow-up work for automatic resume after the current turn.
 - Planning mode is persisted per channel:
   - `plan: <task>` stores planning output without editing files.
@@ -115,7 +115,7 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 - `usage_stats`
 - `channels` and `last_active_channel`
 - saved resume contexts
-- saved unfinished timeout session snapshots
+- saved unfinished recovery session snapshots
 - queued follow-up commands
 - saved planning contexts
 

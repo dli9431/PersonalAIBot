@@ -88,8 +88,7 @@ PROTECTED_BRANCHES=main,dev
 
 # Engine defaults
 DEFAULT_ENGINE=claude    # or codex, kimi
-ENGINE_TIMEOUT=300       # seconds without engine output before auto-resume
-CONTEXT_MAX_CHARS=4000   # max chars saved for timeout resume context
+CONTEXT_MAX_CHARS=4000   # max chars saved for resume context
 PLAN_CONTEXT_MAX_CHARS=12000  # max chars saved for plan + plan do/plan: do context
 
 # Claude Code settings
@@ -111,6 +110,9 @@ KIMI_REASONING_EFFORT=
 ```
 
 > **Note:** Use absolute paths (e.g. `/home/you/code`) not `~/code` in `.env`.
+
+Engine turns do not expire when output is quiet. They run until the engine CLI exits or you send
+`stop`; separate Discord channels/threads can continue running other agents concurrently.
 
 ### 5. Run
 
@@ -243,9 +245,9 @@ pr main               → open a GitHub PR targeting main
 | `undo` | Discard uncommitted working-tree changes in the active session |
 | `switch <branch\|N>` | Switch branches (auto-commit if in session) |
 | `cwd <n>` | Save & switch active repo (from GIT_PROJECTS) |
-| `resume` | Reopen the saved unfinished timeout session for this channel |
-| `resume show` | Inspect the saved unfinished timeout snapshot without reopening it |
-| `context clear` | Forget saved timeout/resume context, unfinished timeout snapshot, and queued follow-ups (`resume clear` / `clear context` aliases) |
+| `resume` | Reopen a saved unfinished recovery session for this channel |
+| `resume show` | Inspect the saved unfinished recovery snapshot without reopening it |
+| `context clear` | Forget saved resume context, unfinished snapshot, and queued follow-ups (`resume clear` / `clear context` aliases) |
 | `plan show` | Show saved plan context for this channel |
 | `plan clear` | Clear saved plan context without executing it (`clear plan` alias) |
 | `abort` | Discard all changes immediately |
@@ -296,8 +298,8 @@ pr main               → open a GitHub PR targeting main
 
 | Command | Description |
 |---------|-------------|
-| `resume` | Reopen the saved unfinished timeout session for this channel |
-| `resume show` | Show the saved unfinished timeout snapshot |
+| `resume` | Reopen a saved unfinished recovery session for this channel |
+| `resume show` | Show the saved unfinished recovery snapshot |
 | `recover` | List orphaned feature branches |
 | `recover <id>` | Resume an orphaned branch as a session |
 | `recover drop <id>` | Delete an orphaned branch |
