@@ -57,7 +57,10 @@ Codex sandbox and approval settings are read from `~/.codex/config.toml`, not fr
 ## Important Runtime Behavior
 
 - Sessions run in per-channel git worktrees under `<repo>/.worktrees/ch-<channel_id>`.
-- Feature branches use the form `{BRANCH_PREFIX}/{engine}/{slug}-{timestamp}`.
+- Feature branches include `{BRANCH_PREFIX}`, engine, task slug, channel/thread identity, and a unique nonce.
+- Separate Discord channels/threads run as concurrent agents in isolated worktrees.
+- Shared-target merges are serialized in disposable integration worktrees, leaving the canonical checkout and agent worktrees untouched.
+- If integration finds overlapping edits, only the source agent worktree is synced into a conflict state for that agent to resolve.
 - The bot never intends to work directly on `main` or `dev`; it creates feature branches first.
 - Follow-up messages continue the current engine session with Claude resume, Kimi `-c` continue, or Codex resume.
 - While a run is active, `add:` / `queue:` stores follow-up instructions and resumes automatically after the current turn.
@@ -79,6 +82,7 @@ The bot supports more than simple task execution. Important command groups:
 - Recovery and workflow: `recover`, `recover drop`, `merge`, `pr`
 - Runtime config: `engine`, `engine global`, `claude models`, `codex models`, `kimi models`, `claude model`, `codex model`, `kimi model`, reasoning commands
 - Diagnostics: `status`, `usage`, `doctor`, `help`, `restart`
+- Multi-agent coordination: `agents`, `agent status`, `sync [target]`
 
 Engine logins: `claude login`, `codex login`, `kimi login` (`login both` covers Claude + Codex only).
 

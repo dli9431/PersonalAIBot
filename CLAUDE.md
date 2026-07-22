@@ -89,8 +89,10 @@ Runtime config is persisted in `.bot_state.json` and can diverge from `.env` bec
 
 ## Key Runtime Behavior
 
-- Each Discord channel gets its own git worktree under `<repo>/.worktrees/ch-<channel_id>`.
-- Feature branches are created as `{BRANCH_PREFIX}/{engine}/{slug}-{timestamp}`.
+- Each Discord channel or thread is an independent agent with its own git worktree under `<repo>/.worktrees/ch-<channel_id>`; agents in different channels can run concurrently.
+- Feature branches include the channel/thread identity and a nanosecond nonce so simultaneous agents cannot collide.
+- Merges into one repository are serialized and run in disposable detached integration worktrees; the canonical checkout and agent worktrees are not used for integration.
+- A content conflict keeps the source session open and syncs the latest target into only that agent worktree for a follow-up resolution.
 - Active sessions are tracked in `active_sessions`; running processes and cancellation state are tracked separately.
 - Follow-up prompts continue the prior engine session using Claude resume, Kimi `-c` continue, or Codex resume.
 - If a run times out, the bot saves resume context and automatically retries up to `MAX_AUTO_CONTINUES = 3`.
@@ -148,6 +150,7 @@ Session flow:
 - `add: <instruction>` / `queue: <instruction>`
 - `diff`
 - `review` (detailed before/after/why)
+- `sync [target]`
 - `done` (descriptive per-file summary + push prompt)
 - `yes` / `approve` / `push` / `lgtm` / `ship it`
 - `skip`
@@ -189,6 +192,7 @@ Runtime configuration and diagnostics:
 - `usage`
 - `status`
 - `doctor`
+- `agents` / `agent status`
 - `help`
 - `restart`
 - `claude login`, `codex login`, `openai login`, `kimi login`, `login both`
