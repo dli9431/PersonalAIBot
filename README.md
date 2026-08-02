@@ -408,6 +408,13 @@ bash /path/to/PersonalAIBot/start.sh
 # tmux attach -t bot  to return
 ```
 
+From the bot terminal, type `shutdown` (or `exit` / `quit`) and press Enter,
+or press Ctrl+C once. For a detached tmux session, either attach first or run:
+
+```bash
+tmux send-keys -t bot shutdown Enter
+```
+
 ### Keep WSL alive after closing terminal (Windows only)
 
 Create `%USERPROFILE%\.wslconfig` on Windows:

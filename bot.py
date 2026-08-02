@@ -19,6 +19,7 @@ import logging
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -6970,24 +6971,125 @@ async def on_message(message: discord.Message):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-async def stdin_listener():
-    """Read stdin in a thread, close the bot when user types 'exit' or 'quit'."""
+async def _stop_running_processes() -> None:
+    """Ask active engine runs to stop, then terminate any remaining processes."""
+    for stop_event in list(stop_events.values()):
+        stop_event.set()
+
+    procs = {
+        proc.pid: proc
+        for proc in list(running_procs.values())
+        if proc.returncode is None
+    }
+    for proc in procs.values():
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+
+    if not procs:
+        return
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(proc.wait() for proc in procs.values()),
+                return_exceptions=True,
+            ),
+            timeout=5,
+        )
+    except asyncio.TimeoutError:
+        for proc in procs.values():
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+        await asyncio.gather(
+            *(proc.wait() for proc in procs.values()),
+            return_exceptions=True,
+        )
+
+
+async def _shutdown_bot(reason: str) -> None:
+    """Stop child processes and close Discord exactly once."""
+    print(f"🛑 Shutting down ({reason})...")
+    await _stop_running_processes()
+    if not client.is_closed():
+        await client.close()
+
+
+async def stdin_listener(request_shutdown) -> None:
+    """Read terminal commands without occupying asyncio's thread pool."""
     loop = asyncio.get_running_loop()
-    while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:  # EOF (e.g. piped input ended)
-            break
-        cmd = line.strip().lower()
-        if cmd in ("exit", "quit", "shutdown"):
-            print("🛑 Shutting down...")
-            await client.close()
-            break
+    try:
+        stdin_fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+
+    chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    def stdin_ready() -> None:
+        try:
+            data = os.read(stdin_fd, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            loop.remove_reader(stdin_fd)
+        chunks.put_nowait(data or None)
+
+    try:
+        loop.add_reader(stdin_fd, stdin_ready)
+    except (NotImplementedError, OSError, PermissionError, ValueError):
+        return
+
+    encoding = sys.stdin.encoding or "utf-8"
+    buffered = bytearray()
+    try:
+        while True:
+            data = await chunks.get()
+            if data is None:
+                break
+            buffered.extend(data)
+            while b"\n" in buffered:
+                raw_line, _, remainder = buffered.partition(b"\n")
+                buffered = bytearray(remainder)
+                cmd = raw_line.decode(encoding, errors="replace").strip().lower()
+                if cmd in ("exit", "quit", "shutdown"):
+                    request_shutdown("terminal command")
+                    return
+    finally:
+        loop.remove_reader(stdin_fd)
 
 
 async def main():
+    loop = asyncio.get_running_loop()
+    shutdown_task: asyncio.Task | None = None
+
+    def request_shutdown(reason: str) -> None:
+        nonlocal shutdown_task
+        if shutdown_task is None:
+            shutdown_task = loop.create_task(_shutdown_bot(reason))
+
+    registered_signals: list[signal.Signals] = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown, sig.name)
+            registered_signals.append(sig)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     async with client:
-        client.loop.create_task(stdin_listener())
-        await client.start(DISCORD_TOKEN)
+        stdin_task = loop.create_task(stdin_listener(request_shutdown))
+        try:
+            await client.start(DISCORD_TOKEN)
+        finally:
+            stdin_task.cancel()
+            await asyncio.gather(stdin_task, return_exceptions=True)
+            for sig in registered_signals:
+                loop.remove_signal_handler(sig)
+            if shutdown_task is not None:
+                await asyncio.gather(shutdown_task, return_exceptions=True)
     if _restart_on_close:
         print("🔄 Restarting process...")
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -6998,6 +7100,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    finally:
-        # Suppress "Event loop is closed" noise from subprocess transport __del__
-        sys.stderr = open(os.devnull, "w")
