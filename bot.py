@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Discord → Claude Code / Codex CLI / Kimi Code CLI → Git bridge bot.
+Discord → Claude Code / Codex CLI / Kimi Code CLI / Antigravity → Git bridge bot.
 
 Supports iterative sessions: send a task, review changes, send follow-ups,
 and only commit when you're satisfied. Uses --resume (Claude Code), -c
-(Kimi Code), and explicit Codex thread resumes for multi-turn context.
+(Kimi Code and Antigravity), and explicit Codex thread resumes for multi-turn context.
 
 Designed to run on Linux (including WSL2).
 
@@ -67,12 +67,18 @@ CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower()
 KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-code/k3")
 KIMI_REASONING_EFFORT = os.getenv("KIMI_REASONING_EFFORT", "").strip().lower() or None
 
+# Google Antigravity CLI (agy)
+ANTIGRAVITY_MODEL = os.getenv("ANTIGRAVITY_MODEL", "gemini-3.7-flash-high")
+ANTIGRAVITY_REASONING_EFFORT = os.getenv("ANTIGRAVITY_REASONING_EFFORT", "").strip().lower() or None
+
 CLAUDE_REASONING_LEVELS = ("low", "medium", "high")
 CODEX_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
 KIMI_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
+ANTIGRAVITY_REASONING_LEVELS = ("low", "medium", "high")
 CLAUDE_REASONING_OPTIONS = (*CLAUDE_REASONING_LEVELS, "default")
 CODEX_REASONING_OPTIONS = (*CODEX_REASONING_LEVELS, "default")
 KIMI_REASONING_OPTIONS = (*KIMI_REASONING_LEVELS, "default")
+ANTIGRAVITY_REASONING_OPTIONS = (*ANTIGRAVITY_REASONING_LEVELS, "default")
 
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4000"))
 PLAN_CONTEXT_MAX_CHARS = int(os.getenv("PLAN_CONTEXT_MAX_CHARS", "12000"))
@@ -458,6 +464,8 @@ def _normalize_engine_name(engine: object | None) -> str:
             return "codex"
         if normalized == "kimi":
             return "kimi"
+        if normalized == "antigravity":
+            return "antigravity"
     return "claude"
 
 
@@ -468,6 +476,8 @@ def _engine_name_from_token(token: str) -> str:
         return "codex"
     if normalized in ("kimi", "km"):
         return "kimi"
+    if normalized in ("antigravity", "agy"):
+        return "antigravity"
     return "claude"
 
 
@@ -487,9 +497,11 @@ def _global_runtime_config() -> dict[str, str | None]:
         "claude_model": CLAUDE_MODEL,
         "codex_model": CODEX_MODEL,
         "kimi_model": KIMI_MODEL,
+        "antigravity_model": ANTIGRAVITY_MODEL,
         "claude_reasoning_effort": CLAUDE_REASONING_EFFORT,
         "codex_reasoning_effort": CODEX_REASONING_EFFORT,
         "kimi_reasoning_effort": KIMI_REASONING_EFFORT,
+        "antigravity_reasoning_effort": ANTIGRAVITY_REASONING_EFFORT,
     }
 
 
@@ -516,6 +528,10 @@ def _coerce_runtime_config(
         config.get("kimi_model"),
         str(base.get("kimi_model") or KIMI_MODEL),
     )
+    base["antigravity_model"] = _normalize_model_name(
+        config.get("antigravity_model"),
+        str(base.get("antigravity_model") or ANTIGRAVITY_MODEL),
+    )
 
     if "claude_reasoning_effort" in config:
         base["claude_reasoning_effort"] = _normalize_reasoning_effort(
@@ -529,19 +545,26 @@ def _coerce_runtime_config(
         base["kimi_reasoning_effort"] = _normalize_reasoning_effort(
             config.get("kimi_reasoning_effort")
         )
+    if "antigravity_reasoning_effort" in config:
+        base["antigravity_reasoning_effort"] = _normalize_reasoning_effort(
+            config.get("antigravity_reasoning_effort")
+        )
     return base
 
 
 def _apply_global_runtime_config(config: dict[str, str | None]) -> None:
-    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, KIMI_MODEL
+    global DEFAULT_ENGINE, CLAUDE_MODEL, CODEX_MODEL, KIMI_MODEL, ANTIGRAVITY_MODEL
     global CLAUDE_REASONING_EFFORT, CODEX_REASONING_EFFORT, KIMI_REASONING_EFFORT
+    global ANTIGRAVITY_REASONING_EFFORT
     DEFAULT_ENGINE = _normalize_engine_name(config.get("default_engine"))
     CLAUDE_MODEL = _normalize_model_name(config.get("claude_model"), CLAUDE_MODEL)
     CODEX_MODEL = _normalize_model_name(config.get("codex_model"), CODEX_MODEL)
     KIMI_MODEL = _normalize_model_name(config.get("kimi_model"), KIMI_MODEL)
+    ANTIGRAVITY_MODEL = _normalize_model_name(config.get("antigravity_model"), ANTIGRAVITY_MODEL)
     CLAUDE_REASONING_EFFORT = _normalize_reasoning_effort(config.get("claude_reasoning_effort"))
     CODEX_REASONING_EFFORT = _normalize_reasoning_effort(config.get("codex_reasoning_effort"))
     KIMI_REASONING_EFFORT = _normalize_reasoning_effort(config.get("kimi_reasoning_effort"))
+    ANTIGRAVITY_REASONING_EFFORT = _normalize_reasoning_effort(config.get("antigravity_reasoning_effort"))
 
 
 def get_runtime_config(ch_id: int | None = None) -> dict[str, str | None]:
@@ -1317,6 +1340,23 @@ def check_kimi_cli() -> tuple[bool, str]:
         return False, "not installed — install Kimi Code CLI"
 
 
+def check_antigravity_cli() -> tuple[bool, str]:
+    """Check if agy CLI is installed and has auth configured. Returns (ok, status)."""
+    try:
+        r = subprocess.run(["agy", "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False, "not installed"
+        version = (r.stdout or r.stderr).strip().splitlines()[0]
+        if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            return True, f"{version} (API key)"
+        token = pathlib.Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        if token.exists():
+            return True, f"{version} (OAuth)"
+        return True, f"{version} (⚠️  no auth — run `agy` once interactively to sign in)"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, "not installed — install Google Antigravity CLI (agy)"
+
+
 def _format_reset_at(ts: object) -> str | None:
     try:
         value = float(ts)
@@ -1609,6 +1649,9 @@ def parse_engine_and_task(content: str, default_engine: str) -> tuple[str, str]:
     for prefix in ("kimi:", "km:"):
         if lower.startswith(prefix):
             return "kimi", content[len(prefix):].strip()
+    for prefix in ("antigravity:", "agy:"):
+        if lower.startswith(prefix):
+            return "antigravity", content[len(prefix):].strip()
     return _normalize_engine_name(default_engine), content
 
 
@@ -1623,7 +1666,11 @@ def get_model_for_engine(
 ) -> str:
     config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
     engine_name = _normalize_engine_name(engine)
-    key = {"codex": "codex_model", "kimi": "kimi_model"}.get(engine_name, "claude_model")
+    key = {
+        "codex": "codex_model",
+        "kimi": "kimi_model",
+        "antigravity": "antigravity_model",
+    }.get(engine_name, "claude_model")
     return str(config[key])
 
 
@@ -1634,9 +1681,11 @@ def get_reasoning_for_engine(
 ) -> str | None:
     config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch_id))
     engine_name = _normalize_engine_name(engine)
-    key = {"codex": "codex_reasoning_effort", "kimi": "kimi_reasoning_effort"}.get(
-        engine_name, "claude_reasoning_effort"
-    )
+    key = {
+        "codex": "codex_reasoning_effort",
+        "kimi": "kimi_reasoning_effort",
+        "antigravity": "antigravity_reasoning_effort",
+    }.get(engine_name, "claude_reasoning_effort")
     value = config.get(key)
     return value if isinstance(value, str) and value else None
 
@@ -1650,6 +1699,8 @@ def get_engine_label(engine: str) -> str:
         return "Codex CLI"
     if engine == "kimi":
         return "Kimi Code"
+    if engine == "antigravity":
+        return "agy"
     return "Claude Code"
 
 
@@ -3026,6 +3077,28 @@ def get_kimi_models() -> list[tuple[str, str | None]]:
         ]
 
 
+def get_antigravity_models() -> list[tuple[str, str | None]]:
+    """Return available Antigravity models as (id, display_name) tuples from `agy models`."""
+    try:
+        r = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            models = []
+            for line in r.stdout.splitlines():
+                parts = [p.strip() for p in line.split("\t")]
+                if len(parts) >= 2 and parts[0]:
+                    models.append((parts[0], parts[1]))
+            if models:
+                return models
+    except Exception:
+        pass
+    return [
+        ("gemini-3.7-flash-high", "Gemini 3.7 Flash (High)"),
+        ("gemini-3.7-flash-low", "Gemini 3.7 Flash (Low)"),
+        ("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"),
+        ("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)"),
+    ]
+
+
 async def get_claude_models() -> list[tuple[str, str]]:
     """Return available Claude models as (id, display_name) tuples from the Anthropic API."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -3114,9 +3187,11 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
         options = CLAUDE_REASONING_OPTIONS
     elif engine == "kimi":
         options = KIMI_REASONING_OPTIONS
+    elif engine == "antigravity":
+        options = ANTIGRAVITY_REASONING_OPTIONS
     else:
         options = CODEX_REASONING_OPTIONS
-    label = {"claude": "Claude", "kimi": "Kimi"}.get(engine, "Codex")
+    label = {"claude": "Claude", "kimi": "Kimi", "antigravity": "agy"}.get(engine, "Codex")
     if token.isdigit():
         index = int(token)
         if index < 1 or index > len(options):
@@ -3138,6 +3213,13 @@ def resolve_reasoning_selector(selector: str, engine: str) -> tuple[str | None, 
         if token not in KIMI_REASONING_LEVELS:
             choices = "`, `".join(KIMI_REASONING_OPTIONS)
             return None, f"Kimi reasoning must be a number `1-{len(KIMI_REASONING_OPTIONS)}` or one of `{choices}`."
+        return token, None
+
+    if engine == "antigravity":
+        token = {"med": "medium"}.get(token, token)
+        if token not in ANTIGRAVITY_REASONING_LEVELS:
+            choices = "`, `".join(ANTIGRAVITY_REASONING_OPTIONS)
+            return None, f"agy reasoning must be a number `1-{len(ANTIGRAVITY_REASONING_OPTIONS)}` or one of `{choices}`."
         return token, None
 
     aliases = {
@@ -3163,6 +3245,8 @@ def format_reasoning_options_numbered(engine: str) -> str:
         options = CLAUDE_REASONING_OPTIONS
     elif engine == "kimi":
         options = KIMI_REASONING_OPTIONS
+    elif engine == "antigravity":
+        options = ANTIGRAVITY_REASONING_OPTIONS
     else:
         options = CODEX_REASONING_OPTIONS
     return "\n".join(f"{idx}. `{level}`" for idx, level in enumerate(options, start=1))
@@ -3833,6 +3917,121 @@ async def _run_kimi_streaming(
         output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail_lines)
     return output
 
+
+async def _run_antigravity_streaming(
+    cmd: list[str],
+    ch: discord.TextChannel,
+    label: str,
+    cwd: str | None = None,
+) -> str:
+    """Run Antigravity (agy) with stream-json output, live-updating Discord as events arrive."""
+    status_msg = await ch.send(f"⚙️ {label} started...")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd or REPO_PATH,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=10 * 1024 * 1024,  # 10MB – prevents "chunk longer than limit" on large JSON lines
+    )
+    running_procs[ch.id] = proc
+
+    accumulated_text: list[str] = []
+    tool_activity: list[str] = []
+    errors: list[str] = []
+    final_result: str | None = None
+    stderr_chunks: list[bytes] = []
+    result_usage: dict[str, int] = {}
+    start = time.time()
+
+    def render_status_tail() -> str:
+        display = "".join(accumulated_text)
+        tool_line = f"[tools: {', '.join(tool_activity[-5:])}]\n" if tool_activity else ""
+        return tool_line + display
+
+    async def read_stderr() -> None:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+
+    async def stream_stdout() -> None:
+        nonlocal final_result
+        async for raw_line in proc.stdout:
+            line_str = raw_line.decode(errors="replace").strip()
+            if not line_str:
+                continue
+            try:
+                event = json.loads(line_str)
+            except json.JSONDecodeError:
+                accumulated_text.append(line_str + "\n")
+                continue
+
+            event_type = event.get("event")
+            if event_type == "step_update":
+                update = event.get("step_update") or {}
+                step_type = update.get("step_type")
+                if step_type == "agent_response":
+                    delta = update.get("text_delta")
+                    if isinstance(delta, str) and delta:
+                        accumulated_text.append(delta)
+                elif step_type == "tool":
+                    name = str(update.get("tool_name") or "").strip()
+                    if name:
+                        tool_activity.append(name)
+                    if update.get("state") == "ERROR":
+                        err_obj = (update.get("tool_info") or {}).get("error") or {}
+                        message = str(err_obj.get("message") or "").strip()
+                        if message:
+                            errors.append(message)
+            elif event_type == "result":
+                result = event.get("result") or {}
+                response = result.get("response")
+                if isinstance(response, str) and response.strip():
+                    final_result = response
+                usage = result.get("usage") or {}
+                if usage:
+                    result_usage.update({
+                        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                        "cache_read": int(usage.get("cache_read_tokens", 0) or 0),
+                        "cache_write": 0,
+                    })
+                status = str(result.get("status") or "").strip()
+                if status and status != "SUCCESS":
+                    errors.append(f"run status: {status}")
+
+    status_task = asyncio.create_task(
+        _stream_status_heartbeat(status_msg, label, start, render_status_tail)
+    )
+    try:
+        await asyncio.gather(stream_stdout(), read_stderr(), proc.wait())
+    finally:
+        status_task.cancel()
+        await asyncio.gather(status_task, return_exceptions=True)
+        running_procs.pop(ch.id, None)
+        elapsed = int(time.time() - start)
+        try:
+            await status_msg.edit(content=f"✅ {label} finished ({elapsed}s)\nI'll post the output below.")
+        except discord.HTTPException:
+            pass
+
+    usage_snapshot = {"engine": "antigravity"}
+    usage_snapshot.update(result_usage)
+    channel_last_usage[ch.id] = usage_snapshot
+    _accumulate_global_usage("antigravity", result_usage)
+
+    stderr = b"".join(stderr_chunks).decode(errors="replace")
+    output = final_result or "".join(accumulated_text).strip() or "(no output)"
+    if errors:
+        output += "\n\n⚠️ agy errors:\n" + "\n".join(errors[-3:])
+    if proc.returncode != 0 and stderr:
+        tail_lines = stderr.strip().split("\n")[-5:]
+        output += "\n\n⚠️ stderr (tail):\n" + "\n".join(tail_lines)
+    return output
+
 async def run_claude_code(
     task: str,
     ch: discord.TextChannel,
@@ -3956,6 +4155,47 @@ async def run_kimi(
     return await _run_kimi_streaming(cmd, ch, "Kimi Code", cwd=cwd, env=env)
 
 
+async def run_antigravity(
+    task: str,
+    ch: discord.TextChannel,
+    resume: bool = False,
+    images: list[str] | None = None,
+    cwd: str | None = None,
+    runtime_config: dict[str, str | None] | None = None,
+) -> str:
+    """Run Google Antigravity (agy). If resume=True, uses -c to continue the last conversation in this cwd."""
+    model = get_model_for_engine("antigravity", runtime_config=runtime_config, ch_id=ch.id)
+    reasoning_effort = get_reasoning_for_engine("antigravity", runtime_config=runtime_config, ch_id=ch.id)
+    if images:
+        img_lines = "\n".join(f"- {p}" for p in images)
+        task = f"Examine the image(s) at the following path(s) using the view_file tool:\n{img_lines}\n\n{task}"
+    # agy has no --append-system-prompt flag, so prepend the same implement-mandate
+    # that run_claude_code passes via --append-system-prompt.
+    task = (
+        "You MUST implement changes, not just read or analyze files. "
+        "Do not stop after reading context — use Edit/Write tools to "
+        "make the requested code changes. If the task asks you to add, "
+        "modify, or fix something, you must edit the relevant files.\n\n"
+        + task
+    )
+    cmd = ["agy"]
+    if resume:
+        cmd.append("-c")
+    cmd.extend([
+        "-p", task,
+        "--output-format", "stream-json",
+        "--model", model,
+        # Print mode auto-denies tool permissions (no interactive approver).
+        "--dangerously-skip-permissions",
+        # Engine turns have no inactivity deadline; the print-mode default is 5m.
+        "--print-timeout", "24h",
+    ])
+    if reasoning_effort:
+        cmd.extend(["--effort", reasoning_effort])
+
+    return await _run_antigravity_streaming(cmd, ch, "agy", cwd=cwd)
+
+
 async def run_engine(
     engine: str,
     task: str,
@@ -3970,6 +4210,8 @@ async def run_engine(
         runner = run_codex
     elif engine == "kimi":
         runner = run_kimi
+    elif engine == "antigravity":
+        runner = run_antigravity
     else:
         runner = run_claude_code
     run_config = _coerce_runtime_config(runtime_config, fallback=get_runtime_config(ch.id))
@@ -4614,7 +4856,7 @@ async def create_pr(source: str, target: str, title: str, path: str | None = Non
 # ── Discord handlers ─────────────────────────────────────────────────────────
 
 HELP_TEXT_1_TEMPLATE = """**Starting a session:**
-`<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:` · `kimi: <task>` / `km:`
+`<task>` — default engine ({default}) · `claude: <task>` / `cc:` / `claude code:` · `codex: <task>` / `cx:` / `openai:` · `kimi: <task>` / `km:` · `agy: <task>` / `antigravity:`
 Use separate Discord channels/threads to run agents concurrently; `agents` lists them
 `plan: <task>` — planning mode with default engine/model (saves/extends plan context)
 `plan: do [extra instructions]` / `plan do [extra instructions]` — execute saved plan context, then clear it
@@ -4645,6 +4887,7 @@ Type follow-ups freely — engine keeps context
 def help_text_1(ch_id: int | None = None) -> str:
     return HELP_TEXT_1_TEMPLATE.format(default=f"{get_default_engine(ch_id)} · this channel")
 
+
 HELP_TEXT_2 = """**Branches:**
 `branches` — list branches (use `N` in commands)
 `branch delete|del <name|N> [local|remote|both] [force]`
@@ -4653,23 +4896,12 @@ HELP_TEXT_2 = """**Branches:**
 
 **Recovery:**
 `resume` — reopen saved unfinished recovery session · `resume show` — inspect it
-`recover` — list orphaned branches · `recover <id>` — resume
-`recover drop <id>` — delete orphaned branch
-
-**Multi-repo:**
-`repos` · `cwd` / `cwd <n>` — show or switch active repo
-`repo <n> status|diff|review|commit [msg]|push|branches`
-
-**Config (channel-scoped by default):**
-`engine` — show this channel config (+ global default)
-`engine global` — show global default config
-`claude models` · `codex models` · `kimi models` — list available models (numbered)
-`claude model <n|name>` · `codex model <n|name>` · `kimi model <n|name>` — set model for this channel
-`engine claude|codex|kimi` · `engine claude model <n|name> [reasoning <n|level>]` · `engine codex model <n|name> [reasoning <n|level>]` · `engine kimi model <n|name> [reasoning <n|level>]` — set this channel
-`engine global claude|codex|kimi` · `engine global claude|codex|kimi model <n|name> [reasoning <n|level>]` — set global default
-`claude reasoning [n|level]` · `codex reasoning [n|level]` · `kimi reasoning [n|level]` — set reasoning for this channel
-`engine claude reasoning <n|level>` · `engine codex reasoning <n|level>` · `engine kimi reasoning <n|level>` — set this channel
-`engine global claude|codex|kimi reasoning <n|level>` — set global default reasoning
+`claude model <n|name>` · `codex model <n|name>` · `kimi model <n|name>` · `agy model <n|name>` — set model for this channel
+`engine claude|codex|kimi|agy` · `engine <engine> model <n|name> [reasoning <n|level>]` — set this channel
+`engine global claude|codex|kimi|agy` · `engine global <engine> model <n|name> [reasoning <n|level>]` — set global default
+`claude reasoning [n|level]` · `codex reasoning [n|level]` · `kimi reasoning [n|level]` · `agy reasoning [n|level]` — set reasoning for this channel
+`engine <engine> reasoning <n|level>` — set this channel
+`engine global claude|codex|kimi|agy reasoning <n|level>` — set global default reasoning
 `reasoning|default reasoning [n|level]` — view/set this channel default-engine reasoning
 `model|default model <n|name>` — set model for this channel default engine
 
@@ -4682,7 +4914,7 @@ HELP_TEXT_2 = """**Branches:**
 `doctor` — run CLI/repo diagnostics
 `help` — refresh pinned command reference
 
-**Login:** `claude|cc login` · `codex|cx|openai login` · `kimi|km login` · `login both`
+**Login:** `claude|cc login` · `codex|cx|openai login` · `kimi|km login` · `login both` · agy: run `agy` interactively once to sign in
 **System:** `restart`"""
 
 HELP_PIN_TITLE_1 = "Help (1/2)"
@@ -4776,6 +5008,7 @@ async def on_ready():
     claude_ok, claude_status = check_claude_cli()
     codex_ok, codex_status = check_codex_cli()
     kimi_ok, kimi_status = check_kimi_cli()
+    agy_ok, agy_status = check_antigravity_cli()
     global_config = get_runtime_config(None)
     print(f"🤖 Bot online as {client.user}")
     print(f"   Allowed user  : {ALLOWED_USER_ID}")
@@ -4783,7 +5016,8 @@ async def on_ready():
     print(
         f"   Claude: {global_config['claude_model']} · "
         f"Codex: {global_config['codex_model']} · "
-        f"Kimi: {global_config['kimi_model']} (global)"
+        f"Kimi: {global_config['kimi_model']} · "
+        f"agy: {global_config['antigravity_model']} (global)"
     )
     print(f"   Channel runtime overrides: {len(CHANNEL_RUNTIME_CONFIGS)}")
     print(f"   gh CLI        : {'yes' if has_gh_cli() else 'no'}")
@@ -4791,6 +5025,7 @@ async def on_ready():
     print(f"   Claude CLI    : {claude_status}")
     print(f"   Codex CLI     : {codex_status}")
     print(f"   Kimi CLI      : {kimi_status}")
+    print(f"   agy           : {agy_status}")
     codex_trusted = _load_codex_trusted_dirs()
     print(f"   Project dirs  :")
     for label, path in GIT_PROJECTS:
@@ -4817,6 +5052,8 @@ async def on_ready():
         print(f"\n⚠️  Codex CLI unavailable: {codex_status}")
     if not kimi_ok:
         print(f"\n⚠️  Kimi CLI unavailable: {kimi_status}")
+    if not agy_ok:
+        print(f"\n⚠️  agy CLI unavailable: {agy_status}")
     claude_untrusted = [path for _, path in GIT_PROJECTS
                         if not _is_claude_trusted(path)]
     if claude_untrusted and claude_ok:
@@ -5437,6 +5674,7 @@ async def on_message(message: discord.Message):
         claude_ok, claude_status = check_claude_cli()
         codex_ok, codex_status = check_codex_cli()
         kimi_ok, kimi_status = check_kimi_cli()
+        agy_ok, agy_status = check_antigravity_cli()
         codex_trusted = _load_codex_trusted_dirs()
 
         await ch.send(
@@ -5444,7 +5682,8 @@ async def on_message(message: discord.Message):
             f"GitHub SSH: {'✅ OK' if ssh_ok else '⚠️ FAILED'}\n"
             f"Claude CLI: {'✅' if claude_ok else '⚠️'} {claude_status}\n"
             f"Codex CLI: {'✅' if codex_ok else '⚠️'} {codex_status}\n"
-            f"Kimi CLI: {'✅' if kimi_ok else '⚠️'} {kimi_status}"
+            f"Kimi CLI: {'✅' if kimi_ok else '⚠️'} {kimi_status}\n"
+            f"agy CLI: {'✅' if agy_ok else '⚠️'} {agy_status}"
         )
 
         project_lines = []
@@ -5477,6 +5716,8 @@ async def on_message(message: discord.Message):
             fix_lines.append("Codex CLI unavailable: install/login Codex CLI.")
         if not kimi_ok:
             fix_lines.append("Kimi CLI unavailable: install/login Kimi Code CLI.")
+        if not agy_ok:
+            fix_lines.append("agy CLI unavailable: install `agy` or run it once interactively to sign in.")
         if claude_ok:
             claude_untrusted = [path for _, path in GIT_PROJECTS if not _is_claude_trusted(path)]
             if claude_untrusted:
@@ -6175,7 +6416,7 @@ async def on_message(message: discord.Message):
         return
 
     engine_model_match = re.match(
-        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km)\s+model(?:\s+(.+))?$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km|antigravity|agy)\s+model(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
@@ -6187,12 +6428,9 @@ async def on_message(message: discord.Message):
         target_engine = _engine_name_from_token(engine_token)
         if not selector:
             await ch.send(
-                "Usage: `engine claude model <n|name> [reasoning <n|level>]`, "
-                "`engine codex model <n|name> [reasoning <n|level>]`, "
-                "`engine kimi model <n|name> [reasoning <n|level>]`, "
-                "`engine global claude model <n|name> [reasoning <n|level>]`, "
-                "`engine global codex model <n|name> [reasoning <n|level>]`, "
-                "or `engine global kimi model <n|name> [reasoning <n|level>]`"
+                "Usage: `engine <engine> model <n|name> [reasoning <n|level>]` or "
+                "`engine global <engine> model <n|name> [reasoning <n|level>]` "
+                "where <engine> is `claude`, `codex`, `kimi`, or `agy`"
             )
             return
         model_selector, reasoning_selector, err = split_model_reasoning_selector(selector)
@@ -6249,6 +6487,31 @@ async def on_message(message: discord.Message):
                 f"{details}"
             )
             return
+        if target_engine == "antigravity":
+            models = get_antigravity_models()
+            selected_model, err = resolve_model_selector(model_selector or "", models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            updates: dict[str, str | None] = {
+                "default_engine": "antigravity",
+                "antigravity_model": selected_model,
+            }
+            if reasoning_selector is not None:
+                selected_effort, err = resolve_reasoning_selector(reasoning_selector, "antigravity")
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                updates["antigravity_reasoning_effort"] = selected_effort
+            updated = update_runtime_config(scope_ch_id, **updates)
+            details = f"model `{updated['antigravity_model']}`"
+            if reasoning_selector is not None:
+                details += f" · reasoning `{format_reasoning_effort(updated['antigravity_reasoning_effort'])}`"
+            await ch.send(
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **agy** — "
+                f"{details}"
+            )
+            return
         models = get_codex_models()
         selected_model, err = resolve_model_selector(model_selector or "", models)
         if err:
@@ -6275,7 +6538,7 @@ async def on_message(message: discord.Message):
         return
 
     engine_reasoning_match = re.match(
-        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km)\s+reasoning(?:\s+(.+))?$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km|antigravity|agy)\s+reasoning(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
@@ -6287,9 +6550,9 @@ async def on_message(message: discord.Message):
         target_engine = _engine_name_from_token(engine_token)
         if not selector:
             await ch.send(
-                "Usage: `engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
-                "`engine kimi reasoning <n|level>`, `engine global claude reasoning <n|level>`, "
-                "`engine global codex reasoning <n|level>`, or `engine global kimi reasoning <n|level>`"
+                "Usage: `engine <engine> reasoning <n|level>` or "
+                "`engine global <engine> reasoning <n|level>` "
+                "where <engine> is `claude`, `codex`, `kimi`, or `agy`"
             )
             return
         selected_effort, err = resolve_reasoning_selector(selector, target_engine)
@@ -6318,6 +6581,17 @@ async def on_message(message: discord.Message):
                 f"reasoning `{format_reasoning_effort(updated['kimi_reasoning_effort'])}`"
             )
             return
+        if target_engine == "antigravity":
+            updated = update_runtime_config(
+                scope_ch_id,
+                default_engine="antigravity",
+                antigravity_reasoning_effort=selected_effort,
+            )
+            await ch.send(
+                f"✅ {runtime_scope_name(scope_ch_id).capitalize()} default engine set to **agy** — "
+                f"reasoning `{format_reasoning_effort(updated['antigravity_reasoning_effort'])}`"
+            )
+            return
         updated = update_runtime_config(
             scope_ch_id,
             default_engine="codex",
@@ -6330,7 +6604,7 @@ async def on_message(message: discord.Message):
         return
 
     engine_only_match = re.match(
-        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km)$",
+        r"^engine(?:\s+(global|default))?\s+(claude|cc|codex|cx|openai|kimi|km|antigravity|agy)$",
         content,
         flags=re.IGNORECASE,
     )
@@ -6356,9 +6630,11 @@ async def on_message(message: discord.Message):
         claude_models = await get_claude_models()
         codex_models = get_codex_models()
         kimi_models = get_kimi_models()
+        agy_models = get_antigravity_models()
         claude_list = " · ".join(f"`{mid}`" for mid, _ in claude_models)
         codex_list = " · ".join(f"`{slug}`" for slug, _ in codex_models)
         kimi_list = " · ".join(f"`{alias}`" for alias, _ in kimi_models)
+        agy_list = " · ".join(f"`{mid}`" for mid, _ in agy_models)
 
         if show_global:
             body = (
@@ -6368,7 +6644,9 @@ async def on_message(message: discord.Message):
                 f"Codex: model `{config['codex_model']}` · reasoning "
                 f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n"
                 f"Kimi: model `{config['kimi_model']}` · reasoning "
-                f"`{format_reasoning_effort(config['kimi_reasoning_effort'])}`\n\n"
+                f"`{format_reasoning_effort(config['kimi_reasoning_effort'])}`\n"
+                f"agy: model `{config['antigravity_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['antigravity_reasoning_effort'])}`\n\n"
             )
         else:
             scope_note = (
@@ -6381,14 +6659,18 @@ async def on_message(message: discord.Message):
                 f"Codex: model `{config['codex_model']}` · reasoning "
                 f"`{format_reasoning_effort(config['codex_reasoning_effort'])}`\n"
                 f"Kimi: model `{config['kimi_model']}` · reasoning "
-                f"`{format_reasoning_effort(config['kimi_reasoning_effort'])}`\n\n"
+                f"`{format_reasoning_effort(config['kimi_reasoning_effort'])}`\n"
+                f"agy: model `{config['antigravity_model']}` · reasoning "
+                f"`{format_reasoning_effort(config['antigravity_reasoning_effort'])}`\n\n"
                 f"Global default: **{global_config['default_engine']}**\n"
                 f"Claude: model `{global_config['claude_model']}` · reasoning "
                 f"`{format_reasoning_effort(global_config['claude_reasoning_effort'])}`\n"
                 f"Codex: model `{global_config['codex_model']}` · reasoning "
                 f"`{format_reasoning_effort(global_config['codex_reasoning_effort'])}`\n"
                 f"Kimi: model `{global_config['kimi_model']}` · reasoning "
-                f"`{format_reasoning_effort(global_config['kimi_reasoning_effort'])}`\n\n"
+                f"`{format_reasoning_effort(global_config['kimi_reasoning_effort'])}`\n"
+                f"agy: model `{global_config['antigravity_model']}` · reasoning "
+                f"`{format_reasoning_effort(global_config['antigravity_reasoning_effort'])}`\n\n"
             )
 
         await ch.send(
@@ -6396,25 +6678,25 @@ async def on_message(message: discord.Message):
             + f"**Available models:**\n"
             + f"Claude: {claude_list}\n"
             + f"Codex: {codex_list}\n"
-            + f"Kimi: {kimi_list}\n\n"
+            + f"Kimi: {kimi_list}\n"
+            + f"agy: {agy_list}\n\n"
             + f"**Reasoning levels (name or number):**\n"
             + f"Claude:\n{format_reasoning_options_numbered('claude')}\n"
             + f"Codex:\n{format_reasoning_options_numbered('codex')}\n"
-            + f"Kimi:\n{format_reasoning_options_numbered('kimi')}"
+            + f"Kimi:\n{format_reasoning_options_numbered('kimi')}\n"
+            + f"agy:\n{format_reasoning_options_numbered('antigravity')}"
         )
         return
 
     if lower.startswith("engine "):
         await ch.send(
-            "Usage: `engine`, `engine global`, `engine claude`, `engine codex`, `engine kimi`, "
-            "`engine claude model <n|name> [reasoning <n|level>]`, "
-            "`engine codex model <n|name> [reasoning <n|level>]`, "
-            "`engine kimi model <n|name> [reasoning <n|level>]`, "
-            "`engine claude reasoning <n|level>`, `engine codex reasoning <n|level>`, "
-            "`engine kimi reasoning <n|level>`, "
-            "`engine global claude|codex|kimi`, "
-            "`engine global claude|codex|kimi model <n|name> [reasoning <n|level>]`, "
-            "or `engine global claude|codex|kimi reasoning <n|level>`"
+            "Usage: `engine`, `engine global`, `engine <engine>` "
+            "(<engine> = claude, codex, kimi, agy), "
+            "`engine <engine> model <n|name> [reasoning <n|level>]`, "
+            "`engine <engine> reasoning <n|level>`, "
+            "`engine global <engine>`, "
+            "`engine global <engine> model <n|name> [reasoning <n|level>]`, "
+            "or `engine global <engine> reasoning <n|level>`"
         )
         return
 
@@ -6477,6 +6759,24 @@ async def on_message(message: discord.Message):
             "Switch global default with `engine global kimi model <n|name> [reasoning <n|level>]`."
         )
         return
+    if lower in ("antigravity models", "agy models"):
+        channel_config = get_runtime_config(ch.id)
+        current_model = get_model_for_engine("antigravity", runtime_config=channel_config)
+        global_model = get_model_for_engine("antigravity")
+        models = get_antigravity_models()
+        listing = "\n".join(
+            f"{idx}. {'▶ ' if mid == current_model else ''}`{mid}`"
+            + (f" ({display_name})" if display_name and display_name != mid else "")
+            for idx, (mid, display_name) in enumerate(models, start=1)
+        )
+        await ch.send(
+            f"**agy models** (this channel: `{current_model}` · global default: `{global_model}`):\n"
+            f"{listing}\n\n"
+            "Switch this channel with `agy model <n|name>` or "
+            "`engine agy model <n|name> [reasoning <n|level>]`. "
+            "Switch global default with `engine global agy model <n|name> [reasoning <n|level>]`."
+        )
+        return
 
     # ── Model change ─────────────────────────────────────────────────────
     # Accepts: "claude model <n|name>", "cc model <n|name>", "codex model <n|name>", "cx model <n|name>",
@@ -6485,6 +6785,7 @@ async def on_message(message: discord.Message):
         "claude model ": "claude", "cc model ": "claude",
         "codex model ": "codex",   "cx model ": "codex",
         "kimi model ": "kimi",     "km model ": "kimi",
+        "antigravity model ": "antigravity", "agy model ": "antigravity",
     }
     for _pfx, _engine in _model_prefixes.items():
         if lower.startswith(_pfx):
@@ -6495,7 +6796,8 @@ async def on_message(message: discord.Message):
                     f"Usage: `{_pfx.strip()} <n|name>`\n"
                     f"This channel — Claude: `{channel_config['claude_model']}` · "
                     f"Codex: `{channel_config['codex_model']}` · "
-                    f"Kimi: `{channel_config['kimi_model']}`"
+                    f"Kimi: `{channel_config['kimi_model']}` · "
+                    f"agy: `{channel_config['antigravity_model']}`"
                 )
                 return
             if _engine == "claude":
@@ -6514,6 +6816,14 @@ async def on_message(message: discord.Message):
                     return
                 updated = update_runtime_config(ch.id, kimi_model=selected_model)
                 await ch.send(f"✅ This channel Kimi model set to `{updated['kimi_model']}`")
+            elif _engine == "antigravity":
+                models = get_antigravity_models()
+                selected_model, err = resolve_model_selector(selector, models)
+                if err:
+                    await ch.send(f"❌ {err}")
+                    return
+                updated = update_runtime_config(ch.id, antigravity_model=selected_model)
+                await ch.send(f"✅ This channel agy model set to `{updated['antigravity_model']}`")
             else:
                 models = get_codex_models()
                 selected_model, err = resolve_model_selector(selector, models)
@@ -6529,7 +6839,7 @@ async def on_message(message: discord.Message):
     #          "codex reasoning [n|level]", "cx reasoning [n|level]", "openai reasoning [n|level]",
     #          "kimi reasoning [n|level]", "km reasoning [n|level]"
     reasoning_match = re.match(
-        r"^(claude|cc|codex|cx|openai|kimi|km)\s+reasoning(?:\s+(.+))?$",
+        r"^(claude|cc|codex|cx|openai|kimi|km|antigravity|agy)\s+reasoning(?:\s+(.+))?$",
         content,
         flags=re.IGNORECASE,
     )
@@ -6552,6 +6862,13 @@ async def on_message(message: discord.Message):
                     f"`{format_reasoning_effort(channel_config['kimi_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('kimi')}\n"
                     "Set with `kimi reasoning <n|level>`"
+                )
+            elif target_engine == "antigravity":
+                await ch.send(
+                    f"agy reasoning (this channel): "
+                    f"`{format_reasoning_effort(channel_config['antigravity_reasoning_effort'])}`\n"
+                    f"Levels:\n{format_reasoning_options_numbered('antigravity')}\n"
+                    "Set with `agy reasoning <n|level>`"
                 )
             else:
                 await ch.send(
@@ -6579,6 +6896,13 @@ async def on_message(message: discord.Message):
                 f"`{format_reasoning_effort(updated['kimi_reasoning_effort'])}`"
             )
             return
+        if target_engine == "antigravity":
+            updated = update_runtime_config(ch.id, antigravity_reasoning_effort=selected_effort)
+            await ch.send(
+                "✅ This channel agy reasoning set to "
+                f"`{format_reasoning_effort(updated['antigravity_reasoning_effort'])}`"
+            )
+            return
         updated = update_runtime_config(ch.id, codex_reasoning_effort=selected_effort)
         await ch.send(
             "✅ This channel Codex reasoning set to "
@@ -6603,6 +6927,9 @@ async def on_message(message: discord.Message):
             elif default_engine == "codex":
                 current = str(channel_config["codex_model"])
                 current_reasoning = format_reasoning_effort(channel_config["codex_reasoning_effort"])
+            elif default_engine == "antigravity":
+                current = str(channel_config["antigravity_model"])
+                current_reasoning = format_reasoning_effort(channel_config["antigravity_reasoning_effort"])
             else:
                 current = str(channel_config["kimi_model"])
                 current_reasoning = format_reasoning_effort(channel_config["kimi_reasoning_effort"])
@@ -6610,7 +6937,7 @@ async def on_message(message: discord.Message):
                 f"Usage: `{prefix} <n|name>`\n"
                 f"This channel default engine: `{default_engine}` · Current model: `{current}` · "
                 f"Current reasoning: `{current_reasoning}`\n"
-                "Use `claude model <n|name>` / `codex model <n|name>` / `kimi model <n|name>` to set explicitly."
+                "Use `claude model <n|name>` / `codex model <n|name>` / `kimi model <n|name>` / `agy model <n|name>` to set explicitly."
             )
             return
         if default_engine == "claude":
@@ -6635,6 +6962,18 @@ async def on_message(message: discord.Message):
             await ch.send(
                 "✅ This channel default engine is **codex** — "
                 f"model set to `{updated['codex_model']}`"
+            )
+            return
+        if default_engine == "antigravity":
+            models = get_antigravity_models()
+            selected_model, err = resolve_model_selector(new_model, models)
+            if err:
+                await ch.send(f"❌ {err}")
+                return
+            updated = update_runtime_config(ch.id, antigravity_model=selected_model)
+            await ch.send(
+                "✅ This channel default engine is **agy** — "
+                f"model set to `{updated['antigravity_model']}`"
             )
             return
         models = get_kimi_models()
@@ -6671,6 +7010,13 @@ async def on_message(message: discord.Message):
                     f"`{format_reasoning_effort(channel_config['codex_reasoning_effort'])}`\n"
                     f"Levels:\n{format_reasoning_options_numbered('codex')}"
                 )
+            elif default_engine == "antigravity":
+                await ch.send(
+                    f"Usage: `{prefix} <n|level>`\n"
+                    f"This channel default engine: `agy` · Current reasoning: "
+                    f"`{format_reasoning_effort(channel_config['antigravity_reasoning_effort'])}`\n"
+                    f"Levels:\n{format_reasoning_options_numbered('antigravity')}"
+                )
             else:
                 await ch.send(
                     f"Usage: `{prefix} <n|level>`\n"
@@ -6700,6 +7046,17 @@ async def on_message(message: discord.Message):
                 "✅ This channel default engine is **codex** — reasoning set to "
                 f"`{format_reasoning_effort(updated['codex_reasoning_effort'])}`"
             )
+            return
+        if default_engine == "antigravity":
+            selected_effort, err = resolve_reasoning_selector(new_effort, "antigravity")
+            if err:
+                await ch.send(f"❌ {err}")
+            else:
+                updated = update_runtime_config(ch.id, antigravity_reasoning_effort=selected_effort)
+                await ch.send(
+                    "✅ This channel default engine is **agy** — reasoning set to "
+                    f"`{format_reasoning_effort(updated['antigravity_reasoning_effort'])}`"
+                )
             return
         selected_effort, err = resolve_reasoning_selector(new_effort, "kimi")
         if err:
